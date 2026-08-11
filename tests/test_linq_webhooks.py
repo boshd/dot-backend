@@ -38,7 +38,13 @@ from benji_api.models.channel import (
     MessageDelivery,
     WebhookEvent,
 )
-from benji_api.models.user import OnboardingStep, User
+from benji_api.models.user import (
+    OnboardingStatus,
+    OnboardingStep,
+    User,
+    UserIdentifier,
+    UserIdentifierKind,
+)
 from benji_api.models.user_event import UserEvent, UserEventStatus
 
 RAW_SECRET = b"benji-test-webhook-secret-32byte"
@@ -285,6 +291,9 @@ async def test_first_linq_message_creates_user_and_sends_onboarding_reply(
 
         async with session_factory() as session:
             user = await session.scalar(select(User))
+            identifier = await session.scalar(select(UserIdentifier))
+            conversation = await session.scalar(select(Conversation))
+            member = await session.scalar(select(ConversationMember))
             inbound = await session.scalar(select(Message).where(Message.direction == "inbound"))
             outbound = await session.scalar(select(Message).where(Message.direction == "outbound"))
             conversation_count = await session.scalar(
@@ -298,9 +307,28 @@ async def test_first_linq_message_creates_user_and_sends_onboarding_reply(
 
         assert user is not None
         assert user.phone_number == "+14155552671"
+        assert user.onboarding_status == OnboardingStatus.COLLECTING_PROFILE.value
         assert user.onboarding_step == OnboardingStep.NAME.value
+        assert identifier is not None
+        assert identifier.user_id == user.id
+        assert identifier.kind == UserIdentifierKind.PHONE.value
+        assert identifier.normalized_value == "+14155552671"
+        assert identifier.source == "linq"
+        assert identifier.verified_at is not None
+        assert identifier.is_primary is True
+        assert conversation is not None
+        assert conversation.user_id == user.id
+        assert conversation.kind == "direct"
+        assert member is not None
+        assert member.conversation_id == conversation.id
+        assert member.user_id == user.id
+        assert member.external_handle == "+14155552671"
         assert inbound is not None and inbound.content == "Hello"
+        assert inbound.conversation_id == conversation.id
+        assert inbound.user_id == user.id
         assert outbound is not None and outbound.status == "completed"
+        assert outbound.conversation_id == conversation.id
+        assert outbound.user_id == user.id
         assert conversation_count == 1
         assert channel_count == 2
         assert web_session.json()["conversation_id"] == str(inbound.conversation_id)
@@ -362,7 +390,7 @@ async def test_duplicate_linq_event_is_acknowledged_without_a_second_reply(
 
 
 @pytest.mark.anyio
-async def test_unlinked_email_direct_message_is_recorded_without_retrying(
+async def test_first_email_linq_message_creates_user_and_sends_onboarding_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = message_received_payload(sender_phone="person@example.com")
@@ -372,7 +400,7 @@ async def test_unlinked_email_direct_message_is_recorded_without_retrying(
         client,
         session_factory,
         fake_linq,
-        _,
+        fake_model,
     ):
         response = await client.post(
             "/api/v1/webhooks/linq",
@@ -381,13 +409,66 @@ async def test_unlinked_email_direct_message_is_recorded_without_retrying(
         )
 
         assert response.status_code == 200
-        assert response.json()["reply_scheduled"] is False
-        assert fake_linq.sent == []
+        assert response.json()["reply_scheduled"] is True
+        assert fake_linq.sent == [
+            {
+                "chat_id": "chat-1",
+                "text": "hey, i’m dot, save me to your contacts. what should i call you?",
+                "idempotency_key": "benji:event-1:onboarding",
+            }
+        ]
         async with session_factory() as session:
             event = await session.scalar(select(WebhookEvent))
-            assert event is not None and event.status == "failed"
-            assert "not linked to a phone identity" in (event.error or "")
-            assert await session.scalar(select(func.count()).select_from(Message)) == 0
+            user = await session.scalar(select(User))
+            identifier = await session.scalar(select(UserIdentifier))
+            conversation = await session.scalar(select(Conversation))
+            channel = await session.scalar(select(ConversationChannel))
+            member = await session.scalar(select(ConversationMember))
+            inbound = await session.scalar(select(Message).where(Message.direction == "inbound"))
+            outbound = await session.scalar(select(Message).where(Message.direction == "outbound"))
+            delivery = await session.scalar(select(MessageDelivery))
+            run = await session.scalar(select(AgentRun))
+            assert event is not None and event.status == "processed"
+            assert user is not None and user.phone_number is None
+            assert response.json()["user_id"] == str(user.id)
+            assert user.onboarding_status == OnboardingStatus.COLLECTING_PROFILE.value
+            assert user.onboarding_step == OnboardingStep.NAME.value
+            assert identifier is not None
+            assert identifier.user_id == user.id
+            assert identifier.kind == UserIdentifierKind.EMAIL.value
+            assert identifier.normalized_value == "person@example.com"
+            assert identifier.source == "linq"
+            assert identifier.verified_at is not None
+            assert identifier.is_primary is True
+            assert conversation is not None
+            assert conversation.user_id == user.id
+            assert conversation.kind == "direct"
+            assert channel is not None
+            assert channel.conversation_id == conversation.id
+            assert channel.provider == "linq"
+            assert channel.external_id == "chat-1"
+            assert member is not None
+            assert member.conversation_id == conversation.id
+            assert member.user_id == user.id
+            assert member.external_handle == "person@example.com"
+            assert inbound is not None and inbound.content == "Hello"
+            assert inbound.conversation_id == conversation.id
+            assert inbound.user_id == user.id
+            assert outbound is not None and outbound.status == "completed"
+            assert outbound.conversation_id == conversation.id
+            assert outbound.user_id == user.id
+            assert delivery is not None and delivery.status == "sent"
+            assert run is not None and run.purpose == AgentRunPurpose.ONBOARDING.value
+            assert run.exposed_tools == []
+            assert run.raw_output == {
+                "messages": ["hey, i’m dot — save me to your contacts. what should i call you?"],
+                "profile": fake_model.profile,
+            }
+            assert await session.scalar(select(func.count()).select_from(Conversation)) == 1
+            assert await session.scalar(select(func.count()).select_from(ConversationChannel)) == 1
+            assert await session.scalar(select(func.count()).select_from(Message)) == 2
+        assert fake_model.structured_calls[0].name == "onboarding_turn"
+        assert fake_linq.typing == [True, False]
 
 
 @pytest.mark.anyio
@@ -574,8 +655,17 @@ async def test_linq_group_syncs_members_and_only_replies_when_invoked(
         assert messages[0].sender_user_id is not None
         assert messages[1].sender_user_id is not None
         assert messages[0].sender_user_id != messages[1].sender_user_id
-        assert messages[3].sender_user_id is None
+        assert messages[3].sender_user_id is not None
         assert messages[3].raw_payload["_sender_label"] == "an unnamed group member"
+        async with session_factory() as session:
+            email_identifier = await session.scalar(
+                select(UserIdentifier).where(
+                    UserIdentifier.kind == UserIdentifierKind.EMAIL.value,
+                    UserIdentifier.normalized_value == "group-member@example.com",
+                )
+            )
+        assert email_identifier is not None
+        assert email_identifier.user_id == messages[3].sender_user_id
         owner = next(member for member in members if member.role == "owner")
         assert group.group_owner_source == "first_invoker"
         assert owner.user_id == messages[0].sender_user_id
@@ -722,13 +812,6 @@ async def test_newly_discovered_linq_group_introduces_dot_from_chat_created(
             },
             {
                 "id": "owner-handle",
-                "handle": "+14155552671",
-                "is_me": False,
-                "service": "iMessage",
-                "status": "active",
-            },
-            {
-                "id": "email-handle",
                 "handle": "reader@example.com",
                 "is_me": False,
                 "service": "iMessage",
@@ -772,8 +855,14 @@ async def test_newly_discovered_linq_group_introduces_dot_from_chat_created(
             event = await session.scalar(
                 select(UserEvent).where(UserEvent.event_type == "group.dot_added")
             )
+            identifier = await session.scalar(
+                select(UserIdentifier).where(
+                    UserIdentifier.normalized_value == "reader@example.com"
+                )
+            )
             assert group is not None and group.title == "Book club"
             assert event is not None and event.conversation_id == group.id
+            assert identifier is not None and identifier.user_id == group.user_id
 
 
 @pytest.mark.anyio

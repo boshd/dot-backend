@@ -54,7 +54,11 @@ from benji_api.services.groups import (
 )
 from benji_api.services.onboarding import apply_messaging_preference
 from benji_api.services.user_events import dispatch_user_event, enqueue_user_event
-from benji_api.services.users import resolve_user_from_phone
+from benji_api.services.users import (
+    UserIdentifierRevokedError,
+    normalize_user_identifier,
+    resolve_user_from_identifier,
+)
 
 router = APIRouter(prefix="/webhooks/linq", tags=["linq webhooks"])
 PROVIDER = "linq"
@@ -284,7 +288,11 @@ async def receive_linq_webhook(
     if inbound.is_group:
         chat_data = await _load_linq_chat_data(linq_client, inbound.external_chat_id)
         try:
-            resolution = await resolve_user_from_phone(session, inbound.sender_handle)
+            resolution = await resolve_user_from_identifier(
+                session,
+                inbound.sender_handle,
+                source="linq",
+            )
         except ValueError:
             resolution = None
         if resolution is not None:
@@ -295,6 +303,7 @@ async def receive_linq_webhook(
                 external_chat_id=inbound.external_chat_id,
                 sender=actor_user,
                 service=inbound.service,
+                sender_handle=resolution.identifier.normalized_value,
                 chat_data=chat_data,
                 claim_owner=False,
             )
@@ -358,10 +367,16 @@ async def receive_linq_webhook(
         channel.status = "active" if group_can_reply else "inactive"
     else:
         try:
-            resolution = await resolve_user_from_phone(session, inbound.sender_handle)
-        except ValueError:
+            resolution = await resolve_user_from_identifier(
+                session,
+                inbound.sender_handle,
+                source="linq",
+            )
+        except (UserIdentifierRevokedError, ValueError):
             webhook_event.status = WebhookStatus.FAILED.value
-            webhook_event.error = "Direct sender is not linked to a phone identity"
+            webhook_event.error = (
+                "Direct sender identifier is invalid, revoked, or requires account recovery"
+            )
             webhook_event.processed_at = datetime.now(UTC)
             await session.commit()
             return LinqWebhookReceipt(event_id=envelope.event_id)
@@ -374,6 +389,7 @@ async def receive_linq_webhook(
             provider=PROVIDER,
             external_id=inbound.external_chat_id,
             service=inbound.service,
+            user_handle=resolution.identifier.normalized_value,
         )
         conversation = channel_resolution.conversation
         channel = channel_resolution.channel
@@ -644,25 +660,17 @@ async def _resolve_group_from_linq_event(
     handles = chat_data.get("handles")
     if not isinstance(handles, list):
         return None
-    sender_handle = next(
-        (
-            item.get("handle")
-            for item in handles
-            if isinstance(item, dict)
-            and item.get("is_me") is not True
-            and isinstance(item.get("handle"), str)
-            and str(item["handle"]).startswith("+")
-        ),
-        None,
-    )
+    sender_handle = _first_external_user_handle(handles)
     if not isinstance(sender_handle, str):
         return None
-    sender = (await resolve_user_from_phone(session, sender_handle)).user
+    resolution = await resolve_user_from_identifier(session, sender_handle, source="linq")
+    sender = resolution.user
     conversation, channel, _ = await resolve_linq_group_conversation(
         session,
         external_chat_id=chat_id,
         sender=sender,
         service=str(chat_data.get("service")) if chat_data.get("service") else None,
+        sender_handle=resolution.identifier.normalized_value,
         chat_data=chat_data,
         claim_owner=False,
     )
@@ -691,31 +699,39 @@ async def _handle_linq_chat_created(
     )
     if dot_handle is None:
         return None
-    sender_handle = next(
-        (
-            item.get("handle")
-            for item in handles
-            if isinstance(item, dict)
-            and item.get("is_me") is not True
-            and isinstance(item.get("handle"), str)
-            and str(item["handle"]).startswith("+")
-        ),
-        None,
-    )
+    sender_handle = _first_external_user_handle(handles)
     if not isinstance(sender_handle, str):
         return None
-    sender = (await resolve_user_from_phone(session, sender_handle)).user
+    resolution = await resolve_user_from_identifier(session, sender_handle, source="linq")
+    sender = resolution.user
     conversation, channel, _ = await resolve_linq_group_conversation(
         session,
         external_chat_id=chat_id,
         sender=sender,
         service=str(data.get("service")) if data.get("service") else None,
+        sender_handle=resolution.identifier.normalized_value,
         chat_data=data,
         claim_owner=False,
     )
     conversation.status = "active"
     channel.status = "active"
     return conversation, channel
+
+
+def _first_external_user_handle(handles: list[object]) -> str | None:
+    for item in handles:
+        if (
+            isinstance(item, dict)
+            and item.get("is_me") is not True
+            and isinstance(item.get("handle"), str)
+        ):
+            handle = str(item["handle"])
+            try:
+                normalize_user_identifier(handle)
+                return handle
+            except ValueError:
+                continue
+    return None
 
 
 async def _is_reply_to_benji(

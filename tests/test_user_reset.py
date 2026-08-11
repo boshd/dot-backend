@@ -31,6 +31,7 @@ from benji_api.models import (
     ToolCallStatus,
     User,
     UserEvent,
+    UserIdentifier,
     WebhookEvent,
 )
 from benji_api.services.user_reset import build_user_reset_plan, execute_user_reset
@@ -128,7 +129,7 @@ async def test_user_reset_deletes_related_local_data_only() -> None:
         session.add(
             AuthIdentity(
                 user_id=user.id,
-                provider="stytch",
+                provider="firebase",
                 provider_subject="user-test-reset",
                 verified_phone=phone,
             )
@@ -313,6 +314,60 @@ async def test_user_reset_can_remove_orphaned_webhook_events_by_phone() -> None:
 
         await execute_user_reset(session, plan)
         await session.commit()
+        assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_user_reset_supports_email_only_users() -> None:
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    email = "Tester@Example.com"
+    normalized_email = "tester@example.com"
+    async with session_factory() as session:
+        user = User(phone_number=None)
+        session.add(user)
+        await session.flush()
+        identifier = UserIdentifier(
+            user_id=user.id,
+            kind="email",
+            normalized_value=normalized_email,
+            display_value=email,
+            source="linq",
+            is_primary=True,
+        )
+        session.add_all(
+            [
+                identifier,
+                WebhookEvent(
+                    provider="linq",
+                    external_event_id="email-event",
+                    event_type="message.received",
+                    payload={"sender": {"handle": email}},
+                ),
+            ]
+        )
+        await session.commit()
+
+        plan = await build_user_reset_plan(session, email)
+        assert plan.normalized_identifier == normalized_email
+        assert plan.identifier_kind == "email"
+        assert plan.user_id == user.id
+        assert plan.user_identifier_ids == (identifier.id,)
+        assert len(plan.webhook_event_ids) == 1
+        assert plan.total_records == 3
+
+        await execute_user_reset(session, plan)
+        await session.commit()
+        assert await session.scalar(select(func.count()).select_from(User)) == 0
+        assert await session.scalar(select(func.count()).select_from(UserIdentifier)) == 0
         assert await session.scalar(select(func.count()).select_from(WebhookEvent)) == 0
 
     await engine.dispose()

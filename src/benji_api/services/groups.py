@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from benji_api.models.channel import (
@@ -20,8 +20,11 @@ from benji_api.models.channel import (
     GroupResponseMode,
 )
 from benji_api.models.user import User
-from benji_api.schemas.phone import normalize_phone_number
-from benji_api.services.users import resolve_user_from_phone
+from benji_api.services.users import (
+    find_user_by_identifier,
+    get_primary_user_handle,
+    normalize_user_identifier,
+)
 
 WEB_PROVIDER = "web"
 GROUP_MENTION_PATTERN = re.compile(r"(?:^|\W)@?(?:dot|benji)(?:$|\W)", re.IGNORECASE)
@@ -67,7 +70,7 @@ async def create_web_group(
         ConversationMember(
             conversation_id=conversation.id,
             user_id=owner.id,
-            external_handle=owner.phone_number,
+            external_handle=await get_primary_user_handle(session, owner),
             display_name=owner.display_name,
             role=ConversationMemberRole.OWNER.value,
             status=ConversationMemberStatus.ACTIVE.value,
@@ -201,17 +204,21 @@ async def join_group_from_invite(
     conversation = await session.get(Conversation, invite.conversation_id)
     if conversation is None or conversation.kind != ConversationKind.GROUP.value:
         raise GroupInviteError("This group no longer exists")
+    member_handle = await get_primary_user_handle(session, user)
     member = await session.scalar(
         select(ConversationMember).where(
             ConversationMember.conversation_id == conversation.id,
-            ConversationMember.external_handle == user.phone_number,
+            or_(
+                ConversationMember.user_id == user.id,
+                ConversationMember.external_handle == member_handle,
+            ),
         )
     )
     if member is None:
         member = ConversationMember(
             conversation_id=conversation.id,
             user_id=user.id,
-            external_handle=user.phone_number,
+            external_handle=member_handle,
             display_name=user.display_name,
             role=ConversationMemberRole.MEMBER.value,
             status=ConversationMemberStatus.ACTIVE.value,
@@ -283,6 +290,7 @@ async def resolve_linq_group_conversation(
     external_chat_id: str,
     sender: User,
     service: str | None,
+    sender_handle: str | None = None,
     chat_data: dict[str, Any] | None = None,
     claim_owner: bool = False,
 ) -> tuple[Conversation, ConversationChannel, bool]:
@@ -318,10 +326,13 @@ async def resolve_linq_group_conversation(
             raise GroupPermissionError("Linq chat is not attached to a group conversation")
         if service:
             channel.service = service
+    normalized_sender_handle = _canonical_handle(
+        sender_handle or await get_primary_user_handle(session, sender),
+    )
     sender_member = await _upsert_group_member(
         session,
         conversation=conversation,
-        handle=sender.phone_number,
+        handle=normalized_sender_handle,
         user=sender,
         role=ConversationMemberRole.MEMBER.value,
         service=service,
@@ -366,11 +377,12 @@ async def sync_linq_group_participants(
         handle = raw.get("handle")
         if not isinstance(handle, str) or not handle.strip():
             continue
-        user = await _resolve_optional_phone_user(session, handle)
+        normalized_handle = _canonical_handle(handle)
+        user = await _find_optional_identifier_user(session, normalized_handle)
         await _upsert_group_member(
             session,
             conversation=conversation,
-            handle=user.phone_number if user is not None else handle.strip(),
+            handle=normalized_handle,
             user=user,
             role=ConversationMemberRole.MEMBER.value,
             service=_clean_optional_text(raw.get("service"), 32),
@@ -447,7 +459,8 @@ async def apply_linq_group_event(
     handle = details.get("handle") or data.get("handle")
     if not isinstance(handle, str):
         return False
-    user = await _resolve_optional_phone_user(session, handle)
+    normalized_handle = _canonical_handle(handle)
+    user = await _find_optional_identifier_user(session, normalized_handle)
     status = (
         ConversationMemberStatus.ACTIVE.value
         if event_type == "participant.added"
@@ -456,7 +469,7 @@ async def apply_linq_group_event(
     member = await _upsert_group_member(
         session,
         conversation=conversation,
-        handle=user.phone_number if user is not None else handle.strip(),
+        handle=normalized_handle,
         user=user,
         role=ConversationMemberRole.MEMBER.value,
         service=_clean_optional_text(details.get("service"), 32),
@@ -579,10 +592,13 @@ async def _upsert_group_member(
     joined_at: datetime | None,
     left_at: datetime | None,
 ) -> ConversationMember:
+    member_filters = [ConversationMember.external_handle == handle]
+    if user is not None:
+        member_filters.append(ConversationMember.user_id == user.id)
     member = await session.scalar(
         select(ConversationMember).where(
             ConversationMember.conversation_id == conversation.id,
-            ConversationMember.external_handle == handle,
+            or_(*member_filters),
         )
     )
     if member is None:
@@ -607,15 +623,22 @@ async def _upsert_group_member(
     return member
 
 
-async def _resolve_optional_phone_user(
+async def _find_optional_identifier_user(
     session: AsyncSession,
     handle: str,
 ) -> User | None:
     try:
-        normalized = normalize_phone_number(handle)
+        return await find_user_by_identifier(session, handle)
     except ValueError:
         return None
-    return (await resolve_user_from_phone(session, normalized)).user
+
+
+def _canonical_handle(handle: str) -> str:
+    try:
+        normalized = normalize_user_identifier(handle)
+    except ValueError:
+        return handle.strip()
+    return normalized.value
 
 
 def _hash_token(token: str) -> str:

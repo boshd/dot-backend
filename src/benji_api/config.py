@@ -41,9 +41,7 @@ class Settings:
             )
         )
     )
-    database_pool_size: int = field(
-        default_factory=lambda: max(1, int(_env("DB_POOL_SIZE", "5")))
-    )
+    database_pool_size: int = field(default_factory=lambda: max(1, int(_env("DB_POOL_SIZE", "5"))))
     database_max_overflow: int = field(
         default_factory=lambda: max(0, int(_env("DB_MAX_OVERFLOW", "5")))
     )
@@ -139,15 +137,25 @@ class Settings:
     plaid_request_timeout_seconds: float = field(
         default_factory=lambda: float(_env("PLAID_REQUEST_TIMEOUT_SECONDS", "15"))
     )
-    stytch_project_id: str | None = field(
-        default_factory=lambda: _optional_env("STYTCH_PROJECT_ID")
+    firebase_project_id: str | None = field(
+        default_factory=lambda: _optional_env("FIREBASE_PROJECT_ID")
     )
-    stytch_secret: str | None = field(default_factory=lambda: _optional_env("STYTCH_SECRET"))
-    stytch_otp_expiration_minutes: int = field(
-        default_factory=lambda: int(_env("STYTCH_OTP_EXPIRATION_MINUTES", "5"))
+    firebase_service_account_json: str | None = field(
+        default_factory=lambda: _optional_env("FIREBASE_SERVICE_ACCOUNT_JSON")
     )
-    stytch_session_max_token_age_seconds: int = field(
-        default_factory=lambda: int(_env("STYTCH_SESSION_MAX_TOKEN_AGE_SECONDS", "60"))
+    firebase_check_revoked: bool = field(
+        default_factory=lambda: _bool_env("FIREBASE_CHECK_REVOKED", True)
+    )
+    auth_eligibility_ip_limit_per_minute: int = field(
+        default_factory=lambda: max(1, int(_env("AUTH_ELIGIBILITY_IP_LIMIT_PER_MINUTE", "10")))
+    )
+    auth_eligibility_ip_limit_per_hour: int = field(
+        default_factory=lambda: max(1, int(_env("AUTH_ELIGIBILITY_IP_LIMIT_PER_HOUR", "60")))
+    )
+    auth_eligibility_identifier_limit_per_hour: int = field(
+        default_factory=lambda: max(
+            1, int(_env("AUTH_ELIGIBILITY_IDENTIFIER_LIMIT_PER_HOUR", "10"))
+        )
     )
     linq_api_key: str | None = field(default_factory=lambda: _optional_env("LINQ_API_KEY"))
     linq_webhook_secret: str | None = field(

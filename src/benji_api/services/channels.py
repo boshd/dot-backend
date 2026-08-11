@@ -15,6 +15,7 @@ from benji_api.models.channel import (
     DeliveryStatus,
     MessageDelivery,
 )
+from benji_api.services.users import get_primary_user_handle
 
 
 class ChannelIdentityConflictError(RuntimeError):
@@ -31,6 +32,7 @@ async def resolve_direct_conversation(
     session: AsyncSession,
     *,
     user_id: UUID,
+    external_handle: str | None = None,
 ) -> Conversation:
     conversation = await session.scalar(
         select(Conversation).where(
@@ -47,11 +49,12 @@ async def resolve_direct_conversation(
         user = await session.get(User, user_id)
         if user is None:
             raise RuntimeError("Direct conversation user no longer exists")
+        member_handle = external_handle or await get_primary_user_handle(session, user)
         session.add(
             ConversationMember(
                 conversation_id=conversation.id,
                 user_id=user_id,
-                external_handle=user.phone_number,
+                external_handle=member_handle,
                 role=ConversationMemberRole.OWNER.value,
                 status=ConversationMemberStatus.ACTIVE.value,
             )
@@ -67,6 +70,7 @@ async def resolve_channel_conversation(
     provider: str,
     external_id: str,
     service: str | None,
+    user_handle: str | None = None,
 ) -> ChannelResolution:
     channel = await session.scalar(
         select(ConversationChannel).where(
@@ -84,7 +88,11 @@ async def resolve_channel_conversation(
             channel.service = service
         return ChannelResolution(conversation=conversation, channel=channel)
 
-    conversation = await resolve_direct_conversation(session, user_id=user_id)
+    conversation = await resolve_direct_conversation(
+        session,
+        user_id=user_id,
+        external_handle=user_handle,
+    )
     channel = ConversationChannel(
         conversation_id=conversation.id,
         provider=provider,

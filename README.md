@@ -35,6 +35,8 @@ uv run pytest
   deduplicates deliveries, persists channel bindings/messages, creates the
   sender's user profile, and schedules the next onboarding reply.
 - `POST /api/v1/web/chat/session` opens the user's canonical direct conversation.
+- `POST /api/v1/auth/eligibility` confirms that a phone number or email already belongs to a
+  messaging-created Dot user before the web client starts Firebase sign-in.
 - `POST /api/v1/web/chat/messages` persists a web message and synchronously returns
   the same guarded onboarding or regular agent turn used by other channels. The response includes
   `assistant_messages` for ordered text bubbles and retains `assistant_message` as a compatibility
@@ -47,9 +49,12 @@ uv run pytest
 - `POST /api/v1/integrations/plaid/connect` starts Plaid Link; its exchange, reconnect,
   disconnect, and verified webhook routes manage durable financial connections.
 
-The web endpoints currently accept a phone number as a development identity selector.
-Set `WEB_CHAT_DEV_IDENTITY_ENABLED=false` outside local testing; this mechanism is not
-authentication and is intentionally replaceable by future magic-link access.
+Web and first-party clients authenticate with a Firebase ID token in the `Authorization: Bearer`
+header. The API verifies the token and maps a verified phone number or email to an existing Dot
+identity; authentication never creates a web-only user. Configure `FIREBASE_PROJECT_ID` and either
+Application Default Credentials or `FIREBASE_SERVICE_ACCOUNT_JSON`. The web endpoints also accept a
+phone number as a development-only identity selector. Set `WEB_CHAT_DEV_IDENTITY_ENABLED=false`
+outside local testing.
 
 ## Conversations and channels
 
@@ -67,7 +72,7 @@ the recent cross-channel transcript as context.
 
 ## User identity
 
-Users have a stable UUID and a unique E.164 phone number. Onboarding is a
+Users have a stable UUID plus one or more normalized phone/email identifiers. Onboarding is a
 generative conversation rather than a scripted sequence: a state-specific prompt
 asks naturally for any missing preferred name, complete date of birth, and country.
 The model returns a private structured profile proposal; application code validates

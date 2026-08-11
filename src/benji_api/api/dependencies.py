@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -5,47 +6,80 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from benji_api.config import Settings, get_settings
 from benji_api.db.session import get_session
-from benji_api.integrations.stytch.client import StytchAuthClient, StytchProviderError
-from benji_api.integrations.stytch.dependencies import get_stytch_client
+from benji_api.integrations.auth import AuthProviderError, AuthTokenVerifier
+from benji_api.integrations.firebase.dependencies import get_auth_token_verifier
 from benji_api.models.user import User
-from benji_api.services.auth import AuthIdentityNotFoundError, resolve_authenticated_user
+from benji_api.services.auth import (
+    AuthIdentityConflictError,
+    AuthIdentityNotFoundError,
+    AuthUserNotFoundError,
+    resolve_authenticated_user,
+)
+from benji_api.services.auth_rate_limit import AuthEligibilityRateLimiter
 from benji_api.services.users import resolve_user_from_phone
 
 
-def _session_jwt(request: Request) -> str | None:
+@lru_cache
+def _auth_eligibility_rate_limiter(
+    ip_per_minute: int,
+    ip_per_hour: int,
+    identifier_per_hour: int,
+) -> AuthEligibilityRateLimiter:
+    return AuthEligibilityRateLimiter(
+        ip_per_minute=ip_per_minute,
+        ip_per_hour=ip_per_hour,
+        identifier_per_hour=identifier_per_hour,
+    )
+
+
+def get_auth_eligibility_rate_limiter(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AuthEligibilityRateLimiter:
+    return _auth_eligibility_rate_limiter(
+        settings.auth_eligibility_ip_limit_per_minute,
+        settings.auth_eligibility_ip_limit_per_hour,
+        settings.auth_eligibility_identifier_limit_per_hour,
+    )
+
+
+def _bearer_token(request: Request) -> str | None:
     authorization = request.headers.get("authorization")
     if authorization:
         scheme, _, token = authorization.partition(" ")
-        if scheme.lower() == "bearer" and token:
-            return token
-    return request.cookies.get("stytch_session_jwt")
+        if scheme.casefold() == "bearer" and token.strip():
+            return token.strip()
+    return None
 
 
 async def get_optional_authenticated_user(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    settings: Annotated[Settings, Depends(get_settings)],
-    stytch_client: Annotated[StytchAuthClient | None, Depends(get_stytch_client)],
+    verifier: Annotated[AuthTokenVerifier | None, Depends(get_auth_token_verifier)],
 ) -> User | None:
-    session_jwt = _session_jwt(request)
-    if session_jwt is None:
+    token = _bearer_token(request)
+    if token is None:
         return None
-    if stytch_client is None:
+    if verifier is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Stytch authentication is not configured",
+            detail="Authentication is not configured",
         )
     try:
         return await resolve_authenticated_user(
             session,
-            session_jwt=session_jwt,
-            client=stytch_client,
-            settings=settings,
+            token=token,
+            verifier=verifier,
         )
-    except (AuthIdentityNotFoundError, StytchProviderError) as error:
+    except (
+        AuthIdentityConflictError,
+        AuthIdentityNotFoundError,
+        AuthProviderError,
+        AuthUserNotFoundError,
+        ValueError,
+    ) as error:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="The authentication session is invalid or expired",
+            detail="The authentication session is invalid or is not linked to Dot",
         ) from error
 
 

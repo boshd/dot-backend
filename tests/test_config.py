@@ -42,3 +42,15 @@ def test_database_pool_settings_are_configurable(monkeypatch: pytest.MonkeyPatch
     assert settings.database_max_overflow == 2
     assert settings.database_pool_timeout_seconds == 7.5
     assert settings.database_pool_recycle_seconds == 240
+
+
+def test_firebase_auth_settings_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "dot-production")
+    monkeypatch.setenv("FIREBASE_SERVICE_ACCOUNT_JSON", '{"type":"service_account"}')
+    monkeypatch.setenv("FIREBASE_CHECK_REVOKED", "false")
+
+    settings = Settings()
+
+    assert settings.firebase_project_id == "dot-production"
+    assert settings.firebase_service_account_json == '{"type":"service_account"}'
+    assert settings.firebase_check_revoked is False

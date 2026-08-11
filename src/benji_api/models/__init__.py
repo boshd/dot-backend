@@ -65,7 +65,14 @@ from benji_api.models.schedule import (
     ScheduledTaskRecurrence,
     ScheduledTaskStatus,
 )
-from benji_api.models.user import OnboardingStatus, OnboardingStep, User
+from benji_api.models.user import (
+    OnboardingStatus,
+    OnboardingStep,
+    User,
+    UserIdentifier,
+    UserIdentifierKind,
+    UserIdentifierStatus,
+)
 from benji_api.models.user_event import UserEvent, UserEventStatus
 
 __all__ = [
@@ -123,6 +130,9 @@ __all__ = [
     "ScheduledTaskStatus",
     "ToolCallStatus",
     "User",
+    "UserIdentifier",
+    "UserIdentifierKind",
+    "UserIdentifierStatus",
     "UserEvent",
     "UserEventStatus",
     "WebhookEvent",

@@ -63,7 +63,7 @@ async def load_recent_messages(
 def _group_message_content(message: Message, sender: User | None) -> str:
     if sender is not None and sender.display_name:
         label = sender.display_name
-    elif sender is not None:
+    elif sender is not None and sender.phone_number:
         label = f"member ending {sender.phone_number[-4:]}"
     else:
         raw_label = message.raw_payload.get("_sender_label")

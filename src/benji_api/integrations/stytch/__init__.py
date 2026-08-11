@@ -1,1 +1,0 @@
-"""Stytch consumer authentication adapter."""

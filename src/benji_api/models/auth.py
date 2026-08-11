@@ -12,7 +12,6 @@ class AuthIdentity(Base):
     __tablename__ = "auth_identities"
     __table_args__ = (
         UniqueConstraint("provider", "provider_subject", name="uq_auth_identities_subject"),
-        UniqueConstraint("user_id", "provider", name="uq_auth_identities_user_provider"),
         Index("ix_auth_identities_user_id", "user_id"),
     )
 

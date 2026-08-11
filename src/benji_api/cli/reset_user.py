@@ -2,34 +2,42 @@ import argparse
 import asyncio
 
 from benji_api.db.session import async_session_factory
-from benji_api.schemas.phone import normalize_phone_number
 from benji_api.services.user_reset import (
     UserResetPlan,
     build_user_reset_plan,
     execute_user_reset,
 )
+from benji_api.services.users import normalize_user_identifier
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Preview or delete all local Dot data associated with a phone number."
+        description="Preview or delete all local Dot data associated with a phone or email."
     )
-    parser.add_argument("--phone", required=True, help="Phone number in international format")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--identifier", help="Phone number or email used to message Dot")
+    target.add_argument(
+        "--phone",
+        help="Deprecated alias for --identifier; phone number in international format",
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
         help="Perform the deletion; without this flag the command is read-only",
     )
     parser.add_argument(
-        "--confirm-phone",
-        help="Required with --execute and must resolve to the same E.164 phone number",
+        "--confirm-identifier",
+        help="Required with --execute and must normalize to the requested identifier",
     )
+    parser.add_argument("--confirm-phone", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def _print_plan(plan: UserResetPlan) -> None:
-    print(f"phone:              {plan.normalized_phone}")
+    print(f"identifier:         {plan.normalized_identifier}")
+    print(f"identifier kind:    {plan.identifier_kind}")
     print(f"user:               {int(plan.user_id is not None)}")
+    print(f"user identifiers:   {len(plan.user_identifier_ids)}")
     print(f"conversations:      {len(plan.conversation_ids)}")
     print(f"group memberships:  {len(plan.conversation_member_ids)}")
     print(f"group invites:      {len(plan.conversation_invite_ids)}")
@@ -63,20 +71,23 @@ def _print_plan(plan: UserResetPlan) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    requested_value = args.identifier or args.phone
+    if requested_value is None:  # pragma: no cover - argparse enforces this
+        raise SystemExit("--identifier is required")
     if args.execute:
-        if not args.confirm_phone:
-            raise SystemExit("--confirm-phone is required with --execute")
+        confirmed_value = args.confirm_identifier or args.confirm_phone
+        if not confirmed_value:
+            raise SystemExit("--confirm-identifier is required with --execute")
         try:
-            confirmed_phone = normalize_phone_number(args.confirm_phone)
+            confirmed = normalize_user_identifier(confirmed_value)
+            requested = normalize_user_identifier(requested_value)
         except ValueError as error:
             raise SystemExit(str(error)) from error
-
-        requested_phone = normalize_phone_number(args.phone)
-        if confirmed_phone != requested_phone:
-            raise SystemExit("--confirm-phone does not match --phone")
+        if confirmed != requested:
+            raise SystemExit("--confirm-identifier does not match --identifier")
 
     async with async_session_factory() as session:
-        plan = await build_user_reset_plan(session, args.phone)
+        plan = await build_user_reset_plan(session, requested_value)
         _print_plan(plan)
 
         if not args.execute:
@@ -85,7 +96,7 @@ async def _run(args: argparse.Namespace) -> None:
 
         await execute_user_reset(session, plan)
         await session.commit()
-        print(f"\ndeleted {plan.total_records} local records for {plan.normalized_phone}")
+        print(f"\ndeleted {plan.total_records} local records for {plan.normalized_identifier}")
 
 
 def main() -> None:

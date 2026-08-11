@@ -36,15 +36,18 @@ from benji_api.models import (
     ScheduledTask,
     User,
     UserEvent,
+    UserIdentifier,
     WebhookEvent,
 )
-from benji_api.schemas.phone import normalize_phone_number
+from benji_api.services.users import normalize_email_address, normalize_user_identifier
 
 
 @dataclass(frozen=True, slots=True)
 class UserResetPlan:
-    normalized_phone: str
+    normalized_identifier: str
+    identifier_kind: str
     user_id: UUID | None
+    user_identifier_ids: tuple[UUID, ...]
     conversation_ids: tuple[UUID, ...]
     conversation_member_ids: tuple[UUID, ...]
     conversation_invite_ids: tuple[UUID, ...]
@@ -81,6 +84,7 @@ class UserResetPlan:
         return sum(
             (
                 self.user_id is not None,
+                len(self.user_identifier_ids),
                 len(self.conversation_ids),
                 len(self.conversation_member_ids),
                 len(self.conversation_invite_ids),
@@ -120,16 +124,34 @@ def _contains_exact_value(value: Any, targets: set[str]) -> bool:
         return any(_contains_exact_value(item, targets) for item in value.values())
     if isinstance(value, list):
         return any(_contains_exact_value(item, targets) for item in value)
-    return isinstance(value, str) and value in targets
+    if not isinstance(value, str):
+        return False
+    if value in targets:
+        return True
+    if "@" not in value:
+        return False
+    try:
+        return normalize_email_address(value) in targets
+    except ValueError:
+        return False
 
 
 async def build_user_reset_plan(
     session: AsyncSession,
-    phone_number: str,
+    identifier_value: str,
 ) -> UserResetPlan:
-    normalized_phone = normalize_phone_number(phone_number)
-    user_id = await session.scalar(select(User.id).where(User.phone_number == normalized_phone))
+    normalized = normalize_user_identifier(identifier_value)
+    identifier = await session.scalar(
+        select(UserIdentifier).where(
+            UserIdentifier.kind == normalized.kind.value,
+            UserIdentifier.normalized_value == normalized.value,
+        )
+    )
+    user_id = identifier.user_id if identifier is not None else None
+    if user_id is None and normalized.kind.value == "phone":
+        user_id = await session.scalar(select(User.id).where(User.phone_number == normalized.value))
 
+    user_identifier_ids: tuple[UUID, ...] = ()
     conversation_ids: tuple[UUID, ...] = ()
     conversation_member_ids: tuple[UUID, ...] = ()
     conversation_invite_ids: tuple[UUID, ...] = ()
@@ -162,6 +184,11 @@ async def build_user_reset_plan(
     chat_external_ids: tuple[str, ...] = ()
 
     if user_id is not None:
+        user_identifiers = (
+            await session.scalars(select(UserIdentifier).where(UserIdentifier.user_id == user_id))
+        ).all()
+        user_identifier_ids = tuple(item.id for item in user_identifiers)
+        member_handles = {normalized.value, *(item.normalized_value for item in user_identifiers)}
         auth_identity_ids = tuple(
             (
                 await session.scalars(
@@ -269,7 +296,7 @@ async def build_user_reset_plan(
                     select(ConversationMember.id).where(
                         or_(
                             ConversationMember.user_id == user_id,
-                            ConversationMember.external_handle == normalized_phone,
+                            ConversationMember.external_handle.in_(member_handles),
                         )
                     )
                 )
@@ -391,8 +418,16 @@ async def build_user_reset_plan(
             )
 
     webhook_targets = {
-        normalized_phone,
+        normalized.value,
         *chat_external_ids,
+        *(
+            item.normalized_value
+            for item in (
+                await session.scalars(
+                    select(UserIdentifier).where(UserIdentifier.id.in_(user_identifier_ids))
+                )
+            ).all()
+        ),
         *(str(account_id) for account_id in integration_account_ids),
         *(str(connection_id) for connection_id in financial_connection_ids),
     }
@@ -404,8 +439,10 @@ async def build_user_reset_plan(
     )
 
     return UserResetPlan(
-        normalized_phone=normalized_phone,
+        normalized_identifier=normalized.value,
+        identifier_kind=normalized.kind.value,
         user_id=user_id,
+        user_identifier_ids=user_identifier_ids,
         conversation_ids=conversation_ids,
         conversation_member_ids=conversation_member_ids,
         conversation_invite_ids=conversation_invite_ids,
@@ -550,6 +587,10 @@ async def execute_user_reset(session: AsyncSession, plan: UserResetPlan) -> None
     if plan.auth_identity_ids:
         await session.execute(
             delete(AuthIdentity).where(AuthIdentity.id.in_(plan.auth_identity_ids))
+        )
+    if plan.user_identifier_ids:
+        await session.execute(
+            delete(UserIdentifier).where(UserIdentifier.id.in_(plan.user_identifier_ids))
         )
     if plan.conversation_invite_ids:
         await session.execute(
