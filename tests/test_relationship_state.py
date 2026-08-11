@@ -114,6 +114,7 @@ async def test_relationship_state_surfaces_recent_unused_shared_work() -> None:
         session.add(
             GeneratedAppRecord(
                 app_id=used_app.id,
+                module_id="expenses",
                 kind="expense",
                 data={"amount": 10},
                 created_at=now - timedelta(hours=6),

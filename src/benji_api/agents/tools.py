@@ -36,7 +36,16 @@ from benji_api.services.financial_goals import (
     create_financial_goal,
     list_financial_goals,
 )
-from benji_api.services.generated_apps import create_generated_app, generated_app_url
+from benji_api.services.generated_app_specs import (
+    GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA,
+    GENERATED_APP_MODULES_TOOL_SCHEMA,
+    normalize_tool_initial_records,
+)
+from benji_api.services.generated_apps import (
+    create_composable_generated_app,
+    create_generated_app,
+    generated_app_url,
+)
 from benji_api.services.integrations import (
     IntegrationAuthorizationError,
     IntegrationNotConfiguredError,
@@ -517,25 +526,18 @@ class CreateGeneratedAppTool:
         return ToolDefinition(
             name="create_personal_app",
             description=(
-                "Create a small durable web app and return its share link. Use only when "
-                "the user or group explicitly asks Dot to make, build, or set up a tracker, "
-                "budget, expense splitter, or checklist. Choose budget for personal spending, "
-                "expense_splitter for shared costs, metric_tracker for weight or any numeric "
-                "habit, and checklist for plans or reusable lists. The user's explicit request "
-                "authorizes this reversible creation; do not ask for another confirmation."
+                "Create one safe declarative web app composed from independently useful modules. "
+                "Use every module the request needs instead of collapsing a multi-part workflow "
+                "into one generic checklist. For example, a birthday-planning app normally needs "
+                "an overview with the known date and venue, todos, a guest_list for RSVPs, and an "
+                "itinerary; it may also need expenses or notes. Use collection for a bounded "
+                "custom dataset that the reviewed modules do "
+                "not cover. Seed facts already known from the conversation. The user's explicit "
+                "request authorizes this reversible creation; do not ask for confirmation again."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "template": {
-                        "type": "string",
-                        "enum": [
-                            "budget",
-                            "expense_splitter",
-                            "metric_tracker",
-                            "checklist",
-                        ],
-                    },
                     "title": {"type": "string", "minLength": 1, "maxLength": 120},
                     "description": {"type": "string", "maxLength": 500},
                     "theme": {
@@ -546,62 +548,69 @@ class CreateGeneratedAppTool:
                         "type": "string",
                         "enum": ["private_link", "collaborative_link"],
                     },
-                    "currency": {"type": ["string", "null"]},
-                    "unit": {"type": ["string", "null"]},
-                    "target_number": {"type": ["number", "null"]},
-                    "target_direction": {
-                        "type": ["string", "null"],
-                        "enum": ["increase", "decrease", None],
-                    },
-                    "participants": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "maxItems": 20,
-                    },
+                    "modules": GENERATED_APP_MODULES_TOOL_SCHEMA,
+                    "initial_records": GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA,
                 },
                 "required": [
-                    "template",
                     "title",
                     "description",
                     "theme",
                     "access_mode",
-                    "currency",
-                    "unit",
-                    "target_number",
-                    "target_direction",
-                    "participants",
+                    "modules",
+                    "initial_records",
                 ],
                 "additionalProperties": False,
             },
         )
 
     async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        participants = arguments.get("participants")
-        if not isinstance(participants, list) or not all(
-            isinstance(participant, str) for participant in participants
-        ):
-            raise ValueError("participants must be a list of names")
         factory = self._session_factory or async_session_factory
         async with factory() as session:
-            bundle = await create_generated_app(
-                session,
-                user_id=context.user_id,
-                conversation_id=context.conversation_id,
-                title=arguments.get("title"),
-                description=arguments.get("description"),
-                template=arguments.get("template"),
-                theme=arguments.get("theme"),
-                access_mode=arguments.get("access_mode"),
-                currency=arguments.get("currency"),
-                unit=arguments.get("unit"),
-                target_number=arguments.get("target_number"),
-                target_direction=arguments.get("target_direction"),
-                participants=participants,
-            )
+            if "modules" in arguments:
+                bundle = await create_composable_generated_app(
+                    session,
+                    user_id=context.user_id,
+                    conversation_id=context.conversation_id,
+                    title=arguments.get("title"),
+                    description=arguments.get("description"),
+                    theme=arguments.get("theme"),
+                    access_mode=arguments.get("access_mode"),
+                    modules=arguments.get("modules"),
+                    initial_records=normalize_tool_initial_records(
+                        arguments.get("initial_records")
+                    ),
+                )
+            else:
+                participants = arguments.get("participants")
+                if not isinstance(participants, list) or not all(
+                    isinstance(participant, str) for participant in participants
+                ):
+                    raise ValueError("participants must be a list of names")
+                bundle = await create_generated_app(
+                    session,
+                    user_id=context.user_id,
+                    conversation_id=context.conversation_id,
+                    title=arguments.get("title"),
+                    description=arguments.get("description"),
+                    template=arguments.get("template"),
+                    theme=arguments.get("theme"),
+                    access_mode=arguments.get("access_mode"),
+                    currency=arguments.get("currency"),
+                    unit=arguments.get("unit"),
+                    target_number=arguments.get("target_number"),
+                    target_direction=arguments.get("target_direction"),
+                    participants=participants,
+                )
+        modules = bundle.version.specification.get("modules", [])
         return {
             "app_id": str(bundle.app.id),
             "title": bundle.app.title,
             "template": bundle.app.template,
+            "modules": [
+                {"id": module["id"], "type": module["type"]}
+                for module in modules
+                if isinstance(module, dict) and "id" in module and "type" in module
+            ],
             "access_mode": bundle.app.access_mode,
             "app_url": generated_app_url(
                 base_url=self._settings.generated_app_public_url,

@@ -17,10 +17,17 @@ from benji_api.models.generated_app import (
     GeneratedAppVersion,
 )
 from benji_api.models.user import utc_now
+from benji_api.services.generated_app_specs import (
+    APP_THEMES,
+    GeneratedAppValidationError,
+    build_composable_specification,
+    modules_from_specification,
+    resolve_record_module,
+    validate_module_record,
+)
 from benji_api.services.groups import group_app_participant_names, list_conversation_members
 
 APP_TEMPLATES = {"budget", "expense_splitter", "metric_tracker", "checklist"}
-APP_THEMES = {"coral", "sage", "ocean", "plum", "gold"}
 APP_ACCESS_MODES = {
     GeneratedAppAccessMode.PRIVATE_LINK.value,
     GeneratedAppAccessMode.COLLABORATIVE_LINK.value,
@@ -32,10 +39,6 @@ HANDLE_LIKE_PARTICIPANT = re.compile(
 
 
 class GeneratedAppNotFoundError(LookupError):
-    pass
-
-
-class GeneratedAppValidationError(ValueError):
     pass
 
 
@@ -75,11 +78,7 @@ async def create_generated_app(
         access_mode = GeneratedAppAccessMode.COLLABORATIVE_LINK.value
         if template == "expense_splitter" and (
             not participants
-            or any(
-                HANDLE_LIKE_PARTICIPANT.search(participant.strip())
-                or participant.strip().casefold() in {"group member", "everyone"}
-                for participant in participants
-            )
+            or any(_unsafe_participant_name(participant) for participant in participants)
         ):
             members = await list_conversation_members(session, conversation_id=conversation.id)
             participants = group_app_participant_names(members)
@@ -93,13 +92,17 @@ async def create_generated_app(
         target_number=target_number,
         target_direction=target_direction,
     )
-    specification = {
-        "schema_version": 1,
+    specification: dict[str, Any] = {
+        "schema_version": 2,
         "template": template,
         "theme": theme,
         "settings": settings,
         "capabilities": _template_capabilities(template),
     }
+    specification["modules"] = modules_from_specification(
+        {**specification, "schema_version": 1},
+        legacy_template=template,
+    )
     app = GeneratedApp(
         user_id=user_id,
         conversation_id=conversation_id,
@@ -126,11 +129,84 @@ async def create_generated_app(
             seen.add(key)
             record = GeneratedAppRecord(
                 app_id=app.id,
+                module_id="expenses",
                 kind="participant",
                 data={"name": name},
             )
             session.add(record)
             records.append(record)
+    await session.commit()
+    return GeneratedAppBundle(app=app, version=version, records=tuple(records))
+
+
+async def create_composable_generated_app(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    conversation_id: UUID,
+    title: str,
+    description: str,
+    theme: str,
+    access_mode: str,
+    modules: list[dict[str, Any]],
+    initial_records: list[dict[str, Any]],
+) -> GeneratedAppBundle:
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None or conversation.user_id != user_id:
+        raise GeneratedAppValidationError("Conversation does not belong to this user")
+    if access_mode not in APP_ACCESS_MODES:
+        raise GeneratedAppValidationError("Unsupported app access mode")
+    if conversation.kind == ConversationKind.GROUP.value:
+        access_mode = GeneratedAppAccessMode.COLLABORATIVE_LINK.value
+
+    clean_title = _text(title, "title", max_length=120)
+    clean_description = _optional_text(description, max_length=500) or ""
+    specification = build_composable_specification(theme=theme, modules=modules)
+    clean_seeds = _initial_records(initial_records)
+    if conversation.kind == ConversationKind.GROUP.value:
+        clean_seeds = await _replace_group_seed_handles(
+            session,
+            conversation=conversation,
+            specification=specification,
+            seeds=clean_seeds,
+        )
+
+    app = GeneratedApp(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        public_id=secrets.token_urlsafe(24),
+        title=clean_title,
+        description=clean_description,
+        template="workspace",
+        theme=theme,
+        access_mode=access_mode,
+    )
+    session.add(app)
+    await session.flush()
+    version = GeneratedAppVersion(app_id=app.id, version=1, specification=specification)
+    session.add(version)
+    await session.flush()
+    bundle = GeneratedAppBundle(app=app, version=version, records=())
+
+    records: list[GeneratedAppRecord] = []
+    for seed in sorted(clean_seeds, key=lambda value: value["kind"] != "participant"):
+        module_id, clean_data = await _validate_and_resolve_record(
+            session,
+            bundle=bundle,
+            module_id=seed["module_id"],
+            kind=seed["kind"],
+            data=seed["data"],
+        )
+        record = GeneratedAppRecord(
+            app_id=app.id,
+            module_id=module_id,
+            kind=seed["kind"],
+            actor_name=seed["actor_name"],
+            data=clean_data,
+        )
+        session.add(record)
+        records.append(record)
+        await session.flush()
     await session.commit()
     return GeneratedAppBundle(app=app, version=version, records=tuple(records))
 
@@ -191,6 +267,7 @@ async def create_generated_app_record(
     session: AsyncSession,
     *,
     public_id: str,
+    module_id: str | None,
     kind: str,
     data: dict[str, Any],
     actor_name: str | None,
@@ -203,14 +280,16 @@ async def create_generated_app_record(
     )
     if (count or 0) >= 10_000:
         raise GeneratedAppValidationError("This app has reached its record limit")
-    clean_data = await _validate_record(
+    resolved_module_id, clean_data = await _validate_and_resolve_record(
         session,
-        app=bundle.app,
+        bundle=bundle,
+        module_id=module_id,
         kind=kind,
         data=data,
     )
     record = GeneratedAppRecord(
         app_id=bundle.app.id,
+        module_id=resolved_module_id,
         kind=kind,
         actor_name=_optional_text(actor_name, max_length=120),
         data=clean_data,
@@ -232,15 +311,28 @@ async def update_generated_app_record(
     record = await session.get(GeneratedAppRecord, record_id)
     if record is None or record.app_id != bundle.app.id:
         raise GeneratedAppNotFoundError("App record was not found")
-    if bundle.app.template != "checklist" or record.kind != "item":
+    if bundle.app.template != "workspace" and (
+        bundle.app.template != "checklist" or record.kind != "item"
+    ):
         raise GeneratedAppValidationError("This record type cannot be edited")
     merged = {**record.data, **data}
-    record.data = await _validate_record(
+    _, clean_data = await _validate_and_resolve_record(
         session,
-        app=bundle.app,
+        bundle=bundle,
+        module_id=record.module_id,
         kind=record.kind,
         data=merged,
+        exclude_record_id=record.id,
     )
+    if (
+        record.kind == "participant"
+        and clean_data.get("name") != record.data.get("name")
+        and _participant_is_referenced(bundle, record)
+    ):
+        raise GeneratedAppValidationError(
+            "Remove expenses involving this participant before renaming them"
+        )
+    record.data = clean_data
     bundle.app.updated_at = utc_now()
     await session.commit()
     return await get_generated_app_by_public_id(session, public_id=public_id)
@@ -256,15 +348,8 @@ async def delete_generated_app_record(
     record = await session.get(GeneratedAppRecord, record_id)
     if record is None or record.app_id != bundle.app.id:
         raise GeneratedAppNotFoundError("App record was not found")
-    if bundle.app.template == "expense_splitter" and record.kind == "participant":
-        participant_name = record.data.get("name")
-        if any(
-            participant_name in expense.data.get("split_between", [])
-            or expense.data.get("paid_by") == participant_name
-            for expense in bundle.records
-            if expense.kind == "expense"
-        ):
-            raise GeneratedAppValidationError("Remove expenses involving this participant first")
+    if record.kind == "participant" and _participant_is_referenced(bundle, record):
+        raise GeneratedAppValidationError("Remove expenses involving this participant first")
     bundle.app.updated_at = utc_now()
     await session.delete(record)
     await session.commit()
@@ -273,6 +358,230 @@ async def delete_generated_app_record(
 
 def generated_app_url(*, base_url: str, public_id: str) -> str:
     return f"{base_url.rstrip('/')}/apps/{public_id}"
+
+
+def _participant_is_referenced(
+    bundle: GeneratedAppBundle,
+    participant: GeneratedAppRecord,
+) -> bool:
+    participant_name = participant.data.get("name")
+    return any(
+        participant_name in expense.data.get("split_between", [])
+        or expense.data.get("paid_by") == participant_name
+        for expense in bundle.records
+        if expense.kind == "expense" and expense.module_id == participant.module_id
+    )
+
+
+def _initial_records(raw_records: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_records, list) or len(raw_records) > 200:
+        raise GeneratedAppValidationError("initial_records must be a list of at most 200 records")
+    records: list[dict[str, Any]] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict) or set(raw_record) != {
+            "module_id",
+            "kind",
+            "actor_name",
+            "data",
+        }:
+            raise GeneratedAppValidationError(
+                "initial records require module_id, kind, actor_name, and data"
+            )
+        module_id = raw_record.get("module_id")
+        kind = raw_record.get("kind")
+        data = raw_record.get("data")
+        if not isinstance(module_id, str) or not isinstance(kind, str):
+            raise GeneratedAppValidationError("initial record module_id and kind must be text")
+        if not isinstance(data, dict):
+            raise GeneratedAppValidationError("initial record data must be an object")
+        records.append(
+            {
+                "module_id": module_id,
+                "kind": kind,
+                "actor_name": _optional_text(raw_record.get("actor_name"), max_length=120),
+                "data": data,
+            }
+        )
+    return records
+
+
+async def _replace_group_seed_handles(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    specification: dict[str, Any],
+    seeds: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    members = await list_conversation_members(session, conversation_id=conversation.id)
+    names = group_app_participant_names(members)
+    aliases: dict[str, str] = {}
+    for (member, user), name in zip(members, names, strict=True):
+        raw_aliases = [member.external_handle, member.external_id, str(member.id)]
+        if user is not None:
+            raw_aliases.extend([str(user.id), user.phone_number])
+        for alias in raw_aliases:
+            if alias:
+                aliases[alias.strip().casefold()] = name
+    result = list(seeds)
+    for module in specification["modules"]:
+        if module["type"] == "expenses" and module["settings"]["mode"] == "split":
+            kind = "participant"
+            make_data = lambda name: {"name": name}  # noqa: E731
+        elif module["type"] == "guest_list":
+            kind = "guest"
+            make_data = lambda name: {  # noqa: E731
+                "name": name,
+                "status": "invited",
+                "party_size": 1,
+                "note": "",
+            }
+        else:
+            continue
+        matching = [
+            seed
+            for seed in result
+            if seed["module_id"] == module["id"] and seed["kind"] == kind
+        ]
+        has_unsafe_name = any(
+            _unsafe_participant_name(str(seed["data"].get("name", ""))) for seed in matching
+        )
+        replacements = dict(aliases)
+        for index, seed in enumerate(matching):
+            raw_name = str(seed["data"].get("name", "")).strip()
+            if HANDLE_LIKE_PARTICIPANT.search(raw_name) and index < len(names):
+                replacements.setdefault(raw_name.casefold(), names[index])
+        if module["type"] == "expenses":
+            result = [
+                _rewrite_group_expense_seed(
+                    seed,
+                    module_id=module["id"],
+                    names=names,
+                    replacements=replacements,
+                )
+                for seed in result
+            ]
+        if matching and not has_unsafe_name:
+            continue
+        result = [
+            seed
+            for seed in result
+            if not (seed["module_id"] == module["id"] and seed["kind"] == kind)
+        ]
+        result.extend(
+            {
+                "module_id": module["id"],
+                "kind": kind,
+                "actor_name": None,
+                "data": make_data(name),
+            }
+            for name in names
+        )
+    return result
+
+
+def _unsafe_participant_name(value: str) -> bool:
+    clean = value.strip()
+    return bool(
+        HANDLE_LIKE_PARTICIPANT.search(clean)
+        or clean.casefold() in {"group member", "everyone"}
+    )
+
+
+def _rewrite_group_expense_seed(
+    seed: dict[str, Any],
+    *,
+    module_id: str,
+    names: list[str],
+    replacements: dict[str, str],
+) -> dict[str, Any]:
+    if seed["module_id"] != module_id or seed["kind"] != "expense":
+        return seed
+    rewritten = {**seed, "data": dict(seed["data"])}
+    data = rewritten["data"]
+
+    paid_by = data.get("paid_by")
+    if isinstance(paid_by, str):
+        data["paid_by"] = replacements.get(paid_by.strip().casefold(), paid_by)
+
+    split_between = data.get("split_between")
+    if isinstance(split_between, list):
+        rewritten_split: list[str] = []
+        for raw_name in split_between:
+            if not isinstance(raw_name, str):
+                continue
+            key = raw_name.strip().casefold()
+            if key in {"everyone", "group member"}:
+                rewritten_split.extend(names)
+            else:
+                rewritten_split.append(replacements.get(key, raw_name))
+        data["split_between"] = list(dict.fromkeys(rewritten_split))
+
+    actor_name = rewritten.get("actor_name")
+    if isinstance(actor_name, str):
+        rewritten["actor_name"] = replacements.get(actor_name.strip().casefold(), actor_name)
+    return rewritten
+
+
+async def _validate_and_resolve_record(
+    session: AsyncSession,
+    *,
+    bundle: GeneratedAppBundle,
+    module_id: str | None,
+    kind: str,
+    data: dict[str, Any],
+    exclude_record_id: UUID | None = None,
+) -> tuple[str, dict[str, Any]]:
+    if bundle.app.template != "workspace":
+        legacy_module_id = {
+            "budget": "expenses",
+            "expense_splitter": "expenses",
+            "metric_tracker": "metric",
+            "checklist": "todos",
+        }.get(bundle.app.template)
+        if legacy_module_id is None:
+            raise GeneratedAppValidationError("Unsupported legacy app template")
+        if module_id is not None and module_id != legacy_module_id:
+            raise GeneratedAppValidationError("module_id does not belong to this app")
+        return legacy_module_id, await _validate_record(
+            session,
+            app=bundle.app,
+            kind=kind,
+            data=data,
+        )
+
+    module = resolve_record_module(
+        bundle.version.specification,
+        legacy_template=bundle.app.template,
+        module_id=module_id,
+        kind=kind,
+    )
+    clean_data = validate_module_record(module, kind=kind, data=data)
+    statement = select(GeneratedAppRecord).where(
+        GeneratedAppRecord.app_id == bundle.app.id,
+        GeneratedAppRecord.module_id == module["id"],
+    )
+    if exclude_record_id is not None:
+        statement = statement.where(GeneratedAppRecord.id != exclude_record_id)
+    module_records = list((await session.scalars(statement)).all())
+
+    if kind in {"participant", "guest"}:
+        name = str(clean_data["name"]).casefold()
+        if any(
+            record.kind == kind and str(record.data.get("name", "")).casefold() == name
+            for record in module_records
+        ):
+            raise GeneratedAppValidationError(f"That {kind.replace('_', ' ')} already exists")
+    if kind == "expense" and module["settings"]["mode"] == "split":
+        participant_names = {
+            str(record.data.get("name"))
+            for record in module_records
+            if record.kind == "participant"
+        }
+        if clean_data["paid_by"] not in participant_names or any(
+            name not in participant_names for name in clean_data["split_between"]
+        ):
+            raise GeneratedAppValidationError("Expense participants must already exist")
+    return module["id"], clean_data
 
 
 def _template_settings(

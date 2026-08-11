@@ -76,12 +76,19 @@ class GeneratedAppRecord(Base):
     __table_args__ = (
         Index("ix_generated_app_records_app_id", "app_id"),
         Index("ix_generated_app_records_app_kind", "app_id", "kind"),
+        Index(
+            "ix_generated_app_records_app_module_kind",
+            "app_id",
+            "module_id",
+            "kind",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     app_id: Mapped[UUID] = mapped_column(
         ForeignKey("generated_apps.id", ondelete="CASCADE"), nullable=False
     )
+    module_id: Mapped[str] = mapped_column(String(64), nullable=False)
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     actor_name: Mapped[str | None] = mapped_column(String(120))
     data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)

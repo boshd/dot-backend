@@ -50,6 +50,7 @@ class GeneratedAppCatalogResponse(BaseModel):
 
 class GeneratedAppRecordResponse(BaseModel):
     id: UUID
+    module_id: str
     kind: str
     actor_name: str | None
     data: dict[str, Any]
@@ -63,6 +64,7 @@ class GeneratedAppResponse(GeneratedAppSummaryResponse):
 
 
 class GeneratedAppRecordCreateRequest(BaseModel):
+    module_id: str | None = Field(default=None, min_length=1, max_length=64)
     kind: str = Field(min_length=1, max_length=64)
     data: dict[str, Any]
     actor_name: str | None = Field(default=None, max_length=120)
@@ -112,6 +114,7 @@ async def add_generated_app_record(
         bundle = await create_generated_app_record(
             session,
             public_id=public_id,
+            module_id=request.module_id,
             kind=request.kind,
             data=request.data,
             actor_name=request.actor_name,
@@ -216,6 +219,7 @@ def _bundle_response(
         records=[
             GeneratedAppRecordResponse(
                 id=record.id,
+                module_id=record.module_id,
                 kind=record.kind,
                 actor_name=record.actor_name,
                 data=record.data,

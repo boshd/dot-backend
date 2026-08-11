@@ -187,3 +187,8 @@ messages wake it only in `mentions` mode when they name Dot or reply to a Dot de
 Memory data is separate from integration documents. Users can inspect or permanently
 forget specific memories conversationally through guarded tools. See
 [`../docs/memory.md`](../docs/memory.md) for the storage and processing model.
+
+Generated apps use a versioned, composable module specification with validated module-scoped
+records and a bounded custom-collection escape hatch. See
+[`../docs/generated-apps.md`](../docs/generated-apps.md) for the public contract and compatibility
+rules.

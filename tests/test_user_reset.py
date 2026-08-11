@@ -80,6 +80,7 @@ async def test_user_reset_deletes_related_local_data_only() -> None:
         session.add(
             GeneratedAppRecord(
                 app_id=generated_app.id,
+                module_id="todos",
                 kind="item",
                 data={"text": "temporary", "completed": False},
             )

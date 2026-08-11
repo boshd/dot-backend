@@ -567,14 +567,19 @@ def group_app_participant_names(
     members: tuple[tuple[ConversationMember, User | None], ...],
 ) -> list[str]:
     names: list[str] = []
+    used: set[str] = set()
     for ordinal, (member, user) in enumerate(members, start=1):
         known_name = (
             user.display_name if user is not None and user.display_name else member.display_name
         )
-        if known_name:
-            names.append(known_name)
-        else:
-            names.append(f"person {ordinal}")
+        base_name = known_name or f"person {ordinal}"
+        name = base_name
+        suffix = 2
+        while name.casefold() in used:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        names.append(name)
+        used.add(name.casefold())
     return names
 
 

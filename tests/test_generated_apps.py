@@ -1,3 +1,5 @@
+from uuid import UUID
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -13,6 +15,7 @@ from benji_api.main import app
 from benji_api.models.channel import Conversation, ConversationKind, ConversationMember
 from benji_api.models.generated_app import GeneratedAppRecord
 from benji_api.models.user import OnboardingStatus, OnboardingStep, User
+from benji_api.services.generated_apps import create_generated_app
 
 
 @pytest.mark.anyio
@@ -144,10 +147,12 @@ async def test_group_app_is_always_collaborative() -> None:
                 ConversationMember(
                     conversation_id=conversation.id,
                     external_handle="+14155552672",
+                    display_name="Alex",
                 ),
                 ConversationMember(
                     conversation_id=conversation.id,
                     external_handle="friend@example.com",
+                    display_name="Alex",
                 ),
             ]
         )
@@ -160,19 +165,64 @@ async def test_group_app_is_always_collaborative() -> None:
     result = await tool.execute(
         context=ToolContext(user_id=owner.id, conversation_id=conversation.id),
         arguments={
-            "template": "expense_splitter",
             "title": "Cottage",
             "description": "Shared trip expenses.",
             "theme": "ocean",
             "access_mode": "private_link",
-            "currency": "CAD",
-            "unit": None,
-            "target_number": None,
-            "target_direction": None,
-            "participants": [
-                "5a0f59b0-ef77-4e47-8715-0df318dc12f4",
-                "+14155552672",
-                "friend@example.com",
+            "modules": [
+                {
+                    "id": "expenses",
+                    "type": "expenses",
+                    "title": "Expenses",
+                    "description": "Track the cottage costs.",
+                    "settings": {"currency": "CAD", "budget": None, "mode": "split"},
+                },
+                {
+                    "id": "guests",
+                    "type": "guest_list",
+                    "title": "Guests",
+                    "description": "Who's coming.",
+                    "settings": {"allow_plus_ones": False},
+                },
+            ],
+            "initial_records": [
+                *[
+                    {
+                        "module_id": "expenses",
+                        "kind": "participant",
+                        "actor_name": None,
+                        "data": {"name": handle},
+                    }
+                    for handle in [
+                        "5a0f59b0-ef77-4e47-8715-0df318dc12f4",
+                        "+14155552672",
+                        "friend@example.com",
+                    ]
+                ],
+                {
+                    "module_id": "expenses",
+                    "kind": "expense",
+                    "actor_name": "+14155552672",
+                    "data": {
+                        "amount": 90,
+                        "category": "food",
+                        "note": "groceries",
+                        "date": "2026-08-11",
+                        "paid_by": "+14155552672",
+                        "split_between": ["everyone"],
+                    },
+                },
+                {
+                    "module_id": "guests",
+                    "kind": "guest",
+                    "actor_name": None,
+                    "data": {
+                        "name": "everyone",
+                        "status": "invited",
+                        "party_size": 1,
+                        "note": "",
+                    },
+                },
             ],
         },
     )
@@ -184,9 +234,661 @@ async def test_group_app_is_always_collaborative() -> None:
                 select(GeneratedAppRecord).order_by(GeneratedAppRecord.created_at)
             )
         ).all()
-    assert [record.data["name"] for record in records] == [
+    participants = [record for record in records if record.kind == "participant"]
+    guests = [record for record in records if record.kind == "guest"]
+    expense = next(record for record in records if record.kind == "expense")
+    assert [record.data["name"] for record in participants] == [
         "Kareem",
-        "person 2",
-        "person 3",
+        "Alex",
+        "Alex 2",
     ]
+    assert [record.data["name"] for record in guests] == ["Kareem", "Alex", "Alex 2"]
+    assert expense.data["paid_by"] == "Alex"
+    assert expense.data["split_between"] == ["Kareem", "Alex", "Alex 2"]
+    assert expense.actor_name == "Alex"
+
+    safe_result = await tool.execute(
+        context=ToolContext(user_id=owner.id, conversation_id=conversation.id),
+        arguments={
+            "title": "Second cottage split",
+            "description": "Uses known display names with handle-based expense references.",
+            "theme": "sage",
+            "access_mode": "private_link",
+            "modules": [
+                {
+                    "id": "expenses",
+                    "type": "expenses",
+                    "title": "Expenses",
+                    "description": "",
+                    "settings": {"currency": "CAD", "budget": None, "mode": "split"},
+                }
+            ],
+            "initial_records": [
+                *[
+                    {
+                        "module_id": "expenses",
+                        "kind": "participant",
+                        "actor_name": None,
+                        "data": {"name": name},
+                    }
+                    for name in ["Kareem", "Alex", "Alex 2"]
+                ],
+                {
+                    "module_id": "expenses",
+                    "kind": "expense",
+                    "actor_name": "friend@example.com",
+                    "data": {
+                        "amount": 45,
+                        "category": "transport",
+                        "note": "taxi",
+                        "date": "2026-08-11",
+                        "paid_by": "friend@example.com",
+                        "split_between": ["everyone"],
+                    },
+                },
+            ],
+        },
+    )
+    async with session_factory() as session:
+        safe_records = (
+            await session.scalars(
+                select(GeneratedAppRecord)
+                .where(GeneratedAppRecord.app_id == UUID(safe_result["app_id"]))
+                .order_by(GeneratedAppRecord.created_at)
+            )
+        ).all()
+    safe_expense = next(record for record in safe_records if record.kind == "expense")
+    assert safe_expense.data["paid_by"] == "Alex 2"
+    assert safe_expense.data["split_between"] == ["Kareem", "Alex", "Alex 2"]
+    assert safe_expense.actor_name == "Alex 2"
     await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_birthday_request_creates_one_seeded_multi_module_app() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    phone = "+14155552673"
+    async with session_factory() as session:
+        user = User(phone_number=phone)
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.commit()
+
+    settings = Settings(
+        web_chat_dev_identity_enabled=True,
+        generated_app_public_url="https://dot.example",
+    )
+    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
+    result = await tool.execute(
+        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+        arguments={
+            "title": "Nour's birthday",
+            "description": "Plan the party in one place.",
+            "theme": "gold",
+            "access_mode": "collaborative_link",
+            "modules": [
+                {
+                    "id": "overview",
+                    "type": "overview",
+                    "title": "Birthday",
+                    "description": "The plan at a glance.",
+                    "settings": {
+                        "body": "Everything for Nour's birthday in one place.",
+                        "facts": [
+                            {"label": "Date", "value": "August 20, 2026"},
+                            {"label": "Location", "value": "Home"},
+                        ],
+                    },
+                },
+                {
+                    "id": "todos",
+                    "type": "todos",
+                    "title": "To dos",
+                    "description": "Everything to get done.",
+                    "settings": {"show_completed": True},
+                },
+                {
+                    "id": "guests",
+                    "type": "guest_list",
+                    "title": "Guests",
+                    "description": "Invites and RSVPs.",
+                    "settings": {"allow_plus_ones": True},
+                },
+                {
+                    "id": "plan",
+                    "type": "itinerary",
+                    "title": "Plan",
+                    "description": "The party timeline.",
+                    "settings": {"timezone": "Africa/Cairo"},
+                },
+            ],
+            "initial_records": [
+                {
+                    "module_id": "todos",
+                    "kind": "todo",
+                    "actor_name": None,
+                    "data": {
+                        "text": "Book the cake",
+                        "completed": False,
+                        "due_date": None,
+                        "assignee": None,
+                        "priority": "high",
+                    },
+                },
+                {
+                    "module_id": "guests",
+                    "kind": "guest",
+                    "actor_name": None,
+                    "data": {
+                        "name": "Nour",
+                        "status": "going",
+                        "party_size": 1,
+                        "note": "birthday person",
+                    },
+                },
+                {
+                    "module_id": "plan",
+                    "kind": "itinerary_item",
+                    "actor_name": None,
+                    "data": {
+                        "title": "Cake and candles",
+                        "date": "2026-08-20",
+                        "start_time": "20:00",
+                        "end_time": "20:30",
+                        "location": "home",
+                        "note": "",
+                        "completed": False,
+                    },
+                },
+            ],
+        },
+    )
+    assert result["template"] == "workspace"
+    assert result["modules"] == [
+        {"id": "overview", "type": "overview"},
+        {"id": "todos", "type": "todos"},
+        {"id": "guests", "type": "guest_list"},
+        {"id": "plan", "type": "itinerary"},
+    ]
+    public_id = result["app_url"].rsplit("/", 1)[-1]
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            opened = await client.get(f"/api/v1/apps/public/{public_id}")
+            assert opened.status_code == 200
+            payload = opened.json()
+            assert payload["specification"]["schema_version"] == 2
+            assert [module["type"] for module in payload["specification"]["modules"]] == [
+                "overview",
+                "todos",
+                "guest_list",
+                "itinerary",
+            ]
+            assert payload["specification"]["modules"][0]["settings"]["facts"][0] == {
+                "label": "Date",
+                "value": "August 20, 2026",
+            }
+            assert {record["module_id"] for record in payload["records"]} == {
+                "todos",
+                "guests",
+                "plan",
+            }
+
+            todo = next(record for record in payload["records"] if record["kind"] == "todo")
+            updated = await client.patch(
+                f"/api/v1/apps/public/{public_id}/records/{todo['id']}",
+                json={"data": {"completed": True}},
+            )
+            assert updated.status_code == 200
+            changed = next(
+                record for record in updated.json()["records"] if record["id"] == todo["id"]
+            )
+            assert changed["data"]["completed"] is True
+
+            wrong_module = await client.post(
+                f"/api/v1/apps/public/{public_id}/records",
+                json={
+                    "module_id": "todos",
+                    "kind": "guest",
+                    "data": {
+                        "name": "Omar",
+                        "status": "invited",
+                        "party_size": 1,
+                        "note": "",
+                    },
+                },
+            )
+            assert wrong_module.status_code == 422
+
+            unknown_module = await client.post(
+                f"/api/v1/apps/public/{public_id}/records",
+                json={
+                    "module_id": "missing",
+                    "kind": "guest",
+                    "data": {
+                        "name": "Omar",
+                        "status": "invited",
+                        "party_size": 1,
+                        "note": "",
+                    },
+                },
+            )
+            assert unknown_module.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_collection_module_crud_validates_configured_fields() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    phone = "+14155552674"
+    async with session_factory() as session:
+        user = User(phone_number=phone)
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.commit()
+
+    settings = Settings(web_chat_dev_identity_enabled=True)
+    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
+    result = await tool.execute(
+        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+        arguments={
+            "title": "Venue shortlist",
+            "description": "Compare possible venues.",
+            "theme": "sage",
+            "access_mode": "private_link",
+            "modules": [
+                {
+                    "id": "venues",
+                    "type": "collection",
+                    "title": "Venues",
+                    "description": "The shortlist.",
+                    "settings": {
+                        "display": "cards",
+                        "primary_field": "name",
+                        "currency": "EGP",
+                        "fields": [
+                            {
+                                "key": "name",
+                                "label": "Name",
+                                "type": "text",
+                                "required": True,
+                                "options": [],
+                            },
+                            {
+                                "key": "status",
+                                "label": "Status",
+                                "type": "select",
+                                "required": True,
+                                "options": ["maybe", "booked"],
+                            },
+                            {
+                                "key": "price",
+                                "label": "Price",
+                                "type": "currency",
+                                "required": False,
+                                "options": [],
+                            },
+                        ],
+                    },
+                }
+            ],
+            "initial_records": [
+                {
+                    "module_id": "venues",
+                    "kind": "entry",
+                    "actor_name": None,
+                    "data": {
+                        "values": [
+                            {
+                                "field_key": "name",
+                                "text_value": "The Garden",
+                                "number_value": None,
+                                "boolean_value": None,
+                            },
+                            {
+                                "field_key": "status",
+                                "text_value": "maybe",
+                                "number_value": None,
+                                "boolean_value": None,
+                            },
+                            {
+                                "field_key": "price",
+                                "text_value": None,
+                                "number_value": 12_000,
+                                "boolean_value": None,
+                            },
+                        ]
+                    },
+                }
+            ],
+        },
+    )
+    public_id = result["app_url"].rsplit("/", 1)[-1]
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            opened = await client.get(f"/api/v1/apps/public/{public_id}")
+            assert opened.json()["specification"]["modules"][0]["settings"]["currency"] == "EGP"
+            record = opened.json()["records"][0]
+            assert record["module_id"] == "venues"
+            assert record["data"] == {
+                "name": "The Garden",
+                "status": "maybe",
+                "price": 12_000.0,
+            }
+
+            updated = await client.patch(
+                f"/api/v1/apps/public/{public_id}/records/{record['id']}",
+                json={"data": {"status": "booked", "price": None}},
+            )
+            assert updated.status_code == 200
+            assert updated.json()["records"][0]["data"]["price"] is None
+
+            invalid = await client.post(
+                f"/api/v1/apps/public/{public_id}/records",
+                json={
+                    "module_id": "venues",
+                    "kind": "entry",
+                    "data": {"name": "Other", "status": "not-an-option"},
+                },
+            )
+            assert invalid.status_code == 422
+
+            deleted = await client.delete(
+                f"/api/v1/apps/public/{public_id}/records/{record['id']}"
+            )
+            assert deleted.status_code == 200
+            assert deleted.json()["records"] == []
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_split_participant_cannot_be_renamed_or_deleted_while_referenced() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with session_factory() as session:
+        user = User(phone_number="+14155552677")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.commit()
+
+    settings = Settings(web_chat_dev_identity_enabled=True)
+    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
+    result = await tool.execute(
+        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+        arguments={
+            "title": "Trip split",
+            "description": "Shared expenses.",
+            "theme": "ocean",
+            "access_mode": "collaborative_link",
+            "modules": [
+                {
+                    "id": "expenses",
+                    "type": "expenses",
+                    "title": "Expenses",
+                    "description": "",
+                    "settings": {"currency": "CAD", "budget": None, "mode": "split"},
+                }
+            ],
+            "initial_records": [
+                {
+                    "module_id": "expenses",
+                    "kind": "participant",
+                    "actor_name": None,
+                    "data": {"name": "Alice"},
+                },
+                {
+                    "module_id": "expenses",
+                    "kind": "participant",
+                    "actor_name": None,
+                    "data": {"name": "Bob"},
+                },
+                {
+                    "module_id": "expenses",
+                    "kind": "expense",
+                    "actor_name": "Alice",
+                    "data": {
+                        "amount": 40,
+                        "category": "food",
+                        "note": "dinner",
+                        "date": "2026-08-11",
+                        "paid_by": "Alice",
+                        "split_between": ["Alice", "Bob"],
+                    },
+                },
+            ],
+        },
+    )
+    public_id = result["app_url"].rsplit("/", 1)[-1]
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            opened = await client.get(f"/api/v1/apps/public/{public_id}")
+            alice = next(
+                record
+                for record in opened.json()["records"]
+                if record["kind"] == "participant" and record["data"]["name"] == "Alice"
+            )
+
+            renamed = await client.patch(
+                f"/api/v1/apps/public/{public_id}/records/{alice['id']}",
+                json={"data": {"name": "Alicia"}},
+            )
+            assert renamed.status_code == 422
+
+            deleted = await client.delete(
+                f"/api/v1/apps/public/{public_id}/records/{alice['id']}"
+            )
+            assert deleted.status_code == 422
+
+            unchanged = await client.get(f"/api/v1/apps/public/{public_id}")
+            assert any(
+                record["kind"] == "participant" and record["data"]["name"] == "Alice"
+                for record in unchanged.json()["records"]
+            )
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_legacy_v1_checklist_item_remains_editable_without_module_id() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    phone = "+14155552675"
+    async with session_factory() as session:
+        user = User(phone_number=phone)
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.flush()
+        bundle = await create_generated_app(
+            session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            title="Old checklist",
+            description="",
+            template="checklist",
+            theme="coral",
+            access_mode="private_link",
+            currency=None,
+            unit=None,
+            target_number=None,
+            target_direction=None,
+            participants=[],
+        )
+        bundle.version.specification = {
+            "schema_version": 1,
+            "template": "checklist",
+            "theme": "coral",
+            "settings": {},
+            "capabilities": ["items", "completion_progress"],
+        }
+        await session.commit()
+        public_id = bundle.app.public_id
+
+    settings = Settings(web_chat_dev_identity_enabled=True)
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            added = await client.post(
+                f"/api/v1/apps/public/{public_id}/records",
+                json={"kind": "item", "data": {"text": "legacy", "completed": False}},
+            )
+            assert added.status_code == 200
+            item = added.json()["records"][0]
+            assert item["module_id"] == "todos"
+
+            toggled = await client.patch(
+                f"/api/v1/apps/public/{public_id}/records/{item['id']}",
+                json={"data": {"completed": True}},
+            )
+            assert toggled.status_code == 200
+            assert toggled.json()["records"][0]["data"]["completed"] is True
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_legacy_expense_splitter_keeps_participant_references() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with session_factory() as session:
+        user = User(phone_number="+14155552676")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.flush()
+        bundle = await create_generated_app(
+            session,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            title="Trip split",
+            description="",
+            template="expense_splitter",
+            theme="ocean",
+            access_mode="collaborative_link",
+            currency="CAD",
+            unit=None,
+            target_number=None,
+            target_direction=None,
+            participants=["Alice", "Bob"],
+        )
+        public_id = bundle.app.public_id
+
+    settings = Settings(web_chat_dev_identity_enabled=True)
+
+    async def override_session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            added = await client.post(
+                f"/api/v1/apps/public/{public_id}/records",
+                json={
+                    "kind": "expense",
+                    "data": {
+                        "amount": 100,
+                        "description": "Dinner",
+                        "paid_by": "Alice",
+                        "split_between": ["Alice", "Bob"],
+                        "date": "2026-08-20",
+                    },
+                },
+            )
+            assert added.status_code == 200
+            expense = next(
+                record for record in added.json()["records"] if record["kind"] == "expense"
+            )
+            alice = next(
+                record
+                for record in added.json()["records"]
+                if record["kind"] == "participant" and record["data"]["name"] == "Alice"
+            )
+            assert expense["module_id"] == "expenses"
+
+            blocked = await client.delete(
+                f"/api/v1/apps/public/{public_id}/records/{alice['id']}"
+            )
+            assert blocked.status_code == 422
+
+            assert (
+                await client.delete(
+                    f"/api/v1/apps/public/{public_id}/records/{expense['id']}"
+                )
+            ).status_code == 200
+            assert (
+                await client.delete(f"/api/v1/apps/public/{public_id}/records/{alice['id']}")
+            ).status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+def test_create_app_tool_schema_closes_every_object_for_strict_mode() -> None:
+    schema = CreateGeneratedAppTool(Settings()).definition.parameters
+
+    def assert_closed(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                assert node.get("additionalProperties") is False
+                assert set(node.get("required", [])) == set(node.get("properties", {}))
+            for value in node.values():
+                assert_closed(value)
+        elif isinstance(node, list):
+            for value in node:
+                assert_closed(value)
+
+    assert_closed(schema)
