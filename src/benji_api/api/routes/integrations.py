@@ -63,6 +63,7 @@ from benji_api.services.integrations import (
     consume_plaid_connect_link,
     create_oauth_authorization,
     inspect_connect_link,
+    plaid_connect_surface_url,
 )
 from benji_api.services.user_events import dispatch_user_event, enqueue_user_event
 
@@ -327,15 +328,8 @@ async def open_integration_connect_link(
         link = await inspect_connect_link(session, raw_token=token)
         definition = get_integration(link.integration_key)
         if definition is not None and definition.provider == "plaid":
-            query = urlencode(
-                {
-                    "tab": "integrations",
-                    "connect": "plaid",
-                    "connect_token": token,
-                }
-            )
             return RedirectResponse(
-                f"{settings.web_app_url}/?{query}",
+                plaid_connect_surface_url(settings, raw_token=token),
                 status_code=status.HTTP_303_SEE_OTHER,
             )
         authorization = await consume_connect_link(

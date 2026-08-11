@@ -2,6 +2,7 @@ import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -62,6 +63,12 @@ class CompletedIntegration:
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def plaid_connect_surface_url(settings: Settings, *, raw_token: str) -> str:
+    """Keep the private capability token client-side until the dedicated flow consumes it."""
+    fragment = urlencode({"token": raw_token})
+    return f"{settings.web_app_url}/connect/plaid#{fragment}"
 
 
 def build_google_integration_client(settings: Settings) -> GoogleIntegrationClient:
@@ -148,8 +155,12 @@ async def create_integration_connect_link(
         )
     )
     await session.commit()
+    if definition.provider == "plaid":
+        url = plaid_connect_surface_url(settings, raw_token=raw_token)
+    else:
+        url = f"{settings.public_api_url}/api/v1/integrations/connect/{raw_token}"
     return IntegrationConnectLinkResult(
-        url=f"{settings.public_api_url}/api/v1/integrations/connect/{raw_token}",
+        url=url,
         expires_at=expires_at,
     )
 

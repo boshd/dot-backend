@@ -1,5 +1,6 @@
 import hashlib
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 import pytest
@@ -33,6 +34,10 @@ from benji_api.services.finance import (
     create_plaid_link_token,
     disconnect_financial_connection,
     sync_financial_connection,
+)
+from benji_api.services.integrations import (
+    create_integration_connect_link,
+    inspect_connect_link,
 )
 
 
@@ -142,6 +147,50 @@ async def test_plaid_webhook_signature_and_body_are_verified() -> None:
 
     assert await client.verify_webhook(body=body, signed_jwt=signed) is True
     assert await client.verify_webhook(body=body + b" ", signed_jwt=signed) is False
+
+
+@pytest.mark.anyio
+async def test_plaid_messaging_link_opens_dedicated_private_surface() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        web_app_url="https://dot.example",
+        public_api_url="https://api.dot.example",
+        integration_token_encryption_key=Fernet.generate_key().decode(),
+        plaid_client_id="plaid-client",
+        plaid_secret="plaid-secret",
+    )
+
+    async with session_factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.commit()
+
+        link = await create_integration_connect_link(
+            session,
+            user_id=user.id,
+            integration_key="plaid",
+            settings=settings,
+        )
+        parsed = urlparse(link.url)
+        assert (parsed.scheme, parsed.netloc, parsed.path) == (
+            "https",
+            "dot.example",
+            "/connect/plaid",
+        )
+        assert parsed.query == ""
+        raw_token = parse_qs(parsed.fragment)["token"][0]
+        assert user.phone_number not in link.url
+        assert str(user.id) not in link.url
+
+        stored = await inspect_connect_link(session, raw_token=raw_token)
+        assert stored.user_id == user.id
+        assert stored.integration_key == "plaid"
+        assert stored.consumed_at is None
+
+    await engine.dispose()
 
 
 @pytest.mark.anyio
