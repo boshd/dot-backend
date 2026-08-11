@@ -18,12 +18,13 @@ from benji_api.agents.tools import (
 from benji_api.agents.types import ToolContext
 from benji_api.config import Settings
 from benji_api.db.base import Base
-from benji_api.integrations.plaid.client import PlaidClient
+from benji_api.integrations.plaid.client import PlaidClient, PlaidProviderError
 from benji_api.models import (
     Conversation,
     FinancialAccount,
     FinancialConnection,
     FinancialGoal,
+    FinancialLinkSession,
     FinancialTransaction,
     ScheduledTask,
     User,
@@ -36,6 +37,8 @@ from benji_api.services.finance import (
     sync_financial_connection,
 )
 from benji_api.services.integrations import (
+    IntegrationAuthorizationError,
+    consume_plaid_connect_link,
     create_integration_connect_link,
     inspect_connect_link,
 )
@@ -117,6 +120,18 @@ class FakePlaidClient:
         self.removed_items.append(access_token)
 
 
+class FailingOncePlaidClient(FakePlaidClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    async def create_link_token(self, **arguments: object) -> dict[str, object]:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise PlaidProviderError("Provider configuration failed")
+        return await super().create_link_token(**arguments)
+
+
 class PlaidClientWithVerificationKey(PlaidClient):
     def __init__(self, key: dict[str, object]) -> None:
         super().__init__(client_id="client", secret="secret", base_url="https://example.com")
@@ -189,6 +204,56 @@ async def test_plaid_messaging_link_opens_dedicated_private_surface() -> None:
         assert stored.user_id == user.id
         assert stored.integration_key == "plaid"
         assert stored.consumed_at is None
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_plaid_messaging_link_is_consumed_only_after_provider_succeeds() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    settings = Settings(
+        web_app_url="https://dot.example",
+        integration_token_encryption_key=Fernet.generate_key().decode(),
+        plaid_client_id="plaid-client",
+        plaid_secret="plaid-secret",
+    )
+    fake_plaid = FailingOncePlaidClient()
+
+    async with session_factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.commit()
+        link = await create_integration_connect_link(
+            session,
+            user_id=user.id,
+            integration_key="plaid",
+            settings=settings,
+        )
+        raw_token = parse_qs(urlparse(link.url).fragment)["token"][0]
+
+        with pytest.raises(PlaidProviderError):
+            await consume_plaid_connect_link(
+                session,
+                raw_token=raw_token,
+                settings=settings,
+                plaid_client=fake_plaid,  # type: ignore[arg-type]
+            )
+        assert (await inspect_connect_link(session, raw_token=raw_token)).consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(FinancialLinkSession)) == 0
+
+        result = await consume_plaid_connect_link(
+            session,
+            raw_token=raw_token,
+            settings=settings,
+            plaid_client=fake_plaid,  # type: ignore[arg-type]
+        )
+        assert result.link_token == "link-sandbox-test"
+        assert await session.scalar(select(func.count()).select_from(FinancialLinkSession)) == 1
+        with pytest.raises(IntegrationAuthorizationError):
+            await inspect_connect_link(session, raw_token=raw_token)
 
     await engine.dispose()
 

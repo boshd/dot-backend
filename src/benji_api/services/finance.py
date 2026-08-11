@@ -82,6 +82,7 @@ async def create_plaid_link_token(
     settings: Settings,
     plaid_client: PlaidClient | None = None,
     connection_id: UUID | None = None,
+    commit: bool = True,
 ) -> FinancialLinkToken:
     if settings.integration_token_encryption_key is None:
         raise FinancialIntegrationNotConfiguredError(
@@ -129,7 +130,10 @@ async def create_plaid_link_token(
             expires_at=expires_at,
         )
     )
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return FinancialLinkToken(
         link_token=link_token,
         exchange_token=raw_exchange_token,

@@ -14,6 +14,7 @@ from benji_api.integrations.google.client import (
     GoogleIntegrationClient,
     GoogleProviderError,
 )
+from benji_api.integrations.plaid.client import PlaidClient
 from benji_api.models.integration import (
     IntegrationAccount,
     IntegrationConnectLink,
@@ -213,21 +214,36 @@ async def consume_plaid_connect_link(
     *,
     raw_token: str,
     settings: Settings,
+    plaid_client: PlaidClient | None = None,
 ):
-    link = await inspect_connect_link(session, raw_token=raw_token)
+    link = await session.scalar(
+        select(IntegrationConnectLink)
+        .where(IntegrationConnectLink.token_hash == _token_hash(raw_token))
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if link is None or link.consumed_at is not None or _as_utc(link.expires_at) <= now:
+        raise IntegrationAuthorizationError("This integration link is invalid or expired")
     definition = _available_integration(link.integration_key)
     if definition.provider != "plaid":
         raise IntegrationAuthorizationError("This is not a bank connection link")
-    link.consumed_at = datetime.now(UTC)
-    await session.commit()
     from benji_api.services.finance import create_plaid_link_token
 
-    return await create_plaid_link_token(
-        session,
-        user_id=link.user_id,
-        initiated_channel="messaging_link",
-        settings=settings,
-    )
+    try:
+        result = await create_plaid_link_token(
+            session,
+            user_id=link.user_id,
+            initiated_channel="messaging_link",
+            settings=settings,
+            plaid_client=plaid_client,
+            commit=False,
+        )
+        link.consumed_at = now
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return result
 
 
 async def complete_google_oauth(

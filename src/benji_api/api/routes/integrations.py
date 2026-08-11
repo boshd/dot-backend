@@ -354,11 +354,19 @@ async def plaid_link_token_from_connect_link(
             raw_token=request.connect_token,
             settings=settings,
         )
-    except (
-        IntegrationAuthorizationError,
-        FinancialIntegrationNotConfiguredError,
-    ) as error:
+    except IntegrationAuthorizationError as error:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except (
+        FinancialIntegrationNotConfiguredError,
+        PlaidProviderError,
+    ) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Bank connection is temporarily unavailable. "
+                "This private link is still valid; try again shortly."
+            ),
+        ) from error
     return IntegrationConnectResponse(
         flow="plaid_link",
         link_token=link.link_token,
