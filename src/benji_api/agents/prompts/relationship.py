@@ -46,7 +46,7 @@ def build_relationship_module(
         if state.previous_message_at
         else "no earlier exchange is available"
     )
-    direction = _turn_direction(state, latest_user_text)
+    direction = _turn_cue(state, latest_user_text)
     return PromptModule(
         name="relationship_state",
         content=f"""
@@ -58,31 +58,24 @@ recent shared artifacts: {json.dumps(artifacts, ensure_ascii=False)}
 active commitments: {json.dumps(commitments, ensure_ascii=False)}
 relationship-opening handoff: {json.dumps(state.onboarding_handoff_pending)}
 
-turn direction: {direction}
+optional turn cue: {direction}
 """.strip(),
     )
 
 
-def _turn_direction(state: RelationshipState, latest_user_text: str) -> str:
+def _turn_cue(state: RelationshipState, latest_user_text: str) -> str:
     if state.onboarding_handoff_pending:
         if is_social_acknowledgment(latest_user_text):
             return (
-                "Dot and the user have not found a shared purpose yet, and this is a natural "
-                "transition point. don't merely acknowledge the social beat and end the exchange. "
-                "briefly meet the user's tone, then take the lead toward a first useful thread. "
-                "use the transcript to choose naturally between reconnecting to why they started "
-                "talking or getting curious about what is actually going on with them. "
-                "leave them one easy, open-ended way to answer, without supplying a list of "
-                "possible answers. this should feel like the conversation opening up, not another "
-                "round of "
-                "questions. don't keep explaining or labeling the earlier exchange, show a "
-                "capability menu, use generic customer-service language, or assume they are "
-                "procrastinating."
+                "this is the first easy beat after setup. meet it lightly. if the transcript "
+                "contains a concrete interest or unfinished request, a quick callback can reopen "
+                "that thread; otherwise let the acknowledgment land. do not explain the earlier "
+                "questions, label the transition, hunt for a meaningful life goal, or force a new "
+                "question just to keep talking."
             )
         return (
-            "the user's current message already gives the conversation a useful direction. respond "
-            "to it directly and advance it instead of redirecting into a discovery script or "
-            "narrating the earlier exchange."
+            "the current message already supplies a direction. respond to it directly rather than "
+            "redirecting into discovery or narrating the earlier setup."
         )
     open_artifact = next(
         (artifact for artifact in state.recent_artifacts if artifact.record_count == 0),
@@ -90,11 +83,11 @@ def _turn_direction(state: RelationshipState, latest_user_text: str) -> str:
     )
     if is_generic_opening(latest_user_text) and open_artifact is not None:
         return (
-            "greet them naturally, then reconnect to the most recent open thread: Dot made "
-            f"{open_artifact.title!r}, and it has no recorded entries yet. a casual check-in about "
-            "whether they got a chance to try it is more present than a generic what's-up "
-            "question. let the greeting and callback be separate conversational beats when that "
-            "reads naturally."
+            "a callback may feel natural here: Dot made "
+            f"{open_artifact.title!r}, and it has no recorded entries yet. a casual check-in "
+            "about whether they tried it could be more present than generic small talk. keep it "
+            "light and "
+            "skip the callback if the live message points somewhere else."
         )
     if is_identity_question(latest_user_text) and state.recent_artifacts:
         return (
@@ -105,9 +98,8 @@ def _turn_direction(state: RelationshipState, latest_user_text: str) -> str:
         )
     if is_generic_opening(latest_user_text) and state.active_commitments:
         return (
-            "greet them naturally, then reconnect to the most relevant active commitment above "
-            "with one useful forward move. don't recap every goal or turn it into an "
-            "accountability speech."
+            "the most relevant active commitment can be a natural callback if it still feels live. "
+            "don't recap goals, force accountability, or make every greeting productive."
         )
     if is_social_acknowledgment(latest_user_text) and state.active_commitments:
         return (
@@ -118,9 +110,8 @@ def _turn_direction(state: RelationshipState, latest_user_text: str) -> str:
             "land."
         )
     return (
-        "respond to the live message. when an active commitment is relevant, help move it forward; "
-        "otherwise leave shared state in the background rather than dragging every goal into "
-        "casual conversation."
+        "respond to the live message. shared state is optional context, not an instruction to drag "
+        "every old goal into casual conversation."
     )
 
 

@@ -51,6 +51,7 @@ class GroupModelProvider:
     ) -> ModelSession:
         assert 'prompt_module name="group_conversation"' in instructions
         assert 'prompt_module name="user_profile"' not in instructions
+        assert 'prompt_module name="conversation_posture"' in instructions
         assert "never reveal" in instructions
         assert messages[-1].content == "[Alice]: hey dot, help us plan"
         assert output is not None and output.name == "benji_conversation_turn"
@@ -66,6 +67,7 @@ class GroupModelProvider:
         output: StructuredOutputDefinition,
     ) -> StructuredModelResult:
         assert output.name == "dot_group_participation"
+        assert "ordinary-friend threshold" in instructions
         return StructuredModelResult(
             response_id="group-participation-1",
             data={

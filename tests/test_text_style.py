@@ -22,3 +22,15 @@ def test_prepare_text_bubbles_has_only_a_backend_delivery_safety_ceiling() -> No
 
     assert len(bubbles) == DELIVERY_BUBBLE_SAFETY_LIMIT
     assert bubbles[-1] == f"message {DELIVERY_BUBBLE_SAFETY_LIMIT - 1}"
+
+
+def test_prepare_text_bubbles_turns_accidental_paragraphs_into_real_bubbles() -> None:
+    bubbles = prepare_text_bubbles(
+        ["i'm an ai you text.\n\ni can also build little apps.", "one more beat"]
+    )
+
+    assert bubbles == (
+        "i'm an ai you text.",
+        "i can also build little apps.",
+        "one more beat",
+    )

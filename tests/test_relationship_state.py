@@ -140,7 +140,8 @@ async def test_relationship_state_surfaces_recent_unused_shared_work() -> None:
     normalized = " ".join(module.content.split())
     assert "about 7 hours ago" in normalized
     assert "advanced gym workout tracker" in normalized
-    assert "more present than a generic what's-up question" in normalized
+    assert "could be more present than generic small talk" in normalized
+    assert "skip the callback if the live message points somewhere else" in normalized
 
     identity = build_relationship_module(
         state,
@@ -206,9 +207,9 @@ async def test_post_onboarding_handoff_is_injected_once() -> None:
             now=now,
         )
         normalized = " ".join(module.content.split())
-        assert "don't merely acknowledge the social beat and end" in normalized
-        assert "not another round of questions" in normalized
-        assert "without supplying a list of possible answers" in normalized
+        assert "meet it lightly" in normalized
+        assert "otherwise let the acknowledgment land" in normalized
+        assert "force a new question just to keep talking" in normalized
 
         normal_reply = Message(
             conversation_id=conversation.id,
@@ -252,5 +253,5 @@ def test_substantive_first_post_onboarding_message_is_not_redirected() -> None:
     )
 
     normalized = " ".join(module.content.split())
-    assert "respond to it directly and advance it" in normalized
-    assert "redirecting into a discovery script" in normalized
+    assert "current message already supplies a direction" in normalized
+    assert "redirecting into discovery" in normalized

@@ -46,6 +46,7 @@ def test_egyptian_franco_guidance_is_native_but_not_over_normalized() -> None:
     assert "modern standard arabic" in normalized
     assert "levantine or gulf grammar" in normalized
     assert "do not guess the user's gender" in normalized
+    assert "match the degree of code-switching too" in normalized
     assert "ya basha" in normalized
     assert "not seasoning for every response" in normalized
 

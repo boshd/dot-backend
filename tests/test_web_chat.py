@@ -280,6 +280,7 @@ async def test_web_chat_uses_same_onboarding_then_unlocks_regular_tools(
             "language_style",
             "user_profile",
             "onboarding",
+            "conversation_posture",
         ]
         assert onboarding_run.retrieved_memory == []
         assert onboarding_run.exposed_tools == []
@@ -304,6 +305,7 @@ async def test_web_chat_uses_same_onboarding_then_unlocks_regular_tools(
             "language_style",
             "user_profile",
             "relationship_state",
+            "conversation_posture",
         ]
         assert conversation_run.retrieved_memory == []
         assert conversation_run.exposed_tools == model_provider.regular_tool_names

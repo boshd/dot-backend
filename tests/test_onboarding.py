@@ -100,6 +100,7 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert '<prompt_module name="benji_core">' in prompt
     assert '<prompt_module name="user_profile">' in prompt
     assert '<prompt_module name="onboarding">' in prompt
+    assert '<prompt_module name="conversation_posture">' in prompt
     assert "no capability tools during onboarding" in prompt
     assert "save you to their contacts" in prompt
     assert "making small personalized apps" in prompt
@@ -108,19 +109,19 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert "do not ask for date of birth or country on this first turn" in normalized
     assert "onboarding can unfold across the real conversation" in prompt
     assert "normalize it without asking for redundant confirmation" in normalized
-    assert "lead with purpose" in prompt
+    assert "lead with the person's purpose when one appears" in normalized
     assert "ask what the friend said or what caught their interest" in normalized
     assert 'what is "taking up space in their head"' in normalized
-    assert "name the useful outcome before asking for setup" in normalized
+    assert "respond to the desired outcome first" in normalized
     assert "don't mechanically follow one profile answer" in prompt
-    assert "never drop a bare date-of-birth or country question" in normalized
-    assert "required before private tools are unlocked" in normalized
+    assert "don't pre-explain the reason just because you are asking" in normalized
+    assert "private tools are still paused only when that limitation matters" in normalized
     assert "an explanation must never become a dead end" in normalized
     assert "they can skip it for now and keep chatting" in normalized
-    assert "make a natural handoff in the same" in normalized
-    assert 'don\'t ask a generic "how can i help?"' in normalized
-    assert 'deliver an "all set" welcome speech' in normalized
-    assert "do not immediately replace the last profile" in normalized
+    assert "drop all profile pressure for the next few conversational beats" in normalized
+    assert 'generic "what brought you here?"' in normalized
+    assert "a new question is optional, not a handoff requirement" in normalized
+    assert 'give an "all set" speech' in normalized
 
 
 def test_onboarding_completion_guidance_prioritizes_the_live_goal() -> None:
@@ -139,8 +140,8 @@ def test_onboarding_completion_guidance_prioritizes_the_live_goal() -> None:
     assert "full date of birth (day, month, and year)" in module.content
     assert "preferred name" not in module.content.split("rules:", maxsplit=1)[0]
     assert "location country" not in module.content.split("rules:", maxsplit=1)[0]
-    assert "continue an existing goal or request" in normalized
-    assert "give them room" in normalized
+    assert "earlier concrete request" in normalized
+    assert "react lightly" in normalized
 
 
 def test_validation_repair_preserves_the_generated_conversational_turn() -> None:

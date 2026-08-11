@@ -3,6 +3,7 @@ from collections.abc import Iterable
 from benji_api.agents.prompts.base import (
     BENJI_CORE_PROMPT,
     DIRECT_CONVERSATION_PROMPT,
+    RELAXED_CONVERSATION_POSTURE,
     PromptModule,
     compose_prompt,
 )
@@ -25,6 +26,7 @@ def build_benji_instructions(
     else:
         modules.append(build_language_module(None))
     modules.extend(state_modules)
+    modules.append(RELAXED_CONVERSATION_POSTURE)
     return compose_prompt(*modules)
 
 

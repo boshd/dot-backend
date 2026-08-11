@@ -344,6 +344,7 @@ async def test_first_linq_message_creates_user_and_sends_onboarding_reply(
             "language_style",
             "user_profile",
             "onboarding",
+            "conversation_posture",
         ]
         assert run.retrieved_memory == []
         assert run.exposed_tools == []

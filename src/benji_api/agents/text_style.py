@@ -8,6 +8,7 @@ INLINE_CODE = re.compile(r"`([^`\n]+)`")
 EMPHASIS_ASTERISK = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
 HEADING = re.compile(r"(?m)^#{1,6}\s+")
 BLOCKQUOTE = re.compile(r"(?m)^>\s?")
+PARAGRAPH_BREAK = re.compile(r"\n\s*\n+")
 
 # This is deliberately not part of the model contract or prompt. It only prevents a malformed
 # provider response from turning into an unbounded sequence of paid outbound messages.
@@ -32,5 +33,10 @@ def plain_text_bubble(text: str) -> str:
 
 def prepare_text_bubbles(messages: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Clean a natural model-authored turn and apply only the delivery safety ceiling."""
-    bubbles = tuple(clean for message in messages if (clean := plain_text_bubble(message)))
+    bubbles = tuple(
+        clean
+        for message in messages
+        for paragraph in PARAGRAPH_BREAK.split(message)
+        if (clean := plain_text_bubble(paragraph))
+    )
     return bubbles[:DELIVERY_BUBBLE_SAFETY_LIMIT]

@@ -1,7 +1,11 @@
 import json
 
 from benji_api.agents.conversation_output import CONVERSATION_OUTPUT, parse_conversation_output
-from benji_api.agents.prompts.base import BENJI_CORE_PROMPT, DOT_PROMPT_VERSION
+from benji_api.agents.prompts.base import (
+    BENJI_CORE_PROMPT,
+    DOT_PROMPT_VERSION,
+    RELAXED_CONVERSATION_POSTURE,
+)
 from benji_api.models.user import LanguagePreference
 
 
@@ -63,13 +67,25 @@ def test_core_prompt_optimizes_for_conversational_momentum_not_a_bubble_count() 
     assert "1–4" not in prompt
     assert "choose the breaks by feel" in normalized
     assert "direct questions deserve direct answers" in normalized
-    assert "give a concise, concrete picture" in normalized
-    assert '"lol" or "lmao" can be a genuine reaction' in normalized
-    assert "don't tack a question onto every response" in normalized
+    assert "make the value concrete with a few real things" in normalized
+    assert "don't finish with a neat catchphrase, metaphor" in normalized
+    assert "don't put blank-line-separated paragraphs inside one item" in normalized
+    assert '"lol" and "lmao" can react' in normalized
+    assert "don't tack a question or next-step offer onto every response" in normalized
     assert 'treat short replies like "yeah", "sure", "do it", or "why?"' in normalized
-    assert "each substantive turn should advance it" in normalized
-    assert "closes only the immediate social beat" in normalized
+    assert "don't confuse momentum with constant questioning" in normalized
+    assert "may simply close the current beat" in normalized
     assert 'avoid vague handoffs such as "what now?", "how can i help?"' in normalized
+
+
+def test_relaxed_posture_is_short_late_stage_guidance_not_policy_replacement() -> None:
+    normalized = " ".join(RELAXED_CONVERSATION_POSTURE.content.split()).lower()
+
+    assert "least ceremonious truthful version" in normalized
+    assert "cut the setup, obvious rationale, and tidy transition" in normalized
+    assert "do not perform friendliness" in normalized
+    assert "a reply does not need a question" in normalized
+    assert "changes delivery, not truthfulness, privacy, tool rules, or safety" in normalized
 
 
 def test_core_prompt_avoids_copy_ready_positioning_and_teaches_behavioral_contrasts() -> None:
@@ -86,6 +102,13 @@ def test_core_prompt_avoids_copy_ready_positioning_and_teaches_behavioral_contra
         "greeting after shared work",
         "short continuation",
         "pushback or annoyance",
+        "small social beat",
+        "unnecessary explanation",
+        "low-pressure continuation",
+        "earned informality",
+        "relaxed correction",
+        "profile-question pushback",
+        "direct useful answer",
         "text bubbles",
     ):
         assert scenario in normalized
