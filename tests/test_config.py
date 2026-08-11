@@ -54,3 +54,23 @@ def test_firebase_auth_settings_are_configurable(monkeypatch: pytest.MonkeyPatch
     assert settings.firebase_project_id == "dot-production"
     assert settings.firebase_service_account_json == '{"type":"service_account"}'
     assert settings.firebase_check_revoked is False
+
+
+def test_firebase_auth_defaults_to_keyless_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "dot-production")
+    monkeypatch.delenv("FIREBASE_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.delenv("FIREBASE_CHECK_REVOKED", raising=False)
+
+    settings = Settings()
+
+    assert settings.firebase_service_account_json is None
+    assert settings.firebase_check_revoked is False
+
+
+def test_firebase_revocation_check_requires_credentials() -> None:
+    with pytest.raises(ValueError, match="FIREBASE_SERVICE_ACCOUNT_JSON"):
+        Settings(
+            firebase_project_id="dot-production",
+            firebase_service_account_json=None,
+            firebase_check_revoked=True,
+        )

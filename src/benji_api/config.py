@@ -144,7 +144,7 @@ class Settings:
         default_factory=lambda: _optional_env("FIREBASE_SERVICE_ACCOUNT_JSON")
     )
     firebase_check_revoked: bool = field(
-        default_factory=lambda: _bool_env("FIREBASE_CHECK_REVOKED", True)
+        default_factory=lambda: _bool_env("FIREBASE_CHECK_REVOKED", False)
     )
     auth_eligibility_ip_limit_per_minute: int = field(
         default_factory=lambda: max(1, int(_env("AUTH_ELIGIBILITY_IP_LIMIT_PER_MINUTE", "10")))
@@ -262,6 +262,17 @@ class Settings:
     web_search_max_sources: int = field(
         default_factory=lambda: int(_env("WEB_SEARCH_MAX_SOURCES", "5"))
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.firebase_project_id is not None
+            and self.firebase_check_revoked
+            and self.firebase_service_account_json is None
+        ):
+            raise ValueError(
+                "FIREBASE_CHECK_REVOKED requires FIREBASE_SERVICE_ACCOUNT_JSON; "
+                "set it to false for keyless verification"
+            )
 
 
 @lru_cache

@@ -52,9 +52,13 @@ uv run pytest
 Web and first-party clients authenticate with a Firebase ID token in the `Authorization: Bearer`
 header. The API verifies the token and maps a verified phone number or email to an existing Dot
 identity; authentication never creates a web-only user. Configure `FIREBASE_PROJECT_ID` and either
-Application Default Credentials or `FIREBASE_SERVICE_ACCOUNT_JSON`. The web endpoints also accept a
-phone number as a development-only identity selector. Set `WEB_CHAT_DEV_IDENTITY_ENABLED=false`
-outside local testing.
+leave `FIREBASE_SERVICE_ACCOUNT_JSON` blank for keyless verification, or provide one-line service
+account JSON to enable Firebase revocation checks. Keyless verification validates the RS256
+signature against Google's cached public certificates plus Firebase's issuer, audience, subject,
+and timestamp claims; it cannot detect a revoked session until its ID token expires. Set
+`FIREBASE_CHECK_REVOKED=true` only with service-account JSON. The web endpoints also accept a phone
+number as a development-only identity selector. Set `WEB_CHAT_DEV_IDENTITY_ENABLED=false` outside
+local testing.
 
 ## Conversations and channels
 
