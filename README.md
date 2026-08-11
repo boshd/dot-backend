@@ -90,6 +90,23 @@ service. To run them directly:
 uv run alembic upgrade head
 ```
 
+## Tester resets
+
+Reset commands are scoped to one normalized phone number or email and preview the full deletion
+plan by default. From the parent project directory:
+
+```bash
+make reset-user IDENTIFIER=+15551234567
+make reset-user-confirm IDENTIFIER=+15551234567
+
+make reset-user-prod IDENTIFIER=+15551234567
+make reset-user-prod-confirm IDENTIFIER=+15551234567
+```
+
+The `-confirm` targets permanently remove that identity's conversations, apps, integrations,
+financial data, schedules, memories, deliveries, and webhook events. They require the identifier
+again as an exact confirmation and do not affect other users.
+
 ## Linq sandbox
 
 Copy the parent `.env.example` to `.env`, then set `LINQ_API_KEY` to the V3 token

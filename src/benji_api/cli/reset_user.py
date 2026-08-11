@@ -12,7 +12,7 @@ from benji_api.services.users import normalize_user_identifier
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Preview or delete all local Dot data associated with a phone or email."
+        description="Preview or delete all Dot data associated with a phone or email."
     )
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--identifier", help="Phone number or email used to message Dot")
@@ -67,7 +67,7 @@ def _print_plan(plan: UserResetPlan) -> None:
     print(f"memory facts:       {len(plan.memory_fact_ids)}")
     print(f"memory evidence:    {len(plan.memory_evidence_ids)}")
     print(f"webhook events:     {len(plan.webhook_event_ids)}")
-    print(f"total local records: {plan.total_records}")
+    print(f"total records:       {plan.total_records}")
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -96,7 +96,7 @@ async def _run(args: argparse.Namespace) -> None:
 
         await execute_user_reset(session, plan)
         await session.commit()
-        print(f"\ndeleted {plan.total_records} local records for {plan.normalized_identifier}")
+        print(f"\ndeleted {plan.total_records} records for {plan.normalized_identifier}")
 
 
 def main() -> None:
