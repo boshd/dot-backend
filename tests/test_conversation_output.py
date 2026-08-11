@@ -63,6 +63,8 @@ def test_core_prompt_optimizes_for_conversational_momentum_not_a_bubble_count() 
     assert "1–4" not in prompt
     assert "choose the breaks by feel" in normalized
     assert "direct questions deserve direct answers" in normalized
+    assert "give a concise, concrete picture" in normalized
+    assert '"lol" or "lmao" can be a genuine reaction' in normalized
     assert "don't tack a question onto every response" in normalized
     assert 'treat short replies like "yeah", "sure", "do it", or "why?"' in normalized
     assert "each substantive turn should advance it" in normalized

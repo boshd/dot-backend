@@ -149,12 +149,41 @@ def missing_profile_fields(user: User) -> tuple[str, ...]:
 
 def validation_repair_reply(rejected_fields: tuple[str, ...]) -> str | None:
     if "birth_date" in rejected_fields:
-        return "i need the full date—day, month, and year. what’s your date of birth?"
+        return "wait, that date doesn’t quite work. what day, month, and year should i use?"
     if "location_country" in rejected_fields:
-        return "i’m not confident i got the country right—what country are you based in?"
+        return "wait, i couldn’t pin down the country from that. what country should i use?"
     if "display_name" in rejected_fields:
-        return "i didn’t quite catch the name you want me to use—what should i call you?"
+        return "wait, i might’ve mangled your name. what should i call you?"
     return None
+
+
+def merge_validation_repair(
+    messages: list[str],
+    rejected_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Preserve the useful generated turn while making rejected profile state explicit."""
+    generated = tuple(message for message in messages if message.strip())
+    repair = validation_repair_reply(rejected_fields)
+    if repair is None or _already_requests_profile_repair(generated, rejected_fields):
+        return generated
+    return (*generated, repair)
+
+
+def _already_requests_profile_repair(
+    messages: tuple[str, ...],
+    rejected_fields: tuple[str, ...],
+) -> bool:
+    text = " ".join(messages).casefold()
+    if "birth_date" in rejected_fields:
+        return (
+            all(part in text for part in ("day", "month", "year"))
+            or "full date of birth" in text
+        )
+    if "location_country" in rejected_fields:
+        return "what country" in text or "which country" in text
+    if "display_name" in rejected_fields:
+        return "what should i call you" in text or "your name" in text
+    return False
 
 
 def _sync_onboarding_state(user: User) -> bool:

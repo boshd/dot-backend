@@ -8,6 +8,7 @@ from benji_api.services.onboarding import (
     OnboardingProfileCandidates,
     apply_messaging_preference,
     apply_profile_candidates,
+    merge_validation_repair,
     missing_profile_fields,
     parse_onboarding_turn,
 )
@@ -101,12 +102,21 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert '<prompt_module name="onboarding">' in prompt
     assert "no capability tools during onboarding" in prompt
     assert "save you to their contacts" in prompt
+    assert "making small personalized apps" in prompt
+    assert "connected calendar, email, or bank data" in prompt
+    assert "searching the web" in prompt
+    assert "do not ask for date of birth or country on this first turn" in normalized
     assert "onboarding can unfold across the real conversation" in prompt
     assert "normalize it without asking for redundant confirmation" in normalized
     assert "lead with purpose" in prompt
+    assert "ask what the friend said or what caught their interest" in normalized
+    assert 'what is "taking up space in their head"' in normalized
+    assert "name the useful outcome before asking for setup" in normalized
     assert "don't mechanically follow one profile answer" in prompt
-    assert "calculate their age" in prompt
-    assert "it is not identity verification" in prompt
+    assert "never drop a bare date-of-birth or country question" in normalized
+    assert "required before private tools are unlocked" in normalized
+    assert "an explanation must never become a dead end" in normalized
+    assert "they can skip it for now and keep chatting" in normalized
     assert "make a natural handoff in the same" in normalized
     assert 'don\'t ask a generic "how can i help?"' in normalized
     assert 'deliver an "all set" welcome speech' in normalized
@@ -131,6 +141,32 @@ def test_onboarding_completion_guidance_prioritizes_the_live_goal() -> None:
     assert "location country" not in module.content.split("rules:", maxsplit=1)[0]
     assert "continue an existing goal or request" in normalized
     assert "give them room" in normalized
+
+
+def test_validation_repair_preserves_the_generated_conversational_turn() -> None:
+    messages = [
+        "yeah, a birthday planner is absolutely doable.",
+        "we can keep shaping it while we sort the setup bit.",
+    ]
+
+    merged = merge_validation_repair(messages, ("birth_date",))
+
+    assert merged[:2] == tuple(messages)
+    assert merged[-1] == (
+        "wait, that date doesn’t quite work. what day, month, and year should i use?"
+    )
+
+
+def test_validation_repair_does_not_change_a_valid_generated_turn() -> None:
+    messages = ["got it, egypt.", "back to that birthday planner..."]
+
+    assert merge_validation_repair(messages, ()) == tuple(messages)
+
+
+def test_validation_repair_does_not_repeat_the_models_clarifying_question() -> None:
+    messages = ["that date looks off. what day, month, and year did you mean?"]
+
+    assert merge_validation_repair(messages, ("birth_date",)) == tuple(messages)
 
 
 def test_onboarding_output_preserves_natural_message_segmentation() -> None:

@@ -33,8 +33,8 @@ from benji_api.services.language_preferences import apply_language_preference
 from benji_api.services.onboarding import (
     ONBOARDING_OUTPUT,
     apply_profile_candidates,
+    merge_validation_repair,
     parse_onboarding_turn,
-    validation_repair_reply,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,11 +141,8 @@ async def _run_onboarding_turn_unlocked(
             if turn.language_preference is not None:
                 apply_language_preference(user=user, proposal=turn.language_preference)
             profile_update = apply_profile_candidates(user=user, candidates=turn.profile)
-            repair_reply = validation_repair_reply(profile_update.rejected_fields)
-            texts = (
-                (repair_reply,)
-                if repair_reply is not None
-                else prepare_text_bubbles(turn.messages)
+            texts = prepare_text_bubbles(
+                merge_validation_repair(turn.messages, profile_update.rejected_fields)
             )
             if not texts:
                 raise RuntimeError("Onboarding model returned an empty assistant turn")
