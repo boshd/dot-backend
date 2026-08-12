@@ -45,9 +45,14 @@ props. Cluster and Stack accept semantic alignment/gap values; Grid accepts one 
 IconButton requires label; Heading accepts levels 2–4 and semantic size; Callout has an `action`
 slot for dismiss/undo controls; Input, Textarea, and Select accept optional label/hint/error props.
 These common controlled shapes are supported exactly:
-`<Select value={value} onChange={...} options={[{ value: "high", label: "High" }]} />` (or
-native `<option>` children), `<SegmentedControl label="Filter" value={filter}
-onChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`, and either
+`<Input value={name} onValueChange={setName} />`,
+`<Textarea value={notes} onValueChange={setNotes} />`, and
+`<Select value={value} onValueChange={setValue}
+options={[{ value: "high", label: "High" }]} />` (or native `<option>` children). Never pass a
+React state setter directly to a native-style `onChange`; use `onValueChange`. Both short size/gap
+tokens (`sm`, `md`, `lg`) and their aliases (`small`, `medium`, `large`) are accepted.
+`<SegmentedControl label="Filter" value={filter}
+onValueChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`, and either
 `<ListItem title="Task" detail="Today" />` or `<ListItem><Text>Task</Text></ListItem>`.
 Raw semantic div, span, form, table, and SVG structure is
 allowed only where the component set cannot express the structure, and still cannot be styled.
@@ -128,6 +133,9 @@ _RELATIVE_CSS_IMPORT = re.compile(
     r"^[ \t]*import[ \t]+(?:[^\n;]+?[ \t]+from[ \t]+)?[\"'](?:\.{1,2}/)[^\"']+\.css[\"'];?[ \t]*$",
     re.MULTILINE,
 )
+_DIRECT_SETTER_ON_CHANGE = re.compile(
+    r"\bonChange\s*=\s*\{\s*(set[A-Z][A-Za-z0-9_]*)\s*\}"
+)
 
 
 def _remove_external_css_assets(contents: str) -> tuple[str, int]:
@@ -141,6 +149,12 @@ def _remove_external_css_assets(contents: str) -> tuple[str, int]:
 def _normalize_react_source(contents: str) -> tuple[str, int]:
     normalized, replacements = re.subn(r"\bJSX\.Element\b", "React.ReactElement", contents)
     return normalized, replacements
+
+
+def _normalize_direct_setter_handlers(contents: str) -> tuple[str, int]:
+    """Map the common controlled-input shorthand to Dot's value callback contract."""
+
+    return _DIRECT_SETTER_ON_CHANGE.subn(r"onValueChange={\1}", contents)
 
 
 def _canonicalize_local_styles(
@@ -419,7 +433,8 @@ class OpenAIAppSourceProvider:
         }
         prompt = (
             f"Repair attempt {attempt}. Return a complete corrected result, not a patch. Preserve "
-            "the product intent while resolving every issue.\n\n"
+            "the product intent while resolving every issue. If any issue reports inline_style "
+            "or class_name, remove every style/className prop and use Dot primitives only.\n\n"
             f"BLUEPRINT:\n{json.dumps(blueprint.as_dict(), ensure_ascii=False, sort_keys=True)}\n\n"
             f"ISSUES:\n{json.dumps([issue.as_dict() for issue in issues], ensure_ascii=False)}\n\n"
             f"PREVIOUS RESULT:\n{json.dumps(previous_payload, ensure_ascii=False)}"
@@ -473,6 +488,7 @@ class OpenAIAppSourceProvider:
         source_files: list[SourceFile] = []
         removed_external_css_assets = 0
         normalized_react_types = 0
+        normalized_value_handlers = 0
         for item in files:
             if (
                 not isinstance(item, dict)
@@ -487,6 +503,8 @@ class OpenAIAppSourceProvider:
             elif item["path"].endswith((".ts", ".tsx")):
                 contents, normalized = _normalize_react_source(contents)
                 normalized_react_types += normalized
+                contents, normalized = _normalize_direct_setter_handlers(contents)
+                normalized_value_handlers += normalized
             source_files.append(SourceFile(path=item["path"], contents=contents))
         source_files, canonicalized_css_imports = _canonicalize_local_styles(
             source_files,
@@ -501,6 +519,7 @@ class OpenAIAppSourceProvider:
             "latency_ms": latency_ms,
             "removed_external_css_assets": removed_external_css_assets,
             "normalized_react_types": normalized_react_types,
+            "normalized_value_handlers": normalized_value_handlers,
             "canonicalized_css_imports": canonicalized_css_imports,
         }
         usage = _token_usage(response)

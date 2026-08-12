@@ -57,6 +57,7 @@ class FakeLinqClient:
     def __init__(self) -> None:
         self.sent: list[dict[str, str]] = []
         self.typing: list[bool] = []
+        self.read_chats: list[str] = []
         self.chats: dict[str, dict[str, Any]] = {}
 
     async def send_chat_message(
@@ -77,6 +78,9 @@ class FakeLinqClient:
     async def stop_typing(self, *, chat_id: str) -> None:
         assert chat_id == "chat-1"
         self.typing.append(False)
+
+    async def mark_chat_read(self, *, chat_id: str) -> None:
+        self.read_chats.append(chat_id)
 
     async def get_chat(self, *, chat_id: str) -> dict[str, Any]:
         return self.chats.get(chat_id, {})
@@ -213,6 +217,7 @@ def message_received_payload(
     chat_id: str = "chat-1",
     sender_phone: str = "+14155552671",
     is_group: bool = False,
+    service: str = "iMessage",
     parts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -234,10 +239,10 @@ def message_received_payload(
             "sender_handle": {
                 "handle": sender_phone,
                 "is_me": False,
-                "service": "iMessage",
+                "service": service,
             },
             "parts": parts if parts is not None else [{"type": "text", "value": text}],
-            "service": "iMessage",
+            "service": service,
         },
     }
 
@@ -366,6 +371,7 @@ async def test_first_linq_message_creates_user_and_sends_onboarding_reply(
             "total_tokens": 96,
         }
         assert fake_model.structured_calls[0].name == "onboarding_turn"
+        assert fake_linq.read_chats == ["chat-1"]
         assert fake_linq.typing == [True, False]
 
 
@@ -395,6 +401,24 @@ async def test_duplicate_linq_event_is_acknowledged_without_a_second_reply(
         async with session_factory() as session:
             event_count = await session.scalar(select(func.count()).select_from(WebhookEvent))
         assert event_count == 1
+
+
+@pytest.mark.anyio
+async def test_linq_read_receipts_are_skipped_for_sms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = message_received_payload(service="SMS")
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    async with linq_test_app(monkeypatch) as (client, _, fake_linq, _):
+        response = await client.post(
+            "/api/v1/webhooks/linq",
+            content=body,
+            headers=signed_headers(body),
+        )
+
+        assert response.status_code == 200
+        assert fake_linq.read_chats == []
 
 
 @pytest.mark.anyio
@@ -543,6 +567,7 @@ async def test_linq_group_syncs_members_and_only_replies_when_invoked(
         assert first.json()["reply_scheduled"] is True
         assert len(fake_linq.sent) == 1
         assert fake_linq.sent[0]["chat_id"] == group_chat_id
+        assert fake_linq.read_chats == []
         assert fake_linq.typing == []  # Linq does not support typing in groups.
         assert fake_model.structured_calls == []
         assert fake_model.regular_tool_names == [

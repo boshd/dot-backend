@@ -138,18 +138,28 @@ async def test_dot_ui_accepts_model_friendly_collection_and_control_apis() -> No
     bundle = await EsbuildAppCompiler().compile(
         _source(
             '''import React, { useState } from "react";
-import { AppShell, List, ListItem, Segment, SegmentedControl, Select, Text } from "@dot/ui";
+import {
+  AppShell, Button, Input, List, ListItem, Segment, SegmentedControl,
+  Select, Stack, Text, Textarea
+} from "@dot/ui";
 
 export default function App() {
+  const [name, setName] = useState("");
+  const [notes, setNotes] = useState("");
   const [priority, setPriority] = useState("normal");
   const [filter, setFilter] = useState("open");
   return <AppShell title="Tasks">
-    <Select
-      label="Priority"
-      value={priority}
-      onChange={(event) => setPriority(event.target.value)}
-      options={[{ value: "normal", label: "Normal" }, { value: "high", label: "High" }]}
-    />
+    <Stack gap="large">
+      <Input label="Name" value={name} onValueChange={setName} />
+      <Textarea label="Notes" value={notes} onValueChange={setNotes} />
+      <Select
+        label="Priority"
+        value={priority}
+        onValueChange={setPriority}
+        options={[{ value: "normal", label: "Normal" }, { value: "high", label: "High" }]}
+      />
+      <Button size="small">Save</Button>
+    </Stack>
     <Select value={priority} onChange={(event) => setPriority(event.target.value)}>
       <option value="normal">Normal</option><option value="high">High</option>
     </Select>

@@ -12,6 +12,10 @@ def build_onboarding_module(user: User, *, is_new_user: bool) -> PromptModule:
         "with connected calendar, email, or bank data, searching the web, and helping them think "
         "or plan. adapt the wording to their message; this is a quick glimpse, not a product "
         "pitch. "
+        "before asking for their name, give one short, relaxed heads-up that you need their name, "
+        "full birthday, and country to finish signing them up before you can use private "
+        "capabilities for them. say it like a texting buddy, not a consent form, and make clear "
+        "you can pick the details up naturally while you talk. "
         "unless they already arrived with a concrete request, leave one easy opening about what "
         "brought them here. do not ask for date of birth or country on this first turn unless they "
         "volunteer it. "
@@ -58,9 +62,13 @@ rules:
 - react to personal details like a person who is getting to know them, but don't use canned praise
   for their name, age, or city. if they resist or brush off a question, drop the pressure and keep
   talking; return to the missing detail later.
-- ask only one focused profile question at a time and make it feel incidental, not official. don't
-  pre-explain the reason just because you are asking. if a date-of-birth or country question would
-  feel abrupt, wait for a better opening instead of dressing it up in policy language.
+- be transparent once, not defensive every time. before the first profile question, briefly say
+  that you need their name, full birthday, and country to finish signing them up before private
+  capabilities can work for them, and that you can pick those details up while you talk. if the
+  recent conversation already contains that heads-up, do not repeat it. after that, ask only one
+  focused profile question at a time and don't pre-explain every individual question. if a
+  date-of-birth or country question would feel abrupt, wait for a better opening instead of
+  dressing it up in policy language.
 - if they ask why, answer the actual concern in one casual sentence. date of birth helps avoid wrong
   age, birthday, and date assumptions; country helps with local time, currency, regional context,
   and available connections. say they can skip it for now and keep chatting. mention that private

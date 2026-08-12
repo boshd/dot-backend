@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -63,6 +64,7 @@ from benji_api.services.users import (
 )
 
 router = APIRouter(prefix="/webhooks/linq", tags=["linq webhooks"])
+logger = logging.getLogger(__name__)
 PROVIDER = "linq"
 MESSAGE_LIFECYCLE_EVENTS = {
     "message.sent",
@@ -449,6 +451,19 @@ async def receive_linq_webhook(
         )
     await cancel_pending_follow_ups(session, conversation_id=conversation.id)
 
+    # Linq read receipts are supported for direct iMessage/RCS chats, not groups or SMS/MMS.
+    # Queue this before agent work so the persisted inbound message is acknowledged promptly.
+    if (
+        not inbound.is_group
+        and linq_client is not None
+        and (inbound.service or "").casefold() in {"imessage", "rcs"}
+    ):
+        background_tasks.add_task(
+            _mark_linq_chat_read,
+            linq_client=linq_client,
+            chat_id=inbound.external_chat_id,
+        )
+
     messaging_preference = None
     if not inbound.is_group:
         messaging_preference = apply_messaging_preference(
@@ -563,6 +578,14 @@ async def receive_linq_webhook(
         user_id=actor_user.id,
         reply_scheduled=onboarding_reply_scheduled or agent_reply_scheduled,
     )
+
+
+async def _mark_linq_chat_read(*, linq_client: LinqClient, chat_id: str) -> None:
+    try:
+        await linq_client.mark_chat_read(chat_id=chat_id)
+    except Exception:
+        # A cosmetic provider acknowledgment must never block or retry the user's message.
+        logger.warning("Could not mark Linq chat read chat_id=%s", chat_id, exc_info=True)
 
 
 async def _load_linq_chat_data(

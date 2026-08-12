@@ -106,6 +106,8 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert "making small personalized apps" in prompt
     assert "connected calendar, email, or bank data" in prompt
     assert "searching the web" in prompt
+    assert "need their name, full birthday, and country to finish signing them up" in normalized
+    assert "pick the details up naturally while you talk" in normalized
     assert "do not ask for date of birth or country on this first turn" in normalized
     assert "onboarding can unfold across the real conversation" in prompt
     assert "normalize it without asking for redundant confirmation" in normalized
@@ -114,7 +116,10 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert 'what is "taking up space in their head"' in normalized
     assert "respond to the desired outcome first" in normalized
     assert "don't mechanically follow one profile answer" in prompt
-    assert "don't pre-explain the reason just because you are asking" in normalized
+    assert (
+        "if the recent conversation already contains that heads-up, do not repeat it" in normalized
+    )
+    assert "don't pre-explain every individual question" in normalized
     assert "private tools are still paused only when that limitation matters" in normalized
     assert "an explanation must never become a dead end" in normalized
     assert "they can skip it for now and keep chatting" in normalized

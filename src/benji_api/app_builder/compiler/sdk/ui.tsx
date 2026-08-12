@@ -1,7 +1,9 @@
 import React, { type InputHTMLAttributes, type ReactNode } from "react";
 
 export type DotAccent = "coral" | "sage" | "ocean" | "plum" | "sky";
-export type DotSpace = "xs" | "sm" | "md" | "lg" | "xl";
+type DotSpaceToken = "xs" | "sm" | "md" | "lg" | "xl";
+export type DotSpace = DotSpaceToken | "small" | "medium" | "large";
+export type DotSize = "sm" | "md" | "lg" | "small" | "medium" | "large";
 
 type ChildrenProps = { children?: ReactNode };
 type SafeButtonProps = Omit<
@@ -29,6 +31,26 @@ type SegmentedControlContextValue = {
   value?: string;
   onValueChange?: (value: string) => void;
 };
+
+type ValueChangeProps = { onValueChange?: (value: string) => void };
+
+const semanticSize = {
+  small: "sm",
+  medium: "md",
+  large: "lg",
+} as const;
+
+function normalizeSpace(value: DotSpace): DotSpaceToken {
+  return value in semanticSize
+    ? semanticSize[value as keyof typeof semanticSize]
+    : value as DotSpaceToken;
+}
+
+function normalizeSize(value: DotSize): "sm" | "md" | "lg" {
+  return value in semanticSize
+    ? semanticSize[value as keyof typeof semanticSize]
+    : value as "sm" | "md" | "lg";
+}
 
 const SegmentedControlContext = React.createContext<SegmentedControlContextValue | null>(null);
 
@@ -110,7 +132,7 @@ export function Stack({
   align?: "start" | "center" | "end" | "stretch";
 }) {
   return (
-    <div className="dot-stack" data-gap={gap} data-align={align}>
+    <div className="dot-stack" data-gap={normalizeSpace(gap)} data-align={align}>
       {children}
     </div>
   );
@@ -124,10 +146,10 @@ export function Cluster({
 }: ChildrenProps & {
   justify?: "start" | "center" | "end" | "between";
   align?: "start" | "center" | "end" | "stretch";
-  gap?: Exclude<DotSpace, "xl">;
+  gap?: DotSpace;
 }) {
   return (
-    <div className="dot-cluster" data-justify={justify} data-align={align} data-gap={gap}>
+    <div className="dot-cluster" data-justify={justify} data-align={align} data-gap={normalizeSpace(gap)}>
       {children}
     </div>
   );
@@ -137,9 +159,9 @@ export function Grid({
   columns = 2,
   gap = "md",
   children,
-}: ChildrenProps & { columns?: 1 | 2 | 3 | 4; gap?: "sm" | "md" | "lg" }) {
+}: ChildrenProps & { columns?: 1 | 2 | 3 | 4; gap?: DotSize }) {
   return (
-    <div className="dot-grid" data-columns={columns} data-gap={gap}>
+    <div className="dot-grid" data-columns={columns} data-gap={normalizeSize(gap)}>
       {children}
     </div>
   );
@@ -151,10 +173,10 @@ export function Card({
   padding = "md",
 }: ChildrenProps & {
   tone?: "default" | "soft" | "accent" | "dark" | "plain";
-  padding?: "none" | "sm" | "md" | "lg";
+  padding?: "none" | DotSize;
 }) {
   return (
-    <section className="dot-card" data-tone={tone} data-padding={padding}>
+    <section className="dot-card" data-tone={tone} data-padding={padding === "none" ? padding : normalizeSize(padding)}>
       {children}
     </section>
   );
@@ -168,7 +190,7 @@ export function Button({
   ...props
 }: SafeButtonProps & {
   variant?: "primary" | "accent" | "secondary" | "ghost" | "danger";
-  size?: "sm" | "md" | "lg";
+  size?: DotSize;
 }) {
   return (
     <button
@@ -176,7 +198,7 @@ export function Button({
       type={type}
       className="dot-button"
       data-variant={variant}
-      data-size={size}
+      data-size={normalizeSize(size)}
     >
       {children}
     </button>
@@ -191,7 +213,7 @@ export function PrimaryWorkflowTrigger({
 }: Omit<SafeButtonProps, "type"> & {
   onClick: NonNullable<SafeButtonProps["onClick"]>;
   variant?: "primary" | "accent" | "secondary";
-  size?: "sm" | "md" | "lg";
+  size?: DotSize;
 }) {
   return (
     <button
@@ -199,7 +221,7 @@ export function PrimaryWorkflowTrigger({
       type="button"
       className="dot-button"
       data-variant={variant}
-      data-size={size}
+      data-size={normalizeSize(size)}
       data-dot-primary-action
     >
       {children}
@@ -244,10 +266,10 @@ export function Heading({
   size,
 }: ChildrenProps & {
   level?: 1 | 2 | 3 | 4;
-  size?: "sm" | "md" | "lg";
+  size?: DotSize;
 }) {
   const Tag = `h${level}` as "h1" | "h2" | "h3" | "h4";
-  return <Tag className="dot-heading" data-size={size}>{children}</Tag>;
+  return <Tag className="dot-heading" data-size={size ? normalizeSize(size) : undefined}>{children}</Tag>;
 }
 
 export function Text({
@@ -256,9 +278,9 @@ export function Text({
   size = "md",
 }: ChildrenProps & {
   tone?: "default" | "muted" | "success" | "danger";
-  size?: "sm" | "md" | "lg";
+  size?: DotSize;
 }) {
-  return <p className="dot-text" data-tone={tone} data-size={size}>{children}</p>;
+  return <p className="dot-text" data-tone={tone} data-size={normalizeSize(size)}>{children}</p>;
 }
 
 export function Metric({
@@ -392,13 +414,33 @@ export function Field({
 
 type LabeledControlProps = { label?: ReactNode; hint?: ReactNode; error?: ReactNode };
 
-export function Input({ label, hint, error, ...props }: SafeInputProps & LabeledControlProps) {
-  const control = <input {...props} className="dot-input" />;
+export function Input({
+  label,
+  hint,
+  error,
+  onChange,
+  onValueChange,
+  ...props
+}: SafeInputProps & LabeledControlProps & ValueChangeProps) {
+  const control = <input {...props} className="dot-input" onChange={(event) => {
+    onChange?.(event);
+    if (!event.defaultPrevented) onValueChange?.(event.currentTarget.value);
+  }} />;
   return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
 }
 
-export function Textarea({ label, hint, error, ...props }: SafeTextareaProps & LabeledControlProps) {
-  const control = <textarea {...props} className="dot-input dot-textarea" />;
+export function Textarea({
+  label,
+  hint,
+  error,
+  onChange,
+  onValueChange,
+  ...props
+}: SafeTextareaProps & LabeledControlProps & ValueChangeProps) {
+  const control = <textarea {...props} className="dot-input dot-textarea" onChange={(event) => {
+    onChange?.(event);
+    if (!event.defaultPrevented) onValueChange?.(event.currentTarget.value);
+  }} />;
   return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
 }
 
@@ -408,10 +450,15 @@ export function Select({
   error,
   options,
   children,
+  onChange,
+  onValueChange,
   ...props
-}: SafeSelectProps & LabeledControlProps & { options?: readonly SelectOption[] }) {
+}: SafeSelectProps & LabeledControlProps & ValueChangeProps & { options?: readonly SelectOption[] }) {
   const control = (
-    <select {...props} className="dot-input dot-select">
+    <select {...props} className="dot-input dot-select" onChange={(event) => {
+      onChange?.(event);
+      if (!event.defaultPrevented) onValueChange?.(event.currentTarget.value);
+    }}>
       {children ?? options?.map((option, index) => (
         <option
           key={`${String(option.value)}:${index}`}

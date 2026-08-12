@@ -38,6 +38,9 @@ class LinqClient:
     async def stop_typing(self, *, chat_id: str) -> None:
         await self._request("DELETE", f"/chats/{chat_id}/typing")
 
+    async def mark_chat_read(self, *, chat_id: str) -> None:
+        await self._request("POST", f"/chats/{chat_id}/read")
+
     async def share_contact_card(self, *, chat_id: str) -> None:
         await self._request("POST", f"/chats/{chat_id}/share_contact_card")
 

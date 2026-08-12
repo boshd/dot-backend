@@ -347,7 +347,9 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
                     "path": "src/View.tsx",
                     "contents": (
                         'import "./missing.css";\n'
-                        "export function View(): JSX.Element { return <div />; }"
+                        "export function View(): JSX.Element { "
+                        "const [name, setName] = React.useState(''); "
+                        "return <Input value={name} onChange={setName} />; }"
                     ),
                 },
             ],
@@ -368,18 +370,21 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert isinstance(result.provider_metadata["latency_ms"], int)
     assert result.provider_metadata["removed_external_css_assets"] == 2
     assert result.provider_metadata["normalized_react_types"] == 1
+    assert result.provider_metadata["normalized_value_handlers"] == 1
     assert result.provider_metadata["canonicalized_css_imports"] == 2
     files = {item.path: item.contents for item in result.files}
     assert "src/dot-generated.css" not in files
     assert "src/app.css" not in files
     assert 'import "./missing.css";' not in files["src/View.tsx"]
     assert "React.ReactElement" in files["src/View.tsx"]
+    assert "onValueChange={setName}" in files["src/View.tsx"]
     request = client.responses.requests[0]
     assert request["store"] is False
     assert request["max_output_tokens"] == 16_000
     assert "PrimaryWorkflowTrigger" in request["instructions"]
     assert "never write `data-dot-primary-action`" in request["instructions"]
     assert 'options={[{ value: "high", label: "High" }]}' in request["instructions"]
+    assert "onValueChange={setName}" in request["instructions"]
     assert '<SegmentedControl label="Filter" value={filter}' in request["instructions"]
     assert '<ListItem title="Task" detail="Today" />' in request["instructions"]
     normalized_instructions = " ".join(request["instructions"].lower().split())
