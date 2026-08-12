@@ -167,6 +167,37 @@ class NeverRepairsProvider(RepairingProvider):
         return previous
 
 
+class LayeredFailureProvider(RepairingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_repair_codes: set[str] = set()
+
+    async def generate(self, app_blueprint: AppBlueprint) -> GeneratedSource:
+        safe = await self.local.generate(app_blueprint)
+        broken = replace(
+            safe.files[0],
+            contents=safe.files[0].contents.replace(
+                "<Card>",
+                '<Card style={{ color: "red" }} unknownProp="nope">',
+            ),
+        )
+        return replace(safe, files=(broken,))
+
+    async def repair(
+        self,
+        app_blueprint: AppBlueprint,
+        previous: GeneratedSource,
+        issues: tuple[ValidationIssue, ...],
+        *,
+        attempt: int,
+    ) -> GeneratedSource:
+        del previous
+        assert attempt == 1
+        self.first_repair_codes = {issue.code for issue in issues}
+        self.repairs += 1
+        return await self.local.generate(app_blueprint)
+
+
 class SlowProvider(DeterministicLocalProvider):
     async def generate(self, app_blueprint: AppBlueprint) -> GeneratedSource:
         await asyncio.sleep(0.02)
@@ -330,6 +361,71 @@ async def test_policy_failure_gets_one_bounded_repair() -> None:
 
 
 @pytest.mark.anyio
+async def test_repair_receives_policy_and_typescript_issues_together() -> None:
+    provider = LayeredFailureProvider()
+
+    completion = await AppBuildPipeline(provider, max_repair_attempts=1).build(claim())
+
+    assert completion.metrics.repair_attempts == 1
+    assert "inline_style" in provider.first_repair_codes
+    assert "typescript_type_error" in provider.first_repair_codes
+
+
+@pytest.mark.anyio
+async def test_exhausted_custom_build_promotes_trusted_declarative_fallback() -> None:
+    fallback_blueprint = blueprint()
+    fallback_blueprint["manifest"] = {
+        "schema_version": 1,
+        "entities": [
+            {
+                "name": "expense",
+                "fields": [
+                    {"name": "amount", "type": "money"},
+                    {"name": "nights", "type": "integer"},
+                    {"name": "metadata", "type": "object"},
+                    {"name": "split_between", "type": "array"},
+                ],
+            }
+        ],
+    }
+    completion = await AppBuildPipeline(
+        NeverRepairsProvider(),
+        max_repair_attempts=0,
+        allow_declarative_fallback=True,
+    ).build(claim(blueprint=fallback_blueprint))
+
+    assert completion.artifact.browser_bundle is None
+    assert completion.artifact.as_dict()["browser_bundle"] is None
+    assert completion.artifact.provider_metadata["fallback_mode"] == "declarative"
+    assert "network_access" in completion.artifact.provider_metadata[
+        "custom_code_issue_codes"
+    ]
+    assert completion.artifact.test_results["custom_code"]["status"] == "rejected"
+    assert "fallback" in completion.metrics.stage_duration_ms
+    main = completion.artifact.render_document["root"]["children"][1]
+    assert [
+        field["type"] for field in main["children"][0]["children"][1]["fields"]
+    ] == ["currency", "integer", "object", "array"]
+    assert main["children"][0]["children"][2]["type"] == "list"
+    assert main["children"][0]["children"][2]["source"] == "expense"
+
+
+@pytest.mark.anyio
+async def test_custom_build_timeout_promotes_trusted_declarative_fallback() -> None:
+    completion = await AppBuildPipeline(
+        SlowProvider(),
+        timeout_seconds=0.001,
+        allow_declarative_fallback=True,
+    ).build(claim())
+
+    assert completion.artifact.browser_bundle is None
+    assert completion.artifact.provider_metadata["fallback_mode"] == "declarative"
+    assert completion.artifact.provider_metadata["custom_code_issue_codes"] == [
+        "custom_code_timeout"
+    ]
+
+
+@pytest.mark.anyio
 async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     local = await DeterministicLocalProvider().generate(AppBlueprint.from_mapping(blueprint()))
     client = FakeOpenAIClient(
@@ -388,6 +484,9 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert "onCheckedChange={setDone}" in request["instructions"]
     assert '<SegmentedControl label="Filter" value={filter}' in request["instructions"]
     assert '<ListItem title="Task" detail="Today" />' in request["instructions"]
+    assert "AUTHORITATIVE @dot/ui TYPES" in request["instructions"]
+    assert "export declare function Input" in request["instructions"]
+    assert "onValueChange?: (value: string) => void" in request["instructions"]
     normalized_instructions = " ".join(request["instructions"].lower().split())
     assert "do not return css files, classname props, inline style props" in (
         normalized_instructions

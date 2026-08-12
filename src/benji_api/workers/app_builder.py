@@ -146,6 +146,7 @@ async def run() -> None:
         timeout_seconds=timeout_seconds,
         smoke_runner=smoke_runner,
         require_browser_smoke=True,
+        allow_declarative_fallback=True,
     )
     logger.info("App builder started with provider=%s", pipeline.provider.name)
     try:

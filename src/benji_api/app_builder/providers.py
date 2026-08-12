@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 from typing import Any
@@ -14,6 +15,11 @@ from benji_api.app_builder.types import (
     SourceFile,
     ValidationIssue,
 )
+
+_UI_AGENT_DECLARATIONS = (
+    Path(__file__).with_name("compiler") / "sdk" / "ui.agent.d.ts"
+).read_text(encoding="utf-8")
+
 
 _GENERATOR_INSTRUCTIONS = """You are Dot's app compiler. Turn the supplied validated product
 blueprint into a focused, delightful persistent app interface. This is not a website or a generic
@@ -103,6 +109,14 @@ inside them.
 Dot derives the trusted fallback/acceptance document from the blueprint itself. Do not return a
 second schema or duplicate the interface as JSON. Concentrate the output budget on a coherent,
 working app and its task-specific styling.
+
+AUTHORITATIVE @dot/ui TYPES
+The declaration block below is the exact installed @dot/ui contract. It overrides assumptions from
+other component libraries or training data. Import only exports shown here and pass only declared
+props. Before returning source, check every @dot/ui import and prop against this block.
+
+```ts
+""" + _UI_AGENT_DECLARATIONS + """```
 """
 
 _GENERATOR_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -179,11 +193,12 @@ def _canonicalize_local_styles(
 def _safe_field_type(value: object) -> str:
     return {
         "number": "number",
-        "integer": "number",
+        "integer": "integer",
+        "money": "currency",
         "boolean": "checkbox",
         "date": "date",
-        "object": "textarea",
-        "array": "textarea",
+        "object": "object",
+        "array": "array",
     }.get(str(value), "text")
 
 
@@ -214,6 +229,19 @@ def _trusted_render_document(blueprint: AppBlueprint) -> dict[str, Any]:
             for field in field_items
             if isinstance(field.get("name"), str)
         ]
+        display_fields = [field["name"] for field in fields]
+        item_title = next(
+            (
+                candidate
+                for candidate in ("title", "name", "note", "description", "amount")
+                if candidate in display_fields
+            ),
+            display_fields[0] if display_fields else "id",
+        )
+        item_detail = next(
+            (candidate for candidate in display_fields if candidate != item_title),
+            None,
+        )
         entity_cards.append(
             {
                 "type": "card",
@@ -236,6 +264,14 @@ def _trusted_render_document(blueprint: AppBlueprint) -> dict[str, Any]:
                             "operation": "records.create",
                             "payload": {"entity": name, "data": {}},
                         },
+                        "children": [],
+                    },
+                    {
+                        "type": "list",
+                        "id": f"entity_{index}_list",
+                        "source": name,
+                        "item_title": item_title,
+                        **({"item_detail": item_detail} if item_detail is not None else {}),
                         "children": [],
                     },
                 ],
@@ -330,56 +366,7 @@ function App() {{
 
 export default App;
 '''
-        render_document = {
-            "schema_version": 1,
-            "theme": {
-                "accent": blueprint.accent,
-                "density": "comfortable",
-                "radius": "round",
-            },
-            "data": dict(blueprint.seed_data),
-            "root": {
-                "type": "page",
-                "id": "app",
-                "children": [
-                    {
-                        "type": "hero",
-                        "id": "hero",
-                        "overline": blueprint.layout.replace("_", " "),
-                        "title": blueprint.title,
-                        "subtitle": blueprint.description,
-                        "children": [],
-                    },
-                    {
-                        "type": "section",
-                        "id": "main",
-                        "title": blueprint.purpose,
-                        "children": [
-                            {
-                                "type": "card",
-                                "id": "welcome",
-                                "variant": "soft",
-                                "children": [
-                                    {
-                                        "type": "heading",
-                                        "id": "welcome_heading",
-                                        "title": blueprint.title,
-                                        "size": "lg",
-                                        "children": [],
-                                    },
-                                    {
-                                        "type": "text",
-                                        "id": "welcome_text",
-                                        "body": blueprint.description,
-                                        "children": [],
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            },
-        }
+        render_document = _trusted_render_document(blueprint)
         return GeneratedSource(
             files=(SourceFile("src/App.tsx", source),),
             entrypoint="src/App.tsx",

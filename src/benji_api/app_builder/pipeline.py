@@ -40,6 +40,18 @@ logger = logging.getLogger(__name__)
 _MAX_BUILD_ARTIFACT_BYTES = 4_000_000
 _MAX_TEST_RESULTS_BYTES = 128_000
 _COMPUTED_ACCEPTANCE_FIELDS = frozenset({"created_at", "updated_at", "id", "version"})
+_COMPILATION_BLOCKING_POLICY_CODES = frozenset(
+    {
+        "duplicate_source_path",
+        "file_too_large",
+        "invalid_source_path",
+        "invalid_typescript",
+        "missing_entrypoint",
+        "missing_source",
+        "source_too_large",
+        "too_many_files",
+    }
+)
 DOT_APP_DEPENDENCY_LOCK = MappingProxyType(
     {
         "@dot/app-runtime": "2",
@@ -88,6 +100,7 @@ class AppBuildPipeline:
         compiler: AppCompiler | None = None,
         smoke_runner: AppBrowserSmokeRunner | None = None,
         require_browser_smoke: bool = False,
+        allow_declarative_fallback: bool = False,
     ) -> None:
         if max_repair_attempts < 0 or max_repair_attempts > 4:
             raise ValueError("max_repair_attempts must be between 0 and 4")
@@ -102,25 +115,32 @@ class AppBuildPipeline:
         self.compiler = compiler or EsbuildAppCompiler(timeout_seconds=min(20.0, timeout_seconds))
         self.smoke_runner = smoke_runner
         self.require_browser_smoke = require_browser_smoke
+        self.allow_declarative_fallback = allow_declarative_fallback
 
     async def build(self, claim: BuildClaim) -> BuildCompletion:
         started_at = datetime.now(UTC)
         started = monotonic()
         stages = _StageTimer({})
+        blueprint: AppBlueprint | None = None
+        generated: GeneratedSource | None = None
+        attempts = 0
+        repairs = 0
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 blueprint = await stages.measure(
                     "validate", lambda: _as_awaitable(AppBlueprint.from_mapping(claim.blueprint))
                 )
+                attempts = 1
                 generated = await stages.measure(
                     "generate", lambda: self.provider.generate(blueprint)
                 )
-                attempts = 1
-                repairs = 0
                 browser_bundle = None
                 smoke_result: MappingProxyType[str, object] | None = None
+                fallback_issues: tuple[ValidationIssue, ...] = ()
                 while True:
-                    issues = await stages.measure(
+                    browser_bundle = None
+                    smoke_result = None
+                    policy_issues = await stages.measure(
                         "inspect",
                         lambda current=generated: _as_awaitable(
                             inspect_generated_source(
@@ -132,14 +152,18 @@ class AppBuildPipeline:
                             )
                         ),
                     )
-                    if not issues:
+                    issues = policy_issues
+                    if not any(
+                        issue.code in _COMPILATION_BLOCKING_POLICY_CODES
+                        for issue in policy_issues
+                    ):
                         try:
                             browser_bundle = await stages.measure(
                                 "compile",
                                 lambda current=generated: self.compiler.compile(current),
                             )
                         except AppCompilationError as exc:
-                            issues = exc.issues
+                            issues = _dedupe_issues((*policy_issues, *exc.issues))
                     if not issues:
                         if self.smoke_runner is not None and browser_bundle is not None:
                             try:
@@ -172,7 +196,21 @@ class AppBuildPipeline:
                         [issue.code for issue in issues],
                     )
                     if repairs >= self.max_repair_attempts:
-                        raise BuildRejectedError(issues)
+                        if not self.allow_declarative_fallback:
+                            raise BuildRejectedError(issues)
+                        fallback_issues = issues
+                        generated = await stages.measure(
+                            "fallback",
+                            partial(
+                                self._trusted_declarative_fallback,
+                                blueprint,
+                                generated,
+                                issues,
+                            ),
+                        )
+                        browser_bundle = None
+                        smoke_result = None
+                        break
                     repairs += 1
                     attempts += 1
                     previous = generated
@@ -186,18 +224,49 @@ class AppBuildPipeline:
                             attempt=repairs,
                         ),
                     )
-                if browser_bundle is None:
-                    raise RuntimeError("browser compiler returned no bundle")
                 artifact = await stages.measure(
                     "package",
                     lambda: _as_awaitable(
-                        self._package(blueprint, generated, browser_bundle, smoke_result)
+                        self._package_declarative(
+                            blueprint,
+                            generated,
+                            fallback_issues,
+                        )
+                        if browser_bundle is None and fallback_issues
+                        else self._package(
+                            blueprint,
+                            generated,
+                            browser_bundle,
+                            smoke_result,
+                        )
                     ),
                 )
         except TimeoutError as exc:
-            raise TimeoutError(
-                f"app build exceeded the {self.timeout_seconds:g}s worker deadline"
-            ) from exc
+            if not self.allow_declarative_fallback or blueprint is None:
+                raise TimeoutError(
+                    f"app build exceeded the {self.timeout_seconds:g}s worker deadline"
+                ) from exc
+            fallback_issues = (
+                ValidationIssue(
+                    "custom_code_timeout",
+                    f"custom app build exceeded {self.timeout_seconds:g}s",
+                ),
+            )
+            generated = await stages.measure(
+                "fallback",
+                partial(
+                    self._trusted_declarative_fallback,
+                    blueprint,
+                    generated,
+                    fallback_issues,
+                ),
+            )
+            artifact = await stages.measure(
+                "package",
+                lambda: _as_awaitable(
+                    self._package_declarative(blueprint, generated, fallback_issues)
+                ),
+            )
 
         completed_at = datetime.now(UTC)
         duration_ms = max(0, round((monotonic() - started) * 1000))
@@ -220,6 +289,103 @@ class AppBuildPipeline:
             artifact=artifact,
             metrics=metrics,
         )
+
+    async def _trusted_declarative_fallback(
+        self,
+        blueprint: AppBlueprint,
+        previous: GeneratedSource | None,
+        issues: tuple[ValidationIssue, ...],
+    ) -> GeneratedSource:
+        from benji_api.app_builder.providers import DeterministicLocalProvider
+
+        fallback = await DeterministicLocalProvider().generate(blueprint)
+        fallback_issues = inspect_generated_source(
+            fallback,
+            allowed_capabilities=frozenset(
+                parse_generated_app_capabilities(blueprint.manifest)
+            ),
+            manifest=blueprint.manifest,
+        )
+        if fallback_issues:
+            raise BuildRejectedError(fallback_issues)
+        return GeneratedSource(
+            files=fallback.files,
+            entrypoint=fallback.entrypoint,
+            render_document=fallback.render_document,
+            provider_metadata=MappingProxyType(
+                {
+                    **(dict(previous.provider_metadata) if previous is not None else {}),
+                    "fallback_mode": "declarative",
+                    "custom_code_issue_codes": sorted({issue.code for issue in issues}),
+                }
+            ),
+        )
+
+    def _package_declarative(
+        self,
+        blueprint: AppBlueprint,
+        generated: GeneratedSource,
+        issues: tuple[ValidationIssue, ...],
+    ) -> BuildArtifact:
+        ordered_files = tuple(sorted(generated.files, key=lambda item: item.path))
+        source_payload = [item.as_dict() for item in ordered_files]
+        source_digest = content_hash(source_payload)
+        test_results = {
+            "policy": {"status": "passed"},
+            "typescript_compile": {
+                "status": "skipped",
+                "reason": "trusted_declarative_fallback",
+            },
+            "render_contract": {"status": "passed", "schema_version": 1},
+            "browser_smoke": {
+                "status": "skipped",
+                "reason": "trusted_declarative_fallback",
+            },
+            "custom_code": {
+                "status": "rejected",
+                "issue_codes": sorted({issue.code for issue in issues}),
+            },
+        }
+        unsigned = {
+            "format_version": 1,
+            "provider": self.provider.name,
+            "provider_version": self.provider.version,
+            "sdk_version": DOT_APP_SDK_VERSION,
+            "entrypoint": generated.entrypoint,
+            "files": source_payload,
+            "manifest": dict(blueprint.manifest),
+            "render_document": dict(generated.render_document),
+            "dependency_lock": dict(DOT_APP_DEPENDENCY_LOCK),
+            "test_results": test_results,
+            "source_hash": source_digest,
+            "browser_bundle": None,
+        }
+        artifact = BuildArtifact(
+            format_version=1,
+            provider=self.provider.name,
+            provider_version=self.provider.version,
+            sdk_version=DOT_APP_SDK_VERSION,
+            entrypoint=generated.entrypoint,
+            files=ordered_files,
+            manifest=MappingProxyType(dict(blueprint.manifest)),
+            render_document=MappingProxyType(dict(generated.render_document)),
+            dependency_lock=DOT_APP_DEPENDENCY_LOCK,
+            test_results=MappingProxyType(test_results),
+            source_hash=source_digest,
+            content_hash=content_hash(unsigned),
+            provider_metadata=MappingProxyType(dict(generated.provider_metadata)),
+            browser_bundle=None,
+        )
+        if len(canonical_json(artifact.as_dict()).encode()) > _MAX_BUILD_ARTIFACT_BYTES:
+            raise BuildRejectedError(
+                (
+                    ValidationIssue(
+                        "build_artifact_too_large",
+                        "packaged app exceeds the 4 MB persistence envelope",
+                    ),
+                )
+            )
+        return artifact
 
     def _package(
         self,
@@ -339,6 +505,15 @@ class AppBuildPipeline:
 
 async def _as_awaitable[T](value: T) -> T:
     return value
+
+
+def _dedupe_issues(issues: tuple[ValidationIssue, ...]) -> tuple[ValidationIssue, ...]:
+    return tuple(
+        {
+            (issue.code, issue.message, issue.path): issue
+            for issue in issues
+        }.values()
+    )
 
 
 def _acceptance_plan(

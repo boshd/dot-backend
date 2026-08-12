@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -182,6 +183,18 @@ export default function App() {
     assert "High" in bundle.javascript
 
 
+@pytest.mark.anyio
+async def test_production_app_builder_regression_corpus_compiles() -> None:
+    fixtures = tuple((
+        Path(__file__).parent / "fixtures/app_builder/regressions"
+    ).glob("*.tsx"))
+
+    assert fixtures
+    for fixture in fixtures:
+        bundle = await EsbuildAppCompiler().compile(_source(fixture.read_text()))
+        assert bundle.sha256, fixture.name
+
+
 def test_dot_ui_semantic_color_pairs_meet_normal_text_contrast() -> None:
     css = (
         Path(__file__).parents[1]
@@ -200,6 +213,21 @@ def test_dot_ui_semantic_color_pairs_meet_normal_text_contrast() -> None:
     assert _contrast("#696963", "#f6f6f2") >= 4.5
     assert "--dot-chart-muted: #696963" in css
     assert ".dot-input::placeholder { color: var(--dot-muted); opacity: 1; }" in css
+
+
+def test_agent_facing_dot_ui_declarations_match_runtime_sdk() -> None:
+    compiler_directory = (
+        Path(__file__).parents[1] / "src/benji_api/app_builder/compiler"
+    )
+    generated = subprocess.run(
+        ["node", str(compiler_directory / "generate_ui_declarations.mjs")],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    ).stdout
+
+    assert generated == (compiler_directory / "sdk/ui.agent.d.ts").read_text()
 
 
 @pytest.mark.anyio
