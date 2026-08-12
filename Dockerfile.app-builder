@@ -30,9 +30,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY --from=uv /uv /uvx /bin/
-RUN --mount=type=cache,id=dot-app-builder-apt-cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,id=dot-app-builder-apt-lists,target=/var/lib/apt,sharing=locked \
-    apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-sandbox
 
 # Keep the large browser layer independent from SDK/harness churn so normal app-platform
