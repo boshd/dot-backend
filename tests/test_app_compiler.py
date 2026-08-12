@@ -139,7 +139,7 @@ async def test_dot_ui_accepts_model_friendly_collection_and_control_apis() -> No
         _source(
             '''import React, { useState } from "react";
 import {
-  AppShell, Button, Input, List, ListItem, Segment, SegmentedControl,
+  AppShell, Button, Checkbox, Input, List, ListItem, Segment, SegmentedControl,
   Select, Stack, Text, Textarea
 } from "@dot/ui";
 
@@ -148,6 +148,7 @@ export default function App() {
   const [notes, setNotes] = useState("");
   const [priority, setPriority] = useState("normal");
   const [filter, setFilter] = useState("open");
+  const [done, setDone] = useState(false);
   return <AppShell title="Tasks">
     <Stack gap="large">
       <Input label="Name" value={name} onValueChange={setName} />
@@ -159,6 +160,8 @@ export default function App() {
         options={[{ value: "normal", label: "Normal" }, { value: "high", label: "High" }]}
       />
       <Button size="small">Save</Button>
+      <Checkbox label="Done" checked={done} onCheckedChange={setDone} />
+      <Checkbox label="Done too" checked={done} onValueChange={setDone} />
     </Stack>
     <Select value={priority} onChange={(event) => setPriority(event.target.value)}>
       <option value="normal">Normal</option><option value="high">High</option>

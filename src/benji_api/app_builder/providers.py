@@ -51,6 +51,7 @@ These common controlled shapes are supported exactly:
 options={[{ value: "high", label: "High" }]} />` (or native `<option>` children). Never pass a
 React state setter directly to a native-style `onChange`; use `onValueChange`. Both short size/gap
 tokens (`sm`, `md`, `lg`) and their aliases (`small`, `medium`, `large`) are accepted.
+`<Checkbox checked={done} onCheckedChange={setDone} label="Done" />` is supported.
 `<SegmentedControl label="Filter" value={filter}
 onValueChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`, and either
 `<ListItem title="Task" detail="Today" />` or `<ListItem><Text>Task</Text></ListItem>`.

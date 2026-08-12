@@ -385,6 +385,7 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert "never write `data-dot-primary-action`" in request["instructions"]
     assert 'options={[{ value: "high", label: "High" }]}' in request["instructions"]
     assert "onValueChange={setName}" in request["instructions"]
+    assert "onCheckedChange={setDone}" in request["instructions"]
     assert '<SegmentedControl label="Filter" value={filter}' in request["instructions"]
     assert '<ListItem title="Task" detail="Today" />' in request["instructions"]
     normalized_instructions = " ".join(request["instructions"].lower().split())

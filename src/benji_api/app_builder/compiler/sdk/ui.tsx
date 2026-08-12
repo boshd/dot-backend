@@ -473,8 +473,24 @@ export function Select({
   return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
 }
 
-export function Checkbox({ label, ...props }: SafeInputProps & { label?: ReactNode }) {
-  return <label className="dot-checkbox"><input {...props} type="checkbox" />{label && <span>{label}</span>}</label>;
+export function Checkbox({
+  label,
+  onChange,
+  onCheckedChange,
+  onValueChange,
+  ...props
+}: SafeInputProps & {
+  label?: ReactNode;
+  onCheckedChange?: (checked: boolean) => void;
+  onValueChange?: (checked: boolean) => void;
+}) {
+  return <label className="dot-checkbox"><input {...props} type="checkbox" onChange={(event) => {
+    onChange?.(event);
+    if (!event.defaultPrevented) {
+      onCheckedChange?.(event.currentTarget.checked);
+      onValueChange?.(event.currentTarget.checked);
+    }
+  }} />{label && <span>{label}</span>}</label>;
 }
 
 export function List({ children, divided = true }: ChildrenProps & { divided?: boolean }) {
