@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -116,7 +117,7 @@ async def _deployed_app(factory):
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={"render_document": {"schema_version": 1, "root": {"type": "page"}}},
+            artifact=compiled_artifact(),
             artifact_url="artifact://launch-list",
             artifact_sha256="a" * 64,
             sdk_version="1.0.0",
@@ -363,7 +364,7 @@ async def test_revision_and_rollback_replay_crash_gap_without_repeating_action()
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return 'v2' }"},
-            artifact={"render_document": {"schema_version": 1, "root": {"type": "page"}}},
+            artifact=compiled_artifact(),
             artifact_url="artifact://launch-list-v2",
             artifact_sha256="b" * 64,
             sdk_version="1.0.0",

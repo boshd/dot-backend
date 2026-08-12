@@ -922,7 +922,12 @@ class CreateGeneratedAppTool:
                     "entities": {
                         "type": "array",
                         "maxItems": 24,
-                        "description": "Persistent data types the app needs.",
+                        "description": (
+                            "User-created records the app must persist, in dependency order. "
+                            "Every entity must have a real create workflow. Do not model "
+                            "calculated views, totals, balances, recommendations, or other "
+                            "derived output as entities."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {

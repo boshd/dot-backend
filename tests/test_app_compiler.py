@@ -5,7 +5,6 @@ import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
 
 import pytest
 
@@ -21,21 +20,10 @@ from benji_api.app_builder.types import (
 )
 
 
-def _document() -> MappingProxyType[str, object]:
-    return MappingProxyType(
-        {
-            "schema_version": 1,
-            "data": {},
-            "root": {"id": "root", "type": "page", "children": []},
-        }
-    )
-
-
 def _source(contents: str, *extra: SourceFile) -> GeneratedSource:
     return GeneratedSource(
         files=(SourceFile("src/App.tsx", contents), *extra),
         entrypoint="src/App.tsx",
-        render_document=_document(),
     )
 
 
@@ -228,6 +216,26 @@ def test_agent_facing_dot_ui_declarations_match_runtime_sdk() -> None:
     ).stdout
 
     assert generated == (compiler_directory / "sdk/ui.agent.d.ts").read_text()
+
+
+def test_agent_facing_dot_runtime_declarations_match_runtime_sdk() -> None:
+    compiler_directory = (
+        Path(__file__).parents[1] / "src/benji_api/app_builder/compiler"
+    )
+    generated = subprocess.run(
+        ["node", str(compiler_directory / "generate_runtime_declarations.mjs")],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    ).stdout
+
+    declaration = (compiler_directory / "sdk/app-runtime.agent.d.ts").read_text()
+    assert generated == declaration
+    assert "export declare function useRecords" in declaration
+    assert "export declare function runAction" in declaration
+    assert "__dotInitialize" not in declaration
+    assert "__DOT_APP_POST__" not in declaration
 
 
 @pytest.mark.anyio

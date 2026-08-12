@@ -17,6 +17,7 @@ type JsonObject = Record<string, unknown>;
 type RuntimeError = { code: string; message: string };
 type RequestOptions = { idempotencyKey?: string; timeoutMs?: number };
 
+/** @internal */
 declare global {
   interface Window {
     __DOT_APP_CHANNEL_TOKEN__?: string;
@@ -143,6 +144,7 @@ function invalidateRecords(entity: unknown): void {
   recordListeners.forEach((listeners) => listeners.forEach((listener) => listener()));
 }
 
+/** @internal */
 export function DotRuntimeProvider({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
@@ -239,6 +241,7 @@ export async function runAction<T = unknown>(
   return result;
 }
 
+/** @internal */
 export function __dotInitialize(initialData: unknown): void {
   if (initialData !== undefined) {
     appData = initialData;
@@ -246,6 +249,7 @@ export function __dotInitialize(initialData: unknown): void {
   }
 }
 
+/** @internal */
 export function __dotNotifyReady(): void {
   post({ type: "dot.app.ready" });
   if (typeof ResizeObserver !== "undefined") {
@@ -262,6 +266,7 @@ export function __dotNotifyReady(): void {
 type BoundaryProps = { children: ReactNode };
 type BoundaryState = { error: Error | null };
 
+/** @internal */
 export class DotRuntimeErrorBoundary extends Component<BoundaryProps, BoundaryState> {
   state: BoundaryState = { error: null };
 

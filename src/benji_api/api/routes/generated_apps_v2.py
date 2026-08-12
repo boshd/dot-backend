@@ -48,6 +48,7 @@ class RevisionResponse(BaseModel):
     id: UUID
     revision_number: int
     manifest: dict[str, Any]
+    seed_data: dict[str, Any]
     artifact: dict[str, Any]
     artifact_url: str
     artifact_sha256: str
@@ -56,10 +57,7 @@ class RevisionResponse(BaseModel):
 
 def _runtime_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     """Return only immutable assets needed by the browser, not source/build telemetry."""
-    return {
-        "render_document": artifact.get("render_document", {}),
-        "browser_bundle": artifact.get("browser_bundle"),
-    }
+    return {"browser_bundle": artifact.get("browser_bundle")}
 
 
 class BuildResponse(BaseModel):
@@ -149,6 +147,7 @@ async def code_app_bootstrap(
                 id=revision.id,
                 revision_number=revision.revision_number,
                 manifest=revision.manifest,
+                seed_data=revision.seed_data,
                 artifact=_runtime_artifact(revision.artifact),
                 artifact_url=revision.artifact_url,
                 artifact_sha256=revision.artifact_sha256,

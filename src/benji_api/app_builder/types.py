@@ -229,7 +229,6 @@ class SourceFile:
 class GeneratedSource:
     files: tuple[SourceFile, ...]
     entrypoint: str
-    render_document: Mapping[str, Any]
     provider_metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
 
@@ -314,7 +313,6 @@ class BuildArtifact:
     entrypoint: str
     files: tuple[SourceFile, ...]
     manifest: Mapping[str, Any]
-    render_document: Mapping[str, Any]
     dependency_lock: Mapping[str, str]
     test_results: Mapping[str, Any]
     source_hash: str
@@ -331,7 +329,6 @@ class BuildArtifact:
             "entrypoint": self.entrypoint,
             "files": [source_file.as_dict() for source_file in self.files],
             "manifest": dict(self.manifest),
-            "render_document": dict(self.render_document),
             "dependency_lock": dict(self.dependency_lock),
             "test_results": dict(self.test_results),
             "source_hash": self.source_hash,

@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -96,7 +97,7 @@ async def _deployed_app(factory, *, reminders: bool, group: bool = False):
             expected_attempt=claim.attempt,
             manifest=manifest,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={"render_document": {"schema_version": 1}},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://gentle-habits",
             artifact_sha256="a" * 64,
             sdk_version="1",
@@ -470,7 +471,7 @@ async def test_unsupported_manifest_capability_never_deploys() -> None:
                     "entities": [],
                 },
                 source_files={"src/App.tsx": "export default function App() { return null }"},
-                artifact={},
+                artifact=compiled_artifact(sdk_version="1"),
                 artifact_url="artifact://unsafe",
                 artifact_sha256="a" * 64,
                 sdk_version="1",

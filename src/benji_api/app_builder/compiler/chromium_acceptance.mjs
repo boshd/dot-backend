@@ -5,6 +5,8 @@ const MAX_INPUT_BYTES = 3_600_000;
 const MAX_OUTPUT_BYTES = 512_000;
 const MAX_STEPS = 24;
 const MAX_OPERATIONS = 100;
+let acceptanceTargetSequence = 0;
+let primaryWorkflowRevealed = false;
 
 function respond(value, code = 0) {
   const encoded = JSON.stringify(value);
@@ -325,6 +327,114 @@ function selectorField(formSelector, name) {
   return `${formSelector} [name="${safeName}"]`;
 }
 
+function stepFieldHints(step) {
+  return step.field_hints && typeof step.field_hints === "object"
+    ? step.field_hints
+    : step.fields && typeof step.fields === "object"
+      ? step.fields
+      : {};
+}
+
+async function discoverSubmitForm(frame, step) {
+  const forms = frame.locator("form");
+  const candidates = await forms.evaluateAll((elements, rawStep) => {
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" &&
+        Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+    };
+    const fieldNames = Object.keys(
+      rawStep.field_hints && typeof rawStep.field_hints === "object"
+        ? rawStep.field_hints
+        : rawStep.fields && typeof rawStep.fields === "object"
+          ? rawStep.fields
+          : {},
+    );
+    const requiredNames = Array.isArray(rawStep.required_payload_fields)
+      ? rawStep.required_payload_fields
+      : Array.isArray(rawStep.required_fields)
+        ? rawStep.required_fields
+        : [];
+    return elements.map((form, index) => {
+      const submitters = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')]
+        .filter(visible);
+      const present = fieldNames.filter((name) => {
+        const safe = CSS.escape(String(name));
+        return [...form.querySelectorAll(`[name="${safe}"]`)].some(visible);
+      });
+      const required = requiredNames.filter((name) => present.includes(name));
+      return {
+        index,
+        visible: visible(form),
+        submitters: submitters.length,
+        present,
+        requiredCoverage: required.length === requiredNames.length,
+        score: required.length * 100 + present.length,
+      };
+    });
+  }, step);
+  const usable = candidates.filter((item) =>
+    item.visible && item.submitters === 1 && item.requiredCoverage
+  );
+  if (!usable.length) return null;
+  const bestScore = Math.max(...usable.map((item) => item.score));
+  const best = usable.filter((item) => item.score === bestScore);
+  if (best.length !== 1) {
+    fail(
+      "acceptance_flow_ambiguous",
+      `could not identify one ${step.operation} form from declared fields; ${best.length} forms shared score ${bestScore}`,
+    );
+  }
+  return forms.nth(best[0].index);
+}
+
+async function interactionTarget(frame, step, { required }) {
+  if (step.event_type === "submit") {
+    let form = await discoverSubmitForm(frame, step);
+    if (!form && !primaryWorkflowRevealed) {
+      const triggers = frame.locator("[data-dot-primary-action]");
+      const visibleTriggerIndexes = await triggers.evaluateAll((elements) => elements
+        .map((element, index) => ({ element, index }))
+        .filter(({ element }) => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== "none" && style.visibility !== "hidden" &&
+            Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+        })
+        .map(({ index }) => index));
+      if (visibleTriggerIndexes.length > 1) {
+        fail(
+          "acceptance_flow_ambiguous",
+          `app rendered ${visibleTriggerIndexes.length} primary workflow triggers`,
+        );
+      }
+      if (visibleTriggerIndexes.length === 1) {
+        primaryWorkflowRevealed = true;
+        await triggers.nth(visibleTriggerIndexes[0]).click();
+        await assertVisibleExperience(frame);
+        form = await discoverSubmitForm(frame, step);
+      }
+    }
+    if (!form && required) {
+      const fields = Object.keys(stepFieldHints(step));
+      fail(
+        "acceptance_flow_missing",
+        `no visible submit form matched the declared ${step.entity || step.operation} fields: ${fields.join(", ")}`,
+      );
+    }
+    return form;
+  }
+  if (typeof step.selector !== "string") {
+    if (required) fail("acceptance_flow_missing", `no interaction target declared for ${step.operation}`);
+    return null;
+  }
+  return expectSingleVisible(frame, step.selector, {
+    required,
+    label: "interaction target",
+  });
+}
+
 async function visible(locator) {
   return await locator.count() > 0 && await locator.first().isVisible();
 }
@@ -416,7 +526,8 @@ async function auditVisibleExperience(frame) {
         if (label && visible(label)) target = label;
       }
       const rect = target.getBoundingClientRect();
-      if (rect.width < 44 || rect.height < 44) {
+      // Browser font/layout rounding can report a 44px SDK control a fraction below 44.
+      if (rect.width < 43.5 || rect.height < 43.5) {
         push(
           "ux_tap_target_too_small",
           `${describe(element)} has a ${Math.round(rect.width)}x${Math.round(rect.height)}px tap target; minimum is 44x44px`,
@@ -426,8 +537,8 @@ async function auditVisibleExperience(frame) {
 
     const primarySelector = [
       "[data-dot-primary-action]",
-      "[data-dot-operation] button[type=submit]",
-      "[data-dot-operation][role=button]",
+      "form button[type=submit]",
+      "form input[type=submit]",
     ].join(",");
     for (const element of document.querySelectorAll(primarySelector)) {
       if (!visible(element)) continue;
@@ -516,11 +627,49 @@ async function assertVisibleExperience(frame) {
 }
 
 async function assertFocused(locator, selector) {
+  if (await locator.count() !== 1) {
+    fail("acceptance_input_focus_lost", `field was remounted while typing: ${selector}`);
+  }
   const focused = await locator.evaluate((element) => element === element.ownerDocument.activeElement);
   if (!focused) fail("acceptance_input_focus_lost", `field lost focus while typing: ${selector}`);
 }
 
 async function enterField(frame, selector, value) {
+  const candidates = frame.locator(selector);
+  const candidateCount = await candidates.count();
+  if (!candidateCount) fail("acceptance_flow_missing", `required field was not rendered: ${selector}`);
+  if (candidateCount > 1) {
+    const choices = await candidates.evaluateAll((elements) => elements.map((element, index) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return {
+        index,
+        visible: style.display !== "none" && style.visibility !== "hidden" &&
+          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0,
+        enabled: !(element instanceof HTMLInputElement) || !element.disabled,
+        type: element instanceof HTMLInputElement ? element.type.toLowerCase() : "",
+      };
+    }));
+    const enabledChoices = choices.filter((item) =>
+      item.visible && item.enabled && ["checkbox", "radio"].includes(item.type)
+    );
+    if (enabledChoices.length !== choices.filter((item) => item.visible).length || !enabledChoices.length) {
+      fail("acceptance_flow_ambiguous", `required field matched ${candidateCount} controls: ${selector}`);
+    }
+    const desiredCount = Array.isArray(value) && value.length
+      ? Math.min(value.length, enabledChoices.length)
+      : 1;
+    const selected = [];
+    for (const choice of enabledChoices.slice(0, desiredCount)) {
+      const locator = candidates.nth(choice.index);
+      if (!(await locator.isChecked())) await locator.click();
+      if (!(await locator.isChecked())) {
+        fail("acceptance_field_value_mismatch", `choice did not stay selected: ${selector}`);
+      }
+      selected.push(await locator.inputValue());
+    }
+    return { mode: "multi-choice", value: selected };
+  }
   const locator = await expectSingleVisible(frame, selector, {
     required: true,
     label: "required field",
@@ -611,7 +760,7 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
   let refreshVerified = 0;
   let persistedRenderVerified = 0;
   for (const step of acceptancePlan) {
-    if (!step || typeof step !== "object" || typeof step.selector !== "string") continue;
+    if (!step || typeof step !== "object") continue;
     const required = step.required === true;
     if (step.operation === "ui.reveal_primary") {
       const trigger = await expectSingleVisible(frame, step.selector, {
@@ -625,21 +774,19 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
       acceptance.push({ operation: step.operation, passed: true });
       continue;
     }
-    const target = await expectSingleVisible(frame, step.selector, {
-      required,
-      label: "interaction target",
-    });
+    const target = await interactionTarget(frame, step, { required });
     if (!target) {
       acceptance.push({ operation: step.operation, entity: step.entity, passed: !required });
       continue;
     }
-    const fieldHints = step.field_hints && typeof step.field_hints === "object"
-      ? step.field_hints
-      : step.fields && typeof step.fields === "object"
-        ? step.fields
-        : {};
+    const fieldHints = stepFieldHints(step);
+    const targetId = `dot-acceptance-${++acceptanceTargetSequence}`;
+    const targetSelector = await target.evaluate((element, testId) => {
+      element.setAttribute("data-dot-acceptance-target", testId);
+      return `[data-dot-acceptance-target="${testId}"]`;
+    }, targetId);
     for (const [name, value] of Object.entries(fieldHints)) {
-      const fieldSelector = selectorField(step.selector, name);
+      const fieldSelector = selectorField(targetSelector, name);
       if (!(await visible(frame.locator(fieldSelector)))) {
         // Field names are only interaction hints. Purpose-built controls may derive a persisted
         // field from a segmented control, stepper, or several differently named inputs. The
@@ -660,7 +807,7 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
       if (required) {
         fail(
           "acceptance_flow_missing",
-          `visible submit button was not rendered inside target form: ${step.selector}`,
+          `visible submit button was not rendered inside the discovered ${step.entity || step.operation} form`,
         );
       }
       continue;
@@ -668,7 +815,7 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
     if (submitCount !== 1) {
       fail(
         "acceptance_flow_ambiguous",
-        `target form contained ${submitCount} submit buttons: ${step.selector}`,
+        `discovered form contained ${submitCount} submit buttons`,
       );
     }
     const submit = submitCandidates.first();

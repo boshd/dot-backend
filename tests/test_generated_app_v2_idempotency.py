@@ -1,4 +1,5 @@
 import pytest
+from generated_app_artifacts import compiled_artifact
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -80,7 +81,7 @@ async def _deployed_app(factory):
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://idempotency-test",
             artifact_sha256="a" * 64,
             sdk_version="1",

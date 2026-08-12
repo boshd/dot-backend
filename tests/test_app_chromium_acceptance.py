@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import pytest
 
 from benji_api.app_builder.browser_smoke import (
@@ -16,29 +14,15 @@ def _source(contents: str) -> GeneratedSource:
     return GeneratedSource(
         files=(SourceFile("src/App.tsx", contents),),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "data": {},
-                "root": {"id": "root", "type": "page", "children": []},
-            }
-        ),
     )
 
 
 def _vote_plan() -> tuple[dict[str, object], ...]:
     return (
         {
-            "operation": "ui.reveal_primary",
-            "required": False,
-            "selector": "[data-dot-primary-action]",
-            "event_type": "click",
-        },
-        {
             "operation": "records.create",
             "entity": "vote",
             "required": True,
-            "selector": '[data-dot-operation="records.create"][data-dot-entity="vote"]',
             "event_type": "submit",
             "field_hints": {"choice": "test"},
             "required_payload_fields": ["choice"],
@@ -65,7 +49,7 @@ export default function App() {
   const [createdChoice, setCreatedChoice] = useState("");
   return <AppShell title="Vote">
     <PrimaryWorkflowTrigger onClick={() => setOpen(true)}>vote</PrimaryWorkflowTrigger>
-    {open ? <form data-dot-operation="records.create" data-dot-entity="vote"
+    {open ? <form
       onSubmit={async (event) => {
         event.preventDefault();
         const created = await runAction<{ choice: string }>(
@@ -118,7 +102,7 @@ import { runAction } from "@dot/app-runtime";
 import { AppShell, Button, Input } from "@dot/ui";
 export default function App() {
   const [choice, setChoice] = useState("");
-  const Form = () => <form data-dot-operation="records.create" data-dot-entity="vote"
+  const Form = () => <form
     onSubmit={(event) => {
       event.preventDefault();
       void runAction("records.create", { entity: "vote", data: { choice } });
@@ -133,7 +117,7 @@ export default function App() {
     )
 
     with pytest.raises(AppBrowserSmokeError) as failed:
-        await runner.smoke(bundle, acceptance_plan=(_vote_plan()[1],))
+        await runner.smoke(bundle, acceptance_plan=_vote_plan())
 
     assert failed.value.issues[0].code == "acceptance_input_focus_lost"
 
@@ -151,7 +135,7 @@ import { AppShell, Button, Input } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; choice: string }>("vote", { limit: 200 });
   const [choice, setChoice] = useState("");
-  return <AppShell title="Vote"><form data-dot-operation="records.create" data-dot-entity="vote"
+  return <AppShell title="Vote"><form
     onSubmit={(event) => {
       event.preventDefault();
       void runAction("records.create", { entity: "vote", data: { choice } });
@@ -166,7 +150,7 @@ export default function App() {
     )
 
     with pytest.raises(AppBrowserSmokeError) as failed:
-        await runner.smoke(bundle, acceptance_plan=(_vote_plan()[1],))
+        await runner.smoke(bundle, acceptance_plan=_vote_plan())
 
     assert failed.value.issues[0].code in {
         "acceptance_duplicate_mutation",
@@ -191,7 +175,7 @@ export default function App() {
     <form onSubmit={(event) => event.preventDefault()}>
       <Button type="submit">unrelated action</Button>
     </form>
-    <form data-dot-operation="records.create" data-dot-entity="session"
+    <form
       onSubmit={(event) => {
         event.preventDefault();
         void runAction("records.create", {
@@ -213,9 +197,6 @@ export default function App() {
             "operation": "records.create",
             "entity": "session",
             "required": True,
-            "selector": (
-                '[data-dot-operation="records.create"][data-dot-entity="session"]'
-            ),
             "event_type": "submit",
             "fields": {"duration": 1},
             "required_fields": ["duration"],
@@ -244,7 +225,7 @@ export default function App() {
   const { records } = useRecords<{ id: string; priority: string }>("task");
   const [priority, setPriority] = useState("");
   return <AppShell title="Tasks">
-    <form data-dot-operation="records.create" data-dot-entity="task"
+    <form
       onSubmit={(event) => {
         event.preventDefault();
         void runAction("records.create", { entity: "task", data: { priority } });
@@ -267,7 +248,6 @@ export default function App() {
             "operation": "records.create",
             "entity": "task",
             "required": True,
-            "selector": '[data-dot-operation="records.create"][data-dot-entity="task"]',
             "event_type": "submit",
             # This generic suggestion is deliberately not a real option.
             "field_hints": {"priority": "test"},
@@ -286,7 +266,139 @@ export default function App() {
 
 
 @pytest.mark.anyio
-async def test_chromium_acceptance_validates_payload_without_requiring_named_input() -> None:
+async def test_chromium_acceptance_handles_repeated_named_checkboxes_as_an_array() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Checkbox } from "@dot/ui";
+export default function App() {
+  const { records } = useRecords<{ id: string; split_between: string[] }>("expense");
+  const [people, setPeople] = useState<string[]>([]);
+  const toggle = (name: string, checked: boolean) => setPeople((current) =>
+    checked ? [...current, name] : current.filter((item) => item !== name));
+  return <AppShell title="Trip expenses"><form onSubmit={(event) => {
+    event.preventDefault();
+    void runAction("records.create", {
+      entity: "expense", data: { split_between: people },
+    });
+  }}>
+    <Checkbox label="Kareem" name="split_between" value="Kareem"
+      checked={people.includes("Kareem")}
+      onCheckedChange={(checked) => toggle("Kareem", checked)} />
+    <Checkbox label="Maged" name="split_between" value="Maged"
+      checked={people.includes("Maged")}
+      onCheckedChange={(checked) => toggle("Maged", checked)} />
+    <Button type="submit">add expense</Button>
+  </form><p>{records.map((record) => record.split_between.join(", ")).join("; ")}</p></AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "expense",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"split_between": []},
+            "required_payload_fields": ["split_between"],
+            "allowed_payload_fields": ["split_between"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutation = next(item for item in result["operations"] if item["mutating"])
+    assert mutation["args"]["data"] == {"split_between": ["Kareem"]}
+    assert result["field_typing"] == [
+        {"field": "split_between", "mode": "multi-choice", "value": ["Kareem"]}
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_seeds_dependency_before_revealing_later_form() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import {
+  AppShell, Button, Checkbox, Input, PrimaryWorkflowTrigger, Select
+} from "@dot/ui";
+export default function App() {
+  const { records: people } = useRecords<{ id: string; name: string }>("participant");
+  const { records: expenses } = useRecords<{ id: string; amount: number }>("expense");
+  const [name, setName] = useState("");
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [paidBy, setPaidBy] = useState("");
+  const [split, setSplit] = useState(false);
+  return <AppShell title="Cottage costs">
+    <form onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", { entity: "participant", data: { name } });
+    }}>
+      <Input label="Tripmate" name="name" value={name} onValueChange={setName} />
+      <Button type="submit">add tripmate</Button>
+    </form>
+    <PrimaryWorkflowTrigger onClick={() => setOpen(true)}>add expense</PrimaryWorkflowTrigger>
+    {open ? <form onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", { entity: "expense", data: {
+        amount: Number(amount), paid_by: paidBy, split_between: split ? [paidBy] : [],
+      }});
+    }}>
+      <Input label="Amount" name="amount" value={amount} onValueChange={setAmount} />
+      <Select label="Paid by" name="paid_by" value={paidBy} onValueChange={setPaidBy}
+        options={people.map((person) => ({ value: person.name, label: person.name }))} />
+      <Checkbox label="Split with tripmates" name="split_between" checked={split}
+        value={paidBy} onCheckedChange={setSplit} />
+      <Button type="submit">save expense</Button>
+    </form> : null}
+    <p>{people.length} tripmates, {expenses.length} expenses</p>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+        {
+            "operation": "records.create",
+            "entity": "expense",
+            "required": False,
+            "event_type": "submit",
+            "field_hints": {"amount": 1, "paid_by": "test", "split_between": []},
+            "required_payload_fields": ["amount", "paid_by", "split_between"],
+            "allowed_payload_fields": ["amount", "paid_by", "split_between"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutations = [item for item in result["operations"] if item["mutating"]]
+    assert [item["args"]["entity"] for item in mutations] == ["participant", "expense"]
+    assert mutations[1]["args"]["data"] == {
+        "amount": 1,
+        "paid_by": "test",
+        "split_between": ["test"],
+    }
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_requires_named_controls_for_required_fields() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
         pytest.skip("real Chromium acceptance runtime is unavailable")
@@ -297,7 +409,7 @@ import { AppShell, Button } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; choice: string }>("vote");
   return <AppShell title="Vote">
-    <form data-dot-operation="records.create" data-dot-entity="vote"
+    <form
       onSubmit={(event) => {
         event.preventDefault();
         void runAction("records.create", { entity: "vote", data: { choice: "yes" } });
@@ -315,7 +427,6 @@ export default function App() {
             "operation": "records.create",
             "entity": "vote",
             "required": True,
-            "selector": '[data-dot-operation="records.create"][data-dot-entity="vote"]',
             "event_type": "submit",
             "field_hints": {"choice": "test"},
             "required_payload_fields": ["choice"],
@@ -323,11 +434,75 @@ export default function App() {
         },
     )
 
-    result = await runner.smoke(bundle, acceptance_plan=plan)
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=plan)
 
-    mutation = next(item for item in result["operations"] if item["mutating"])
-    assert mutation["args"]["data"] == {"choice": "yes"}
-    assert result["field_typing"] == []
+    assert failed.value.issues[0].code == "acceptance_flow_missing"
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_rejects_ambiguous_marker_free_forms() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
+export default function App() {
+  const [choice, setChoice] = useState("");
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    void runAction("records.create", { entity: "vote", data: { choice } });
+  };
+  return <AppShell title="Vote">
+    <form onSubmit={submit}>
+      <Input label="First choice" name="choice" value={choice} onValueChange={setChoice} />
+      <Button type="submit">save first</Button>
+    </form>
+    <form onSubmit={submit}>
+      <Input label="Second choice" name="choice" value={choice} onValueChange={setChoice} />
+      <Button type="submit">save second</Button>
+    </form>
+  </AppShell>;
+}'''
+        )
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=_vote_plan())
+
+    assert failed.value.issues[0].code == "acceptance_flow_ambiguous"
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_validates_observed_entity_without_markers() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
+export default function App() {
+  const [choice, setChoice] = useState("");
+  return <AppShell title="Vote"><form onSubmit={(event) => {
+    event.preventDefault();
+    void runAction("records.create", { entity: "poll", data: { choice } });
+  }}>
+    <Input label="Choice" name="choice" value={choice} onValueChange={setChoice} />
+    <Button type="submit">save vote</Button>
+  </form></AppShell>;
+}'''
+        )
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=_vote_plan())
+
+    assert failed.value.issues[0].code == "acceptance_required_field_missing"
 
 
 @pytest.mark.anyio
@@ -416,8 +591,7 @@ async def test_chromium_ux_audit_only_checks_user_visible_copy() -> None:
     <label>Guest name
       <input name={internal_field_name} style={{ width: 180, height: 44 }} />
     </label>
-    <button data-dot-operation="records.create" data-dot-entity="trip_expense"
-      style={{ width: 120, height: 44 }}>Add guest</button>
+    <button style={{ width: 120, height: 44 }}>Add guest</button>
   </main>;
 }'''
         )

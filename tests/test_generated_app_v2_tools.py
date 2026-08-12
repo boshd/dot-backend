@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -115,7 +116,7 @@ async def _deployed_app(factory):
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={"render_document": {"schema_version": 1, "root": {"type": "page"}}},
+            artifact=compiled_artifact(),
             artifact_url="artifact://launch-list",
             artifact_sha256="a" * 64,
             sdk_version="1.0.0",
@@ -377,7 +378,7 @@ async def test_revision_queue_is_single_flight_and_stale_build_cannot_promote() 
             manifest=MANIFEST,
             seed_data={},
             source_files={"src/App.tsx": "export default function App() { return 'manual' }"},
-            artifact={},
+            artifact=compiled_artifact(),
             artifact_url="artifact://manual",
             artifact_sha256="c" * 64,
             sdk_version="1.0.0",
@@ -404,7 +405,7 @@ async def test_revision_queue_is_single_flight_and_stale_build_cannot_promote() 
                 expected_attempt=claim.attempt,
                 manifest=MANIFEST,
                 source_files={"src/App.tsx": "export default function App() { return 'stale' }"},
-                artifact={},
+                artifact=compiled_artifact(),
                 artifact_url="artifact://stale",
                 artifact_sha256="d" * 64,
                 sdk_version="1.0.0",
@@ -532,7 +533,7 @@ async def test_owner_can_reversibly_roll_back_previous_deployed_revision() -> No
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return 'v2' }"},
-            artifact={"render_document": {"schema_version": 1, "root": {"type": "page"}}},
+            artifact=compiled_artifact(),
             artifact_url="artifact://launch-list-v2",
             artifact_sha256="b" * 64,
             sdk_version="1.0.0",
@@ -775,7 +776,7 @@ async def test_direct_chat_can_create_a_collaborative_app_with_anonymous_member_
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://shared-tasks",
             artifact_sha256="c" * 64,
             sdk_version="1",

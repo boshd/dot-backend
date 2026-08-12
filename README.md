@@ -157,7 +157,7 @@ then runs a bounded QuickJS-WASM startup/security gate followed by manifest-deri
 persistence checks in real Chromium before promoting an immutable revision. Dot is woken on
 completion and sends the stable private or collaborative link. In the product, generated JavaScript
 runs in an opaque-origin, network-blocked iframe and reaches schema-checked managed records only
-through a narrow validated bridge. Legacy declarative mini-apps remain available during migration.
+through a narrow validated bridge. Only compiled generated-app bundles are promotable.
 
 Current public information is available through the provider-neutral `search_web` tool. Its first
 adapter uses OpenAI Responses native web search in a separate retrieval call, then returns a

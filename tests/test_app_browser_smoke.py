@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import pytest
 
 from benji_api.app_builder.browser_smoke import (
@@ -17,13 +15,6 @@ def _source(contents: str) -> GeneratedSource:
     return GeneratedSource(
         files=(SourceFile("src/App.tsx", contents),),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "data": {},
-                "root": {"id": "root", "type": "page", "children": []},
-            }
-        ),
     )
 
 

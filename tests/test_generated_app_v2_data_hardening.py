@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -75,7 +76,7 @@ async def _finish(factory, *, worker: str, manifest=MANIFEST):
             expected_attempt=claim.attempt,
             manifest=manifest,
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={},
+            artifact=compiled_artifact(),
             artifact_url=f"artifact://{worker}",
             artifact_sha256="a" * 64,
             sdk_version="1.0.0",
@@ -263,7 +264,7 @@ async def test_deploy_revalidates_records_written_after_revision_was_queued() ->
                 expected_attempt=claim.attempt,
                 manifest=incompatible,
                 source_files={"src/App.tsx": "export default function App() { return null }"},
-                artifact={},
+                artifact=compiled_artifact(),
                 artifact_url="artifact://schema-second",
                 artifact_sha256="b" * 64,
                 sdk_version="1.0.0",

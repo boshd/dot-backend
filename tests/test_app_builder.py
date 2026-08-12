@@ -241,6 +241,7 @@ class FakeSmokeRunner:
             {
                 "ready": True,
                 "runtime_errors": 0,
+                "real_browser": {"ready": True, "runtime": "chromium"},
                 "static_html": '<main data-testid="app">ready</main>',
             }
         )
@@ -322,8 +323,22 @@ async def test_local_build_is_deterministic_and_instrumented() -> None:
 
     assert first.artifact.content_hash == second.artifact.content_hash
     assert first.artifact.source_hash == second.artifact.source_hash
-    assert first.artifact.render_document["schema_version"] == 1
-    assert first.artifact.render_document["root"]["type"] == "page"
+    assert first.artifact.browser_bundle.javascript
+    assert set(first.artifact.as_dict()) == {
+        "format_version",
+        "provider",
+        "provider_version",
+        "sdk_version",
+        "entrypoint",
+        "files",
+        "manifest",
+        "dependency_lock",
+        "test_results",
+        "source_hash",
+        "content_hash",
+        "provider_metadata",
+        "browser_bundle",
+    }
     assert "export default App" in first.artifact.files[0].contents
     assert first.metrics.within_target is True
     assert first.metrics.repair_attempts == 0
@@ -480,13 +495,41 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     request = client.responses.requests[0]
     assert request["store"] is False
     assert request["max_output_tokens"] == 16_000
+    assert "dependency order, never visual priority" in request["input"][0]["content"]
+    output_schema = request["text"]["format"]["schema"]
+    source_path_schema = output_schema["properties"]["files"]["items"]["properties"]["path"]
+    assert source_path_schema["pattern"].startswith("^src/")
+    assert output_schema["properties"]["entrypoint"]["pattern"].startswith("^src/")
+    assert "package manifests" in request["instructions"]
     assert "PrimaryWorkflowTrigger" in request["instructions"]
-    assert "never write `data-dot-primary-action`" in request["instructions"]
+    assert "PERSISTENCE AND USER ACTIONS" in request["instructions"]
+    assert "PERSISTENCE AND ACCEPTANCE" not in request["instructions"]
+    assert "data-dot-operation" not in request["instructions"]
+    assert "data-dot-entity" not in request["instructions"]
+    assert "data-dot-primary-action" not in request["instructions"]
     assert 'options={[{ value: "high", label: "High" }]}' in request["instructions"]
     assert "onValueChange={setName}" in request["instructions"]
     assert "onCheckedChange={setDone}" in request["instructions"]
     assert '<SegmentedControl label="Filter" value={filter}' in request["instructions"]
     assert '<ListItem title="Task" detail="Today" />' in request["instructions"]
+    assert "AUTHORITATIVE @dot/app-runtime TYPES" in request["instructions"]
+    assert "export declare function useAppData" in request["instructions"]
+    assert "export declare function useRecords" in request["instructions"]
+    assert "export declare function runAction" in request["instructions"]
+    assert 'await runAction("records.create", { entity, data })' in request["instructions"]
+    assert (
+        'await runAction("records.update", { record_id, expected_version, data })'
+        in request["instructions"]
+    )
+    assert (
+        'await runAction("records.delete", { record_id, expected_version })'
+        in request["instructions"]
+    )
+    assert 'await runAction("dot.reminder.create", {' in request["instructions"]
+    assert "records.create({" not in request["instructions"]
+    assert "records.update({" not in request["instructions"]
+    assert "records.delete({" not in request["instructions"]
+    assert "dot.reminder.create({" not in request["instructions"]
     assert "AUTHORITATIVE @dot/ui TYPES" in request["instructions"]
     assert "export declare function Input" in request["instructions"]
     assert "onValueChange?: (value: string) => void" in request["instructions"]
@@ -497,11 +540,6 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
 
 
 def test_source_policy_blocks_privileged_browser_and_dependency_access() -> None:
-    document = {
-        "schema_version": 1,
-        "data": {},
-        "root": {"id": "root", "type": "page", "children": []},
-    }
     source = GeneratedSource(
         files=(
             SourceFile(
@@ -510,7 +548,6 @@ def test_source_policy_blocks_privileged_browser_and_dependency_access() -> None
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(document),
     )
 
     codes = {issue.code for issue in inspect_generated_source(source)}
@@ -518,11 +555,6 @@ def test_source_policy_blocks_privileged_browser_and_dependency_access() -> None
 
 
 def test_source_policy_allows_typescript_comments_but_blocks_real_external_urls() -> None:
-    document = {
-        "schema_version": 1,
-        "data": {},
-        "root": {"id": "root", "type": "page", "children": []},
-    }
     commented = GeneratedSource(
         files=(
             SourceFile(
@@ -531,7 +563,6 @@ def test_source_policy_allows_typescript_comments_but_blocks_real_external_urls(
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(document),
     )
     linked = replace(
         commented,
@@ -565,14 +596,6 @@ export default function App() {
             SourceFile("src/app.css", ".neon { font-size: 100px; }"),
         ),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "theme": {"accent": "coral"},
-                "data": {},
-                "root": {"id": "app", "type": "page", "children": []},
-            }
-        ),
     )
 
     codes = {issue.code for issue in inspect_generated_source(source)}
@@ -604,14 +627,6 @@ export default function App() {
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "theme": {"accent": "sky"},
-                "data": {},
-                "root": {"id": "app", "type": "page", "children": []},
-            }
-        ),
     )
 
     assert not inspect_generated_source(source)
@@ -629,13 +644,6 @@ export default function App() {
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "data": {},
-                "root": {"id": "app", "type": "page", "children": []},
-            }
-        ),
     )
 
     assert "reserved_primary_action_marker" in {
@@ -643,122 +651,17 @@ export default function App() {
     }
 
 
-def test_render_policy_requires_unique_ids_and_managed_actions() -> None:
-    source = GeneratedSource(
-        files=(SourceFile("src/App.tsx", "export default function App() { return null; }"),),
-        entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "root": {
-                    "id": "same",
-                    "type": "page",
-                    "children": [
-                        {
-                            "id": "same",
-                            "type": "button",
-                            "action": {"operation": "dot.start", "payload": {}},
-                            "children": [],
-                        }
-                    ],
-                },
-            }
-        ),
-    )
-
-    codes = {issue.code for issue in inspect_generated_source(source)}
-    assert {"duplicate_render_node_id", "invalid_render_action_operation"} <= codes
-
-
-def test_render_policy_allows_reminder_only_with_manifest_grant() -> None:
-    source = GeneratedSource(
-        files=(SourceFile("src/App.tsx", "export default function App() { return null; }"),),
-        entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "root": {
-                    "id": "app",
-                    "type": "page",
-                    "children": [
-                        {
-                            "id": "reminder",
-                            "type": "button",
-                            "action": {
-                                "operation": "dot.reminder.create",
-                                "payload": {
-                                    "title": "walk",
-                                    "goal": "take a walk",
-                                    "run_at": "2026-08-13T18:00:00+03:00",
-                                    "timezone": "Africa/Cairo",
-                                    "recurrence": "once",
-                                },
-                                "confirm": {"title": "Set this reminder?"},
-                            },
-                            "children": [],
-                        }
-                    ],
-                },
-            }
-        ),
-    )
-
-    assert "invalid_render_action_operation" in {
-        issue.code for issue in inspect_generated_source(source)
-    }
-    assert not inspect_generated_source(
-        source,
-        allowed_capabilities=frozenset({"dot.reminder.create"}),
-    )
-
-
-def test_render_policy_binds_record_actions_to_manifest_entities_and_fields() -> None:
-    source = GeneratedSource(
-        files=(SourceFile("src/App.tsx", "export default function App() { return null; }"),),
-        entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "root": {
-                    "id": "app",
-                    "type": "page",
-                    "children": [
-                        {
-                            "id": "save",
-                            "type": "button",
-                            "action": {
-                                "operation": "records.create",
-                                "payload": {
-                                    "entity": "made_up",
-                                    "data": {"surprise": True},
-                                },
-                            },
-                            "children": [],
-                        }
-                    ],
-                },
-            }
-        ),
-    )
-
-    issues = inspect_generated_source(
-        source,
-        manifest={
-            "schema_version": 1,
-            "entities": [{"name": "task", "fields": {"title": {"type": "string"}}}],
-        },
-    )
-
-    assert {issue.code for issue in issues} == {"undeclared_record_action_entity"}
-
-
-def test_acceptance_plan_requires_primary_create_even_with_supporting_entities() -> None:
+def test_acceptance_plan_follows_manifest_dependency_order() -> None:
     app_blueprint = AppBlueprint.from_mapping(
         {
             **blueprint(),
             "manifest": {
                 "schema_version": 1,
                 "entities": [
+                    {
+                        "name": "participant",
+                        "fields": {"name": {"type": "string", "required": True}},
+                    },
                     {
                         "name": "expense",
                         "fields": {
@@ -770,60 +673,32 @@ def test_acceptance_plan_requires_primary_create_even_with_supporting_entities()
                             "version": {"type": "integer", "required": True},
                         },
                     },
-                    {
-                        "name": "participant",
-                        "fields": {"name": {"type": "string", "required": True}},
-                    },
                 ],
             },
         }
     )
-    generated = GeneratedSource(
-        files=(SourceFile("src/App.tsx", "export default function App() { return null; }"),),
-        entrypoint="src/App.tsx",
-        render_document=MappingProxyType(
-            {
-                "schema_version": 1,
-                "root": {
-                    "id": "app",
-                    "type": "page",
-                    "children": [
-                        {
-                            "id": "expense_form",
-                            "type": "form",
-                            "action": {
-                                "operation": "records.create",
-                                "payload": {"entity": "expense", "data": {}},
-                            },
-                            "children": [],
-                        }
-                    ],
-                },
-            }
-        ),
-    )
-
-    plan = [dict(step) for step in _acceptance_plan(app_blueprint, generated)]
+    plan = [dict(step) for step in _acceptance_plan(app_blueprint)]
 
     assert plan[0] == {
+        "operation": "records.list",
+        "entity": "participant",
+        "required": False,
+    }
+    assert plan[1] == {
         "operation": "records.list",
         "entity": "expense",
         "required": False,
     }
-    assert plan[1] == {
-        "operation": "ui.reveal_primary",
-        "required": False,
-        "selector": "[data-dot-primary-action]",
-        "event_type": "click",
-    }
-    assert plan[2]["selector"] == (
-        '[data-dot-operation="records.create"][data-dot-entity="expense"]'
-    )
+    assert plan[2]["operation"] == "records.create"
+    assert plan[2]["entity"] == "participant"
     assert plan[2]["required"] is True
-    assert plan[2]["event_type"] == "submit"
-    assert plan[2]["field_hints"] == {"amount": 1, "note": "test"}
-    assert plan[2]["required_payload_fields"] == ["amount"]
-    assert plan[2]["allowed_payload_fields"] == [
+    assert plan[2]["field_hints"] == {"name": "test"}
+    assert "selector" not in plan[3]
+    assert plan[3]["required"] is True
+    assert plan[3]["event_type"] == "submit"
+    assert plan[3]["field_hints"] == {"amount": 1, "note": "test"}
+    assert plan[3]["required_payload_fields"] == ["amount"]
+    assert plan[3]["allowed_payload_fields"] == [
         "amount",
         "created_at",
         "id",
@@ -831,9 +706,8 @@ def test_acceptance_plan_requires_primary_create_even_with_supporting_entities()
         "updated_at",
         "version",
     ]
-    assert plan[4]["operation"] == "records.create"
-    assert plan[4]["entity"] == "participant"
-    assert plan[4]["required"] is False
+    assert plan[3]["operation"] == "records.create"
+    assert plan[3]["entity"] == "expense"
 
 
 @pytest.mark.anyio
@@ -1035,7 +909,7 @@ async def test_durable_hooks_promote_revision_and_enqueue_completion_event() -> 
         assert deployment is not None
         revision = await session.get(GeneratedAppRevision, deployment.active_revision_id)
         assert revision is not None
-        assert revision.artifact["render_document"]["schema_version"] == 1
+        assert revision.artifact["browser_bundle"]["format"] == "iife"
         event = await session.scalar(
             select(UserEvent).where(UserEvent.event_type == "app.build.completed")
         )

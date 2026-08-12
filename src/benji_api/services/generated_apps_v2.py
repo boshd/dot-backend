@@ -832,6 +832,7 @@ async def complete_build(
         raise CodeAppValidationError("A revision requires generated source files")
     if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
         raise CodeAppValidationError("artifact_sha256 must be a lowercase SHA-256 digest")
+    _validate_promotable_compiled_artifact(artifact, sdk_version=sdk_version)
     # Serializing on the stable app row prevents two successful workers assigning the same
     # immutable revision number under PostgreSQL.
     app = await _locked_code_app(session, job.app_id)
@@ -963,6 +964,52 @@ async def complete_build(
     return revision
 
 
+def _validate_promotable_compiled_artifact(
+    artifact: dict[str, Any] | None,
+    *,
+    sdk_version: str,
+) -> None:
+    """Refuse deployment unless the real compiled app passed every promotion gate."""
+
+    if not isinstance(artifact, dict):
+        raise CodeAppValidationError("A compiled build artifact is required")
+    bundle = artifact.get("browser_bundle")
+    if not isinstance(bundle, dict):
+        raise CodeAppValidationError("A compiled browser bundle is required")
+    javascript = bundle.get("javascript")
+    css = bundle.get("css")
+    digest = bundle.get("sha256")
+    static_html = bundle.get("static_html")
+    if (
+        bundle.get("format") != "iife"
+        or not isinstance(javascript, str)
+        or not javascript.strip()
+        or not isinstance(css, str)
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not isinstance(static_html, str)
+        or not static_html.strip()
+    ):
+        raise CodeAppValidationError("The compiled browser bundle is invalid")
+    expected_digest = hashlib.sha256(
+        javascript.encode() + b"\0" + css.encode()
+    ).hexdigest()
+    if not secrets.compare_digest(digest, expected_digest):
+        raise CodeAppValidationError("The compiled browser bundle digest is invalid")
+    if bundle.get("sdk_version") != sdk_version or artifact.get("sdk_version") != sdk_version:
+        raise CodeAppValidationError("The compiled browser bundle SDK version is invalid")
+    results = artifact.get("test_results")
+    if not isinstance(results, dict) or any(
+        not isinstance(results.get(stage), dict)
+        or results[stage].get("status") != "passed"
+        for stage in ("policy", "typescript_compile", "browser_smoke")
+    ):
+        raise CodeAppValidationError("The compiled app did not pass every promotion gate")
+    browser_result = results["browser_smoke"].get("real_browser")
+    if not isinstance(browser_result, dict) or browser_result.get("ready") is not True:
+        raise CodeAppValidationError("The compiled app did not pass real-browser acceptance")
+
+
 async def fail_build(
     session: AsyncSession,
     *,
@@ -1040,6 +1087,10 @@ async def promote_revision(
     revision = await session.get(GeneratedAppRevision, revision_id)
     if revision is None or revision.app_id != app_id:
         raise CodeAppNotFoundError("Revision was not found")
+    _validate_promotable_compiled_artifact(
+        revision.artifact if isinstance(revision.artifact, dict) else None,
+        sdk_version=revision.sdk_version,
+    )
     app = await session.get(GeneratedApp, app_id)
     if app is None or app.runtime_kind != GeneratedAppRuntimeKind.CODE.value:
         raise CodeAppNotFoundError("Code app was not found")
@@ -1813,13 +1864,12 @@ async def _validate_existing_records_for_manifest(
 
 
 def _revision_context(revision: GeneratedAppRevision) -> dict[str, Any]:
-    artifact = revision.artifact if isinstance(revision.artifact, dict) else {}
     context: dict[str, Any] = {
         "revision_id": str(revision.id),
         "revision_number": revision.revision_number,
         "manifest": revision.manifest,
+        "seed_data": revision.seed_data,
         "source_files": revision.source_files,
-        "render_document": artifact.get("render_document"),
     }
     try:
         _require_json_size(context, "Base revision context", _MAX_REVISION_CONTEXT_BYTES)
@@ -1831,7 +1881,7 @@ def _revision_context(revision: GeneratedAppRevision) -> dict[str, Any]:
         try:
             _require_json_size(context, "Base revision context", _MAX_REVISION_CONTEXT_BYTES)
         except CodeAppValidationError:
-            context["render_document"] = {"omitted": True}
+            context["seed_data"] = {"omitted": True}
             _require_json_size(context, "Base revision context", _MAX_REVISION_CONTEXT_BYTES)
     return context
 

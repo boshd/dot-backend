@@ -1,24 +1,11 @@
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import pytest
 
 from benji_api.app_builder.compiler import EsbuildAppCompiler
 from benji_api.app_builder.compiler.source_normalizer import normalize_generated_source
 from benji_api.app_builder.policy import inspect_generated_source
 from benji_api.app_builder.types import GeneratedSource, SourceFile
-
-
-def _document() -> MappingProxyType[str, object]:
-    return MappingProxyType(
-        {
-            "schema_version": 1,
-            "theme": {"accent": "coral"},
-            "data": {},
-            "root": {"id": "app", "type": "page", "children": []},
-        }
-    )
 
 
 @pytest.mark.anyio
@@ -56,7 +43,6 @@ export default function App(): JSX.Element {
     generated = GeneratedSource(
         files=tuple(files),
         entrypoint="src/App.tsx",
-        render_document=_document(),
     )
     assert not inspect_generated_source(generated)
     assert (await EsbuildAppCompiler().compile(generated)).sha256
@@ -72,7 +58,6 @@ export default function App() { return <p>{preferences.style}</p>; }''',
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=_document(),
     )
 
     codes = {issue.code for issue in inspect_generated_source(source)}
@@ -90,7 +75,6 @@ def test_policy_reports_source_coordinates_for_repairs() -> None:
             ),
         ),
         entrypoint="src/App.tsx",
-        render_document=_document(),
     )
 
     issue = next(

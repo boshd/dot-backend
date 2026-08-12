@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -27,6 +28,8 @@ from benji_api.services.generated_apps_v2 import (
     CodeAppAuthorizationError,
     CodeAppConflictError,
     CodeAppNotFoundError,
+    CodeAppValidationError,
+    _validate_promotable_compiled_artifact,
     authorize_session,
     claim_next_build,
     complete_build,
@@ -51,6 +54,21 @@ MANIFEST = {
 }
 
 
+def test_only_real_browser_verified_bundles_are_promotable() -> None:
+    artifact = compiled_artifact(sdk_version="1")
+    _validate_promotable_compiled_artifact(artifact, sdk_version="1")
+
+    without_bundle = dict(artifact)
+    without_bundle.pop("browser_bundle")
+    with pytest.raises(CodeAppValidationError, match="compiled browser bundle"):
+        _validate_promotable_compiled_artifact(without_bundle, sdk_version="1")
+
+    without_real_browser = compiled_artifact(sdk_version="1")
+    without_real_browser["test_results"]["browser_smoke"].pop("real_browser")
+    with pytest.raises(CodeAppValidationError, match="real-browser acceptance"):
+        _validate_promotable_compiled_artifact(without_real_browser, sdk_version="1")
+
+
 @pytest.mark.anyio
 async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
@@ -70,7 +88,10 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
             conversation_id=conversation.id,
             title="Birthday plan",
             description="Plan a party",
-            request={"prompt": "make a birthday planner"},
+            request={
+                "prompt": "make a birthday planner",
+                "blueprint": {"seed_data": {"occasion": "birthday"}},
+            },
             delivery_provider="linq",
         )
     async with factory() as session:
@@ -84,9 +105,7 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() {}"},
-            artifact={
-                "render_document": {"root": "screen"},
-            },
+            artifact=compiled_artifact(sdk_version="1.0.0"),
             artifact_url="https://assets.example/revision.json",
             artifact_sha256="a" * 64,
             sdk_version="1.0.0",
@@ -136,9 +155,11 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
                 f"/api/v1/apps/v2/{code_app.public_id}",
                 headers=headers,
             )
-            assert authorized.json()["active_revision"]["artifact"] == {
-                "render_document": {"root": "screen"},
-                "browser_bundle": None,
+            runtime_artifact = authorized.json()["active_revision"]["artifact"]
+            assert runtime_artifact["browser_bundle"]["format"] == "iife"
+            assert set(runtime_artifact) == {"browser_bundle"}
+            assert authorized.json()["active_revision"]["seed_data"] == {
+                "occasion": "birthday"
             }
             app_data = await client.post(
                 f"/api/v1/apps/v2/{code_app.id}/actions",
@@ -304,7 +325,7 @@ async def test_reclaimed_build_fences_stale_completion_and_failure() -> None:
                 expected_attempt=stale_claim.attempt,
                 manifest=MANIFEST,
                 source_files={"src/App.tsx": "export default function App() {}"},
-                artifact={},
+                artifact=compiled_artifact(sdk_version="1"),
                 artifact_url="artifact://stale",
                 artifact_sha256="a" * 64,
                 sdk_version="1",
@@ -326,7 +347,7 @@ async def test_reclaimed_build_fences_stale_completion_and_failure() -> None:
             expected_attempt=current_claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() {}"},
-            artifact={},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://current",
             artifact_sha256="b" * 64,
             sdk_version="1",
@@ -384,7 +405,7 @@ async def test_archiving_code_app_revokes_bearers_and_blocks_stale_mutations() -
             expected_attempt=claim.attempt,
             manifest=MANIFEST,
             source_files={"src/App.tsx": "export default function App() {}"},
-            artifact={},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://archive-test",
             artifact_sha256="c" * 64,
             sdk_version="1",

@@ -33,7 +33,6 @@ from benji_api.app_builder.types import (
     canonical_json,
     content_hash,
 )
-from benji_api.generated_app_contract import parse_generated_app_capabilities
 
 DOT_APP_SDK_VERSION = "2"
 logger = logging.getLogger(__name__)
@@ -138,13 +137,7 @@ class AppBuildPipeline:
                     policy_issues = await stages.measure(
                         "inspect",
                         lambda current=generated: _as_awaitable(
-                            inspect_generated_source(
-                                current,
-                                allowed_capabilities=frozenset(
-                                    parse_generated_app_capabilities(blueprint.manifest)
-                                ),
-                                manifest=blueprint.manifest,
-                            )
+                            inspect_generated_source(current)
                         ),
                     )
                     issues = policy_issues
@@ -169,7 +162,6 @@ class AppBuildPipeline:
                                         browser_bundle,
                                         acceptance_plan=_acceptance_plan(
                                             blueprint,
-                                            generated,
                                         ),
                                     ),
                                 )
@@ -305,7 +297,6 @@ class AppBuildPipeline:
                 "status": "passed",
                 "compiler": dict(browser_bundle.compiler),
             },
-            "render_contract": {"status": "passed", "schema_version": 1},
             # static_html belongs only in browser_bundle. Duplicating it here would break
             # the durable test-result and artifact size envelopes for otherwise valid apps.
             "browser_smoke": smoke_report,
@@ -327,7 +318,6 @@ class AppBuildPipeline:
             "entrypoint": generated.entrypoint,
             "files": source_payload,
             "manifest": dict(blueprint.manifest),
-            "render_document": dict(generated.render_document),
             "dependency_lock": dict(DOT_APP_DEPENDENCY_LOCK),
             "test_results": test_results,
             "source_hash": source_digest,
@@ -341,7 +331,6 @@ class AppBuildPipeline:
             entrypoint=generated.entrypoint,
             files=ordered_files,
             manifest=MappingProxyType(dict(blueprint.manifest)),
-            render_document=MappingProxyType(dict(generated.render_document)),
             dependency_lock=DOT_APP_DEPENDENCY_LOCK,
             test_results=MappingProxyType(test_results),
             source_hash=source_digest,
@@ -376,33 +365,15 @@ def _dedupe_issues(issues: tuple[ValidationIssue, ...]) -> tuple[ValidationIssue
 
 def _acceptance_plan(
     blueprint: AppBlueprint,
-    generated: GeneratedSource,
 ) -> tuple[MappingProxyType[str, object], ...]:
     """Derive small trusted interaction checks from the app's declared contract.
 
-    The render document is not the primary runtime. The first manifest entity is the app's primary
-    persisted workflow, so its create path must work even when the app declares supporting entities.
-    A generated app may put that form behind one explicit primary-action control; the smoke harness
-    clicks that control before looking for and submitting the form. Supporting entity creates remain
-    best-effort because they can legitimately depend on records created earlier in the workflow.
+    Generated source does not own test instrumentation. The manifest tells Chromium which fields
+    and runtime action to exercise, and the browser discovers the corresponding real form from its
+    controls. Manifest order is dependency order, not UI hierarchy. Every declared persisted entity
+    must have a working create workflow; earlier records are created first so later selects and
+    relationships can use them.
     """
-
-    document_actions: dict[str, list[tuple[dict[str, object], str]]] = {}
-
-    def visit(value: object) -> None:
-        if not isinstance(value, dict):
-            return
-        action = value.get("action")
-        if isinstance(action, dict) and isinstance(action.get("operation"), str):
-            operation = action["operation"]
-            node_type = value.get("type") if isinstance(value.get("type"), str) else "button"
-            document_actions.setdefault(operation, []).append((action, node_type))
-        children = value.get("children")
-        if isinstance(children, list):
-            for child in children:
-                visit(child)
-
-    visit(generated.render_document.get("root"))
     steps: list[MappingProxyType[str, object]] = []
     entities = blueprint.manifest.get("entities", [])
     entity_definitions = [
@@ -410,18 +381,9 @@ def _acceptance_plan(
         for definition in entities if isinstance(entities, list)
         if isinstance(definition, dict) and isinstance(definition.get("name"), str)
     ]
-    for entity_index, definition in enumerate(entity_definitions):
+    entity_steps: list[tuple[MappingProxyType[str, object], MappingProxyType[str, object]]] = []
+    for definition in entity_definitions:
         entity = definition["name"]
-        is_primary = entity_index == 0
-        action_entry = next(
-            (
-                candidate
-                for candidate in document_actions.get("records.create", [])
-                if isinstance(candidate[0].get("payload"), dict)
-                and candidate[0]["payload"].get("entity") == entity
-            ),
-            None,
-        )
         fields = definition.get("fields", {})
         normalized_fields = (
             fields
@@ -448,61 +410,32 @@ def _acceptance_plan(
             for name, field in normalized_fields.items()
             if name not in _COMPUTED_ACCEPTANCE_FIELDS and isinstance(field, dict)
         }
-        steps.append(
-            MappingProxyType(
-                {
-                    "operation": "records.list",
-                    "entity": entity,
-                    "required": False,
-                }
-            )
+        list_step = MappingProxyType(
+            {
+                "operation": "records.list",
+                "entity": entity,
+                "required": False,
+            }
         )
-        if is_primary:
-            steps.append(
-                MappingProxyType(
-                    {
-                        "operation": "ui.reveal_primary",
-                        "required": False,
-                        "selector": "[data-dot-primary-action]",
-                        "event_type": "click",
-                    }
-                )
-            )
-        if action_entry is None:
-            node_type = "form"
-        else:
-            _, node_type = action_entry
-        steps.append(
-            MappingProxyType(
-                {
-                    "operation": "records.create",
-                    "entity": entity,
-                    "required": is_primary,
-                    "selector": (
-                        f'[data-dot-operation="records.create"][data-dot-entity="{entity}"]'
-                    ),
-                    "event_type": "submit" if node_type == "form" else "click",
-                    # These are best-effort browser interaction hints, not a required mapping
-                    # between database fields and DOM input names. Purpose-built controls can
-                    # derive persisted values; Chromium validates the submitted payload instead.
-                    "field_hints": field_values,
-                    "required_payload_fields": required_fields,
-                    "allowed_payload_fields": sorted(normalized_fields),
-                }
-            )
+        create_step = MappingProxyType(
+            {
+                "operation": "records.create",
+                "entity": entity,
+                "required": True,
+                "event_type": "submit",
+                # These are best-effort browser interaction hints, not a required mapping
+                # between database fields and DOM input names. Purpose-built controls can
+                # derive persisted values; Chromium validates the submitted payload instead.
+                "field_hints": field_values,
+                "required_payload_fields": required_fields,
+                "allowed_payload_fields": sorted(normalized_fields),
+            }
         )
-    for capability in parse_generated_app_capabilities(blueprint.manifest):
-        document_action = next(iter(document_actions.get(capability, [])), None)
-        steps.append(
-            MappingProxyType(
-                {
-                    "operation": capability,
-                    "required": document_action is not None,
-                    "selector": f'[data-dot-operation="{capability}"]',
-                    "event_type": "click",
-                }
-            )
-        )
+        entity_steps.append((list_step, create_step))
+    steps.extend(item[0] for item in entity_steps)
+    # Manifest order is dependency order. Exercise it in that order so a participant or parent
+    # record exists before later forms need it for selects, splits, or relationships.
+    steps.extend(item[1] for item in entity_steps)
     return tuple(steps)
 
 

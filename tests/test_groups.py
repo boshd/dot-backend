@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 import pytest
+from generated_app_artifacts import compiled_artifact
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -539,7 +540,7 @@ async def test_unclaimed_group_revokes_departed_app_owner_until_later_claim(
             expected_attempt=claim.attempt,
             manifest={"schema_version": 1, "entities": [], "capabilities": []},
             source_files={"src/App.tsx": "export default function App() { return null }"},
-            artifact={},
+            artifact=compiled_artifact(sdk_version="1"),
             artifact_url="artifact://unclaimed-group",
             artifact_sha256="b" * 64,
             sdk_version="1",
