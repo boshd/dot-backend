@@ -35,6 +35,25 @@ def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     return value
 
 
+def _chromium_sandbox_required_from_environment() -> bool:
+    """Return whether Chromium's native sandbox must be used.
+
+    The only production escape hatch is an explicit Railway-only fallback. Keeping the
+    opt-in here, rather than in the browser runner, prevents a generic environment flag
+    from silently weakening local or another provider's deployment.
+    """
+
+    name = "APP_BUILDER_ALLOW_UNSANDBOXED_CHROMIUM_ON_RAILWAY"
+    raw = (os.getenv(name) or "false").strip().lower()
+    if raw in {"false", "0", "no", "off"}:
+        return True
+    if raw not in {"true", "1", "yes", "on"}:
+        raise ValueError(f"{name} must be true or false")
+    if not (os.getenv("RAILWAY_PROJECT_ID") and os.getenv("RAILWAY_SERVICE_ID")):
+        raise RuntimeError(f"{name}=true is only permitted in a Railway service")
+    return False
+
+
 def _source_provider_from_environment(
     *,
     timeout_seconds: float,
@@ -103,6 +122,12 @@ async def run() -> None:
         "APP_BUILDER_BROWSER_TIMEOUT_SECONDS",
         12.0,
     )
+    chromium_sandbox_required = _chromium_sandbox_required_from_environment()
+    if not chromium_sandbox_required:
+        logger.warning(
+            "Chromium native sandbox is disabled by the explicit Railway fallback; "
+            "generated-app acceptance remains network-blocked but has weaker process isolation"
+        )
     smoke_runner = VerifiedAppSmokeRunner(
         QuickJSAppSmokeRunner(
             timeout_seconds=min(10.0, max(1.0, timeout_seconds / 4)),
@@ -110,6 +135,7 @@ async def run() -> None:
         ),
         ChromiumAppAcceptanceRunner(
             timeout_seconds=min(browser_timeout_seconds, max(2.0, timeout_seconds / 4)),
+            sandbox_required=chromium_sandbox_required,
         ),
     )
     if not smoke_runner.available:

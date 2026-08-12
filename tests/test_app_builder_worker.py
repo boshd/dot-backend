@@ -1,7 +1,44 @@
 import pytest
 
 from benji_api.app_builder.providers import DeterministicLocalProvider, OpenAIAppSourceProvider
-from benji_api.workers.app_builder import _source_provider_from_environment
+from benji_api.workers.app_builder import (
+    _chromium_sandbox_required_from_environment,
+    _source_provider_from_environment,
+)
+
+
+def test_chromium_sandbox_is_required_by_default(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "APP_BUILDER_ALLOW_UNSANDBOXED_CHROMIUM_ON_RAILWAY",
+        raising=False,
+    )
+
+    assert _chromium_sandbox_required_from_environment() is True
+
+
+def test_unsandboxed_chromium_fallback_is_rejected_outside_railway(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "APP_BUILDER_ALLOW_UNSANDBOXED_CHROMIUM_ON_RAILWAY",
+        "true",
+    )
+    monkeypatch.delenv("RAILWAY_PROJECT_ID", raising=False)
+    monkeypatch.delenv("RAILWAY_SERVICE_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="only permitted in a Railway service"):
+        _chromium_sandbox_required_from_environment()
+
+
+def test_unsandboxed_chromium_fallback_requires_explicit_railway_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "APP_BUILDER_ALLOW_UNSANDBOXED_CHROMIUM_ON_RAILWAY",
+        "true",
+    )
+    monkeypatch.setenv("RAILWAY_PROJECT_ID", "project-id")
+    monkeypatch.setenv("RAILWAY_SERVICE_ID", "service-id")
+
+    assert _chromium_sandbox_required_from_environment() is False
 
 
 def test_development_defaults_to_local_provider_without_credentials(monkeypatch) -> None:

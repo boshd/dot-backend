@@ -13,8 +13,10 @@ The second gate exercises declared workflows with trusted keyboard, click, submi
 and visible-persistence checks in a short-lived real Chromium process. Chromium's native process
 sandbox must remain enabled. Page-level CSP and request interception detect network attempts, but
 they are not a kernel network boundary. Production deployment must therefore run this stage in a
-secret-free, network-isolated execution boundary; never solve a container namespace failure with
-Chromium's `--no-sandbox` flag.
+secret-free, network-isolated execution boundary. A temporary Railway-only, explicit configuration
+fallback can run Chromium without its native sandbox while retaining every other gate. The worker
+refuses that opt-in outside Railway and the acceptance result records the degraded mode; it is an
+MVP availability tradeoff, not a replacement for the isolated runner boundary.
 
 Every runtime gets a host-generated random ID namespace, and every mutation consumes a host-issued,
 single-use gesture nonce during the synchronous interaction that caused it. Request and idempotency

@@ -87,6 +87,7 @@ export default function App() {
     result = await runner.smoke(bundle, acceptance_plan=_vote_plan())
 
     assert result["runtime"] == "chromium"
+    assert result["process_sandbox"] == "disabled-explicit-railway-fallback"
     assert result["required_mutations_verified"] == 1
     assert result["record_refreshes_verified"] == 1
     assert result["persisted_renders_verified"] == 1

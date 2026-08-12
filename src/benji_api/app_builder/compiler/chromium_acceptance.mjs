@@ -600,16 +600,19 @@ try {
   const browserPath = executablePath();
   if (!browserPath) fail("real_browser_unavailable", "Chromium executable was not found");
   const timeoutMs = Math.min(Math.max(Number(request.timeout_ms) || 12_000, 2_000), 20_000);
+  // Missing or malformed values fail closed. The worker emits exactly "false" only after
+  // validating the explicit Railway-only fallback.
+  const nativeSandboxRequired = process.env.DOT_APP_CHROMIUM_REQUIRE_SANDBOX !== "false";
   const channelToken = `dot_acceptance_${crypto.randomUUID().replaceAll("-", "_")}`;
   const context = request.context && typeof request.context === "object" ? request.context : {};
   browser = await chromium.launch({
     executablePath: browserPath,
     headless: true,
-    // Generated code is untrusted even after the static and QuickJS gates. Keep Chromium's
-    // process sandbox on; container deployments must permit its namespace syscalls rather than
-    // falling back to --no-sandbox. Request interception below is a behavioral assertion, not a
-    // replacement for process or container-level isolation.
-    chromiumSandbox: true,
+    // Generated code is untrusted even after the static and QuickJS gates. Native sandboxing is
+    // the fail-closed default. The worker may explicitly disable it only through the audited
+    // Railway fallback; request interception remains a behavioral assertion, not process or
+    // container-level isolation.
+    chromiumSandbox: nativeSandboxRequired,
     timeout: Math.min(timeoutMs, 8_000),
     args: [
       "--disable-dev-shm-usage",
@@ -623,6 +626,7 @@ try {
       "--no-first-run",
       "--renderer-process-limit=1",
       "--js-flags=--max-old-space-size=128",
+      ...(nativeSandboxRequired ? [] : ["--no-sandbox"]),
     ],
   });
   await assertChromiumSandbox(browser, browserPath, Math.min(timeoutMs, 4_000));
@@ -671,6 +675,9 @@ try {
       ready: true,
       rendered: (await frame.locator("body").innerText()).trim().length > 0,
       runtime: "chromium",
+      process_sandbox: nativeSandboxRequired
+        ? "native"
+        : "disabled-explicit-railway-fallback",
       runtime_errors: 0,
       network_attempts: networkAttempts,
       operations: state.operations,
