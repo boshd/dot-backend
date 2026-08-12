@@ -189,7 +189,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .dot-button[data-variant="secondary"], .dot-icon-button[data-variant="secondary"] { color: var(--dot-ink); border-color: var(--dot-line); background: var(--dot-surface); }
 .dot-button[data-variant="ghost"], .dot-icon-button[data-variant="ghost"] { color: var(--dot-muted); background: transparent; }
 .dot-button[data-variant="danger"], .dot-icon-button[data-variant="danger"] { color: #ffffff; background: var(--dot-danger); }
-.dot-button[data-size="sm"] { min-height: 36px; padding: 0 13px; font-size: .82rem; }
+.dot-button[data-size="sm"] { min-height: 44px; padding: 0 13px; font-size: .82rem; }
 .dot-button[data-size="lg"] { min-height: 50px; padding: 0 21px; font-size: 1rem; }
 .dot-button svg { width: 1rem; height: 1rem; }
 .dot-icon-button { width: 44px; padding: 0; }
@@ -242,7 +242,7 @@ h4.dot-heading { font-size: 1rem; }
 
 .dot-segmented { display: flex; width: fit-content; max-width: 100%; gap: 3px; overflow-x: auto; padding: 3px; border: 1px solid var(--dot-line); border-radius: var(--dot-radius-md); background: var(--dot-surface-subtle); scrollbar-width: none; }
 .dot-segmented::-webkit-scrollbar { display: none; }
-.dot-segment { min-height: 36px; flex: none; padding: 0 13px; color: var(--dot-muted); background: transparent; font-size: .82rem; white-space: nowrap; }
+.dot-segment { min-width: 44px; min-height: 44px; flex: none; padding: 0 13px; color: var(--dot-muted); background: transparent; font-size: .82rem; white-space: nowrap; }
 .dot-segment[aria-pressed="true"] { color: var(--dot-ink); background: var(--dot-surface); box-shadow: 0 1px 2px rgb(21 21 18 / 8%); }
 
 .dot-field { display: grid; gap: 7px; }
@@ -255,7 +255,7 @@ h4.dot-heading { font-size: 1rem; }
 .dot-input:focus { border-color: var(--dot-accent-solid); box-shadow: 0 0 0 3px var(--dot-accent-subtle); }
 .dot-input:disabled { cursor: not-allowed; opacity: .55; }
 .dot-textarea { min-height: 110px; resize: vertical; }
-.dot-checkbox { display: inline-flex; width: fit-content; align-items: center; gap: 9px; cursor: pointer; }
+.dot-checkbox { display: inline-flex; min-width: 44px; min-height: 44px; width: fit-content; align-items: center; gap: 9px; cursor: pointer; }
 .dot-checkbox input { width: 18px; height: 18px; margin: 0; accent-color: var(--dot-accent-solid); }
 
 .dot-list { display: grid; margin: 0; padding: 0; list-style: none; }

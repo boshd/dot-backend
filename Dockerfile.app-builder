@@ -10,6 +10,7 @@ COPY src/benji_api/app_builder/compiler/package.json \
     src/benji_api/app_builder/compiler/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY src/benji_api/app_builder/compiler/harness.mjs ./
+COPY src/benji_api/app_builder/compiler/normalize_source.mjs ./
 COPY src/benji_api/app_builder/compiler/browser_smoke.mjs ./
 COPY src/benji_api/app_builder/compiler/chromium_acceptance.mjs ./
 COPY src/benji_api/app_builder/compiler/smoke_guest.mjs ./
@@ -22,6 +23,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     DOT_APP_COMPILER_HARNESS=/opt/dot-app-compiler/harness.mjs \
+    DOT_APP_SOURCE_NORMALIZER=/opt/dot-app-compiler/normalize_source.mjs \
     DOT_APP_BROWSER_HARNESS=/opt/dot-app-compiler/browser_smoke.mjs \
     DOT_APP_CHROMIUM_HARNESS=/opt/dot-app-compiler/chromium_acceptance.mjs \
     DOT_APP_CHROMIUM_PATH=/usr/bin/chromium \

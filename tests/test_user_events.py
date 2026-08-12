@@ -334,7 +334,7 @@ async def test_app_completion_replaces_model_authored_url_with_exact_trusted_url
 
 
 @pytest.mark.anyio
-async def test_app_completion_persists_and_delivers_canonical_link_after_model_exhaustion(
+async def test_app_completion_immediately_delivers_canonical_link_when_model_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
@@ -372,7 +372,15 @@ async def test_app_completion_persists_and_delivers_canonical_link_after_model_e
     monkeypatch.setattr("benji_api.agents.channel_delivery.async_session_factory", session_factory)
     fake_linq = FakeLinqClient()
     handled = await dispatch_user_event(
-        settings=Settings(user_event_max_attempts=1, agent_inter_bubble_delay_seconds=0),
+        settings=Settings(user_event_max_attempts=8, agent_inter_bubble_delay_seconds=0),
+        provider=FakeFailingAppBuildProvider(),
+        tools=ToolRegistry([]),
+        linq_client=fake_linq,  # type: ignore[arg-type]
+        event_id=event.id,
+        session_factory=session_factory,
+    )
+    handled_again = await dispatch_user_event(
+        settings=Settings(user_event_max_attempts=8, agent_inter_bubble_delay_seconds=0),
         provider=FakeFailingAppBuildProvider(),
         tools=ToolRegistry([]),
         linq_client=fake_linq,  # type: ignore[arg-type]
@@ -381,16 +389,21 @@ async def test_app_completion_persists_and_delivers_canonical_link_after_model_e
     )
 
     assert handled is True
+    assert handled_again is False
     assert [sent["text"] for sent in fake_linq.sent] == [trusted_url]
     async with session_factory() as session:
         stored_event = await session.get(UserEvent, event.id)
         message = await session.scalar(select(Message))
+        delivery = await session.scalar(select(MessageDelivery))
         run = await session.scalar(select(AgentRun))
         assert stored_event is not None
         assert stored_event.status == UserEventStatus.PROCESSED.value
         assert stored_event.attempts == 1
         assert message is not None and message.content == trusted_url
         assert message.raw_payload["canonical_fallback"] is True
+        assert delivery is not None and delivery.status == "sent"
+        assert await session.scalar(select(func.count()).select_from(Message)) == 1
+        assert await session.scalar(select(func.count()).select_from(MessageDelivery)) == 1
         assert run is not None and run.status == AgentRunStatus.FAILED.value
     await engine.dispose()
 

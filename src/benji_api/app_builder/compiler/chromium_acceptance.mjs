@@ -340,6 +340,181 @@ async function expectSingleVisible(frame, selector, { required, label }) {
   return locator.first();
 }
 
+async function auditVisibleExperience(frame) {
+  return frame.evaluate(() => {
+    const viewportWidth = document.documentElement.clientWidth;
+    const viewportHeight = document.documentElement.clientHeight;
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" &&
+        Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+    };
+    const clipped = (rect) => {
+      const pageTop = rect.top + window.scrollY;
+      const pageBottom = rect.bottom + window.scrollY;
+      const documentHeight = Math.max(
+        viewportHeight,
+        document.documentElement.scrollHeight,
+        document.body.scrollHeight,
+      );
+      return rect.left < -1 || rect.right > viewportWidth + 1 ||
+        pageTop < -1 || pageBottom > documentHeight + 1;
+    };
+    const textOf = (element) => String(element.innerText || element.textContent || "")
+      .replace(/\s+/g, " ").trim();
+    const describe = (element) => {
+      const text = textOf(element).slice(0, 80);
+      const name = element.getAttribute("name");
+      return `${element.tagName.toLowerCase()}${name ? `[name=${name}]` : ""}${text ? ` “${text}”` : ""}`;
+    };
+    const issues = [];
+    const push = (code, message) => {
+      if (issues.length >= 20) return;
+      if (!issues.some((item) => item.code === code && item.message === message)) {
+        issues.push({ code, message: String(message).slice(0, 800) });
+      }
+    };
+
+    if (document.documentElement.scrollWidth > viewportWidth + 1 ||
+        document.body.scrollWidth > viewportWidth + 1) {
+      push(
+        "ux_horizontal_overflow",
+        `app content is ${Math.max(document.documentElement.scrollWidth, document.body.scrollWidth)}px wide in a ${viewportWidth}px mobile viewport`,
+      );
+    }
+
+    const headings = [...document.querySelectorAll("h1")].filter(visible);
+    if (headings.length !== 1) {
+      push("ux_heading_hierarchy", `app must render exactly one visible h1; found ${headings.length}`);
+    } else {
+      const heading = headings[0];
+      const rect = heading.getBoundingClientRect();
+      const fontSize = Number.parseFloat(getComputedStyle(heading).fontSize);
+      const lineHeight = Number.parseFloat(getComputedStyle(heading).lineHeight) || fontSize;
+      const lineCount = Math.max(1, Math.round(rect.height / lineHeight));
+      if (fontSize > 56 || rect.height > viewportHeight * 0.35 || lineCount > 3) {
+        push(
+          "ux_giant_heading",
+          `h1 is too dominant on mobile (${Math.round(fontSize)}px, ${lineCount} lines, ${Math.round(rect.height)}px tall)`,
+        );
+      }
+    }
+
+    const interactiveSelector = [
+      "button", "a[href]", "input:not([type=hidden])", "select", "textarea",
+      "[role=button]", "[role=link]", "[role=checkbox]", "[role=radio]", "[role=switch]",
+    ].join(",");
+    for (const element of document.querySelectorAll(interactiveSelector)) {
+      if (!visible(element)) continue;
+      let target = element;
+      if (element instanceof HTMLInputElement && ["checkbox", "radio"].includes(element.type)) {
+        const explicit = element.id
+          ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)
+          : null;
+        const label = element.closest("label") || explicit;
+        if (label && visible(label)) target = label;
+      }
+      const rect = target.getBoundingClientRect();
+      if (rect.width < 44 || rect.height < 44) {
+        push(
+          "ux_tap_target_too_small",
+          `${describe(element)} has a ${Math.round(rect.width)}x${Math.round(rect.height)}px tap target; minimum is 44x44px`,
+        );
+      }
+    }
+
+    const primarySelector = [
+      "[data-dot-primary-action]",
+      "[data-dot-operation] button[type=submit]",
+      "[data-dot-operation][role=button]",
+    ].join(",");
+    for (const element of document.querySelectorAll(primarySelector)) {
+      if (!visible(element)) continue;
+      const rect = element.getBoundingClientRect();
+      if (clipped(rect)) {
+        push(
+          "ux_primary_control_clipped",
+          `${describe(element)} is clipped or outside the 390x844 mobile viewport`,
+        );
+      }
+    }
+
+    const fieldSelector = [
+      "input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image])",
+      "select", "textarea",
+    ].join(",");
+    for (const control of document.querySelectorAll(fieldSelector)) {
+      if (!visible(control)) continue;
+      const id = control.getAttribute("id");
+      const labelledBy = control.getAttribute("aria-labelledby");
+      const wrappingLabel = control.closest("label");
+      const explicitLabel = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+      const hasLabel = Boolean(
+        control.getAttribute("aria-label")?.trim() ||
+        (labelledBy && labelledBy.split(/\s+/).some((labelId) =>
+          textOf(document.getElementById(labelId) || document.createElement("span")))) ||
+        (wrappingLabel && textOf(wrappingLabel)) ||
+        (explicitLabel && textOf(explicitLabel))
+      );
+      if (!hasLabel) {
+        push("ux_missing_control_label", `${describe(control)} has no accessible label`);
+      }
+    }
+    for (const control of document.querySelectorAll("button, [role=button], a[href]")) {
+      if (!visible(control)) continue;
+      const labelledBy = control.getAttribute("aria-labelledby");
+      const hasName = Boolean(
+        textOf(control) || control.getAttribute("aria-label")?.trim() ||
+        control.getAttribute("title")?.trim() ||
+        (labelledBy && labelledBy.split(/\s+/).some((labelId) =>
+          textOf(document.getElementById(labelId) || document.createElement("span")))) ||
+        [...control.querySelectorAll("img[alt], svg title")].some((item) =>
+          String(item.getAttribute("alt") || item.textContent || "").trim())
+      );
+      if (!hasName) {
+        push("ux_missing_control_label", `${describe(control)} has no accessible label`);
+      }
+    }
+
+    const visibleText = [...document.body.querySelectorAll("h1,h2,h3,h4,p,label,button,a,li,th,td,legend,span,small,strong")]
+      .filter(visible)
+      .map(textOf)
+      .filter(Boolean);
+    for (const text of visibleText) {
+      if (/(?:\b[a-z][a-z0-9]*_[a-z0-9_]+\b)/.test(text)) {
+        push("ux_visible_identifier", `visible copy exposes a machine identifier: “${text.slice(0, 120)}”`);
+      }
+      if (/(?:\b(?:valid\s+)?json\b|\{\s*["'][^}]+:|\[\s*["'])/i.test(text)) {
+        push("ux_raw_json_copy", `visible copy asks the user to work with raw JSON: “${text.slice(0, 120)}”`);
+      }
+      if (/\b(?:schema|entity|entities|record id|field type|database field|expected version)\b/i.test(text)) {
+        push("ux_schema_admin_copy", `visible copy exposes implementation terminology: “${text.slice(0, 120)}”`);
+      }
+    }
+    for (const control of document.querySelectorAll("input:not([type=hidden]), textarea")) {
+      if (!visible(control)) continue;
+      const placeholder = String(control.getAttribute("placeholder") || "").trim();
+      if (/(?:\bjson\b|\{\s*["']|\[\s*["'])/i.test(placeholder)) {
+        push("ux_raw_json_copy", `visible placeholder asks the user for raw JSON: “${placeholder.slice(0, 120)}”`);
+      }
+    }
+
+    return { issues, viewport: { width: viewportWidth, height: viewportHeight } };
+  });
+}
+
+async function assertVisibleExperience(frame) {
+  const audit = await auditVisibleExperience(frame);
+  if (audit.issues.length) {
+    const error = new Error(audit.issues[0].message);
+    error.code = audit.issues[0].code;
+    error.uxIssues = audit.issues;
+    throw error;
+  }
+  return audit;
+}
+
 async function assertFocused(locator, selector) {
   const focused = await locator.evaluate((element) => element === element.ownerDocument.activeElement);
   if (!focused) fail("acceptance_input_focus_lost", `field lost focus while typing: ${selector}`);
@@ -443,7 +618,10 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
         required,
         label: "primary workflow trigger",
       });
-      if (trigger) await trigger.click();
+      if (trigger) {
+        await trigger.click();
+        await assertVisibleExperience(frame);
+      }
       acceptance.push({ operation: step.operation, passed: true });
       continue;
     }
@@ -663,7 +841,9 @@ try {
   const acceptancePlan = Array.isArray(request.acceptance_plan)
     ? request.acceptance_plan.slice(0, MAX_STEPS)
     : [];
+  const initialExperience = await assertVisibleExperience(frame);
   const acceptanceResult = await runAcceptance(page, frame, acceptancePlan, timeoutMs);
+  await assertVisibleExperience(frame);
   const state = await hostState(page);
   const runtimeErrors = [...pageErrors, ...state.runtimeErrors.map((item) => item.message || item.name)];
   if (runtimeErrors.length) fail("browser_runtime_error", runtimeErrors[0]);
@@ -681,6 +861,7 @@ try {
       runtime_errors: 0,
       network_attempts: networkAttempts,
       operations: state.operations,
+      ux_audit: { passed: true, viewport: initialExperience.viewport },
       ...acceptanceResult,
     },
   });
@@ -688,9 +869,12 @@ try {
   const message = String(error?.message || error);
   const unavailable = /browserType\.launch|Failed to move to new namespace|chrome-sandbox/i.test(message);
   const timeout = /Timeout|timed out/i.test(message);
+  const uxIssues = Array.isArray(error?.uxIssues)
+    ? error.uxIssues.slice(0, 20).map((item) => issue(item.code, item.message))
+    : null;
   respond({
     ok: false,
-    issues: [issue(
+    issues: uxIssues || [issue(
       unavailable
         ? "real_browser_unavailable"
         : timeout

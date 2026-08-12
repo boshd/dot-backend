@@ -86,7 +86,6 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
             source_files={"src/App.tsx": "export default function App() {}"},
             artifact={
                 "render_document": {"root": "screen"},
-                "provider_metadata": {"fallback_mode": "declarative"},
             },
             artifact_url="https://assets.example/revision.json",
             artifact_sha256="a" * 64,
@@ -102,7 +101,7 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
         assert event.conversation_id == conversation.id
         assert event.delivery_provider == "linq"
         assert event.payload["app_id"] == str(code_app.id)
-        assert event.payload["fallback_mode"] == "declarative"
+        assert "fallback_mode" not in event.payload
 
     async def override_session():
         async with factory() as session:

@@ -320,7 +320,7 @@ class BuildArtifact:
     source_hash: str
     content_hash: str
     provider_metadata: Mapping[str, Any]
-    browser_bundle: BrowserBundle | None
+    browser_bundle: BrowserBundle
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -337,9 +337,7 @@ class BuildArtifact:
             "source_hash": self.source_hash,
             "content_hash": self.content_hash,
             "provider_metadata": dict(self.provider_metadata),
-            "browser_bundle": (
-                self.browser_bundle.as_dict() if self.browser_bundle is not None else None
-            ),
+            "browser_bundle": self.browser_bundle.as_dict(),
         }
 
 

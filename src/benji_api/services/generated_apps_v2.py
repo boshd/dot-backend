@@ -2576,9 +2576,6 @@ def _safe_build_telemetry(
     model = provider.get("model")
     if isinstance(model, str) and len(model) <= 120:
         telemetry["model"] = model
-    fallback_mode = provider.get("fallback_mode")
-    if fallback_mode == "declarative":
-        telemetry["fallback_mode"] = fallback_mode
     token_usage = provider.get("token_usage")
     if isinstance(token_usage, dict):
         safe_tokens = {

@@ -115,12 +115,12 @@ _DESIGN_CONTRACT_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
     (
         "custom_class_name",
-        re.compile(r"\bclassName\s*(?:=|:)"),
+        re.compile(r"<[^>]*\bclassName\s*=", re.MULTILINE),
         "className is not part of the generated-app design contract; use @dot/ui semantic props",
     ),
     (
         "inline_style",
-        re.compile(r"\bstyle\s*(?:=|:)"),
+        re.compile(r"<[^>]*\bstyle\s*=", re.MULTILINE),
         "inline styles are not allowed; use @dot/ui semantic props",
     ),
     (
@@ -162,6 +162,15 @@ def _is_allowed_import(specifier: str) -> bool:
     if specifier.startswith("./") or specifier.startswith("../"):
         return True
     return specifier in ALLOWED_IMPORTS
+
+
+def _source_location(path: str, contents: str, match: re.Match[str]) -> str:
+    """Give repairs an exact source position without changing the issue schema."""
+
+    line = contents.count("\n", 0, match.start()) + 1
+    line_start = contents.rfind("\n", 0, match.start()) + 1
+    column = match.start() - line_start + 1
+    return f"{path}:{line}:{column}"
 
 
 def _source_issues(source: GeneratedSource) -> list[ValidationIssue]:
@@ -222,18 +231,24 @@ def _source_issues(source: GeneratedSource) -> list[ValidationIssue]:
                     )
                 )
         for code, pattern in _FORBIDDEN_PATTERNS:
-            if pattern.search(item.contents):
+            if match := pattern.search(item.contents):
                 issues.append(
                     ValidationIssue(
                         code,
                         f"source contains forbidden capability: {code}",
-                        item.path,
+                        _source_location(item.path, item.contents, match),
                     )
                 )
         if path.suffix in {".ts", ".tsx"}:
             for code, pattern, message in _DESIGN_CONTRACT_PATTERNS:
-                if pattern.search(item.contents):
-                    issues.append(ValidationIssue(code, message, item.path))
+                if match := pattern.search(item.contents):
+                    issues.append(
+                        ValidationIssue(
+                            code,
+                            message,
+                            _source_location(item.path, item.contents, match),
+                        )
+                    )
 
     if source.entrypoint not in paths:
         issues.append(

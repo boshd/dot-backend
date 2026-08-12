@@ -142,25 +142,46 @@ async def dispatch_user_event(
                     typing_started = True
         elif event.delivery_provider is not None:
             raise RuntimeError(f"No delivery adapter for {event.delivery_provider}")
-        if provider is None:
-            raise RuntimeError("The event agent model provider is not configured")
-
         message_key = f"benji:user-event:{event.id}"
-        turn = await run_agent_event(
-            conversation_id=conversation.id,
-            user_id=event.user_id,
-            event_id=event.id,
-            event_type=event.event_type,
-            payload=event.payload,
-            source_binding_id=channel.id if channel is not None else None,
-            idempotency_key=message_key,
-            delivery_provider=(event.delivery_provider if delivery_ready else None),
-            provider=provider,
-            tools=tools,
-            settings=settings,
-            embedding_provider=embedding_provider,
-            session_factory=factory,
-        )
+        try:
+            if provider is None:
+                raise RuntimeError("The event agent model provider is not configured")
+            turn = await run_agent_event(
+                conversation_id=conversation.id,
+                user_id=event.user_id,
+                event_id=event.id,
+                event_type=event.event_type,
+                payload=event.payload,
+                source_binding_id=channel.id if channel is not None else None,
+                idempotency_key=message_key,
+                delivery_provider=(event.delivery_provider if delivery_ready else None),
+                provider=provider,
+                tools=tools,
+                settings=settings,
+                embedding_provider=embedding_provider,
+                session_factory=factory,
+            )
+        except Exception:
+            if event.event_type != "app.build.completed":
+                raise
+            logger.warning(
+                "App completion message generation failed for event %s; using trusted link",
+                event.id,
+                exc_info=True,
+            )
+            turn = await _ensure_app_completion_turn(
+                factory,
+                event=event,
+                conversation=conversation,
+                source_binding_id=channel.id if channel is not None else None,
+                idempotency_key=message_key,
+            )
+            generation_note = (
+                "Agent generation failed; persisted the canonical app completion instead"
+            )
+            delivery_note = (
+                f"{delivery_note}; {generation_note}" if delivery_note else generation_note
+            )
         if (
             delivery_ready
             and channel is not None

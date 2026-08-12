@@ -56,14 +56,14 @@ async def test_chromium_acceptance_types_without_losing_focus_and_renders_saved_
         _source(
             '''import { useState } from "react";
 import { runAction, useRecords } from "@dot/app-runtime";
-import { PrimaryWorkflowTrigger } from "@dot/ui";
+import { AppShell, Button, Input, PrimaryWorkflowTrigger } from "@dot/ui";
 
 export default function App() {
   const { records } = useRecords<{ id: string; choice: string }>("vote", { limit: 200 });
   const [open, setOpen] = useState(false);
   const [choice, setChoice] = useState("");
   const [createdChoice, setCreatedChoice] = useState("");
-  return <main>
+  return <AppShell title="Vote">
     <PrimaryWorkflowTrigger onClick={() => setOpen(true)}>vote</PrimaryWorkflowTrigger>
     {open ? <form data-dot-operation="records.create" data-dot-entity="vote"
       onSubmit={async (event) => {
@@ -73,13 +73,13 @@ export default function App() {
         );
         setCreatedChoice(created.choice);
       }}>
-      <input name="choice" value={choice}
+      <Input label="Choice" name="choice" value={choice}
         onChange={(event) => setChoice(event.currentTarget.value)} />
-      <button type="submit">submit vote</button>
+      <Button type="submit">submit vote</Button>
     </form> : null}
     <p>created: {createdChoice}</p>
     <ul>{records.map((record) => <li key={record.id}>{record.choice}</li>)}</ul>
-  </main>;
+  </AppShell>;
 }'''
         )
     )
@@ -115,6 +115,7 @@ async def test_chromium_acceptance_rejects_input_remounted_after_each_character(
         _source(
             '''import { useState } from "react";
 import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
 export default function App() {
   const [choice, setChoice] = useState("");
   const Form = () => <form data-dot-operation="records.create" data-dot-entity="vote"
@@ -122,11 +123,11 @@ export default function App() {
       event.preventDefault();
       void runAction("records.create", { entity: "vote", data: { choice } });
     }}>
-    <input name="choice" value={choice}
+    <Input label="Choice" name="choice" value={choice}
       onChange={(event) => setChoice(event.currentTarget.value)} />
-    <button type="submit">submit vote</button>
+    <Button type="submit">submit vote</Button>
   </form>;
-  return <Form />;
+  return <AppShell title="Vote"><Form /></AppShell>;
 }'''
         )
     )
@@ -146,19 +147,20 @@ async def test_chromium_acceptance_rejects_duplicate_submit_mutations() -> None:
         _source(
             '''import { useState } from "react";
 import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; choice: string }>("vote", { limit: 200 });
   const [choice, setChoice] = useState("");
-  return <><form data-dot-operation="records.create" data-dot-entity="vote"
+  return <AppShell title="Vote"><form data-dot-operation="records.create" data-dot-entity="vote"
     onSubmit={(event) => {
       event.preventDefault();
       void runAction("records.create", { entity: "vote", data: { choice } });
       void runAction("records.create", { entity: "vote", data: { choice } });
     }}>
-    <input name="choice" value={choice}
+    <Input label="Choice" name="choice" value={choice}
       onChange={(event) => setChoice(event.currentTarget.value)} />
-    <button type="submit">submit vote</button>
-  </form><p>{records.length} votes</p></>;
+    <Button type="submit">submit vote</Button>
+  </form><p>{records.length} votes</p></AppShell>;
 }'''
         )
     )
@@ -181,12 +183,13 @@ async def test_chromium_acceptance_allows_valid_storage_transformation_and_scope
         _source(
             '''import { useState } from "react";
 import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; duration: number }>("session");
   const [minutes, setMinutes] = useState("");
-  return <>
+  return <AppShell title="Sessions">
     <form onSubmit={(event) => event.preventDefault()}>
-      <button type="submit">unrelated action</button>
+      <Button type="submit">unrelated action</Button>
     </form>
     <form data-dot-operation="records.create" data-dot-entity="session"
       onSubmit={(event) => {
@@ -196,12 +199,12 @@ export default function App() {
           data: { duration: Number(minutes) * 60 },
         });
       }}>
-      <input name="duration" value={minutes}
+      <Input label="Duration" name="duration" value={minutes}
         onChange={(event) => setMinutes(event.currentTarget.value)} />
-      <button type="submit">save session</button>
+      <Button type="submit">save session</Button>
     </form>
     <p>{records.map((record) => record.duration).join(",")} seconds</p>
-  </>;
+  </AppShell>;
 }'''
         )
     )
@@ -236,25 +239,26 @@ async def test_chromium_acceptance_selects_a_real_enabled_option() -> None:
         _source(
             '''import { useState } from "react";
 import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Select } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; priority: string }>("task");
   const [priority, setPriority] = useState("");
-  return <>
+  return <AppShell title="Tasks">
     <form data-dot-operation="records.create" data-dot-entity="task"
       onSubmit={(event) => {
         event.preventDefault();
         void runAction("records.create", { entity: "task", data: { priority } });
       }}>
-      <select name="priority" value={priority}
+      <Select label="Priority" name="priority" value={priority}
         onChange={(event) => setPriority(event.currentTarget.value)}>
         <option value="" disabled>pick one</option>
         <option value="low">low</option>
         <option value="high">high</option>
-      </select>
-      <button type="submit">save task</button>
+      </Select>
+      <Button type="submit">save task</Button>
     </form>
     <p>{records.map((record) => record.priority).join(",")}</p>
-  </>;
+  </AppShell>;
 }'''
         )
     )
@@ -289,19 +293,20 @@ async def test_chromium_acceptance_validates_payload_without_requiring_named_inp
     bundle = await EsbuildAppCompiler().compile(
         _source(
             '''import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button } from "@dot/ui";
 export default function App() {
   const { records } = useRecords<{ id: string; choice: string }>("vote");
-  return <>
+  return <AppShell title="Vote">
     <form data-dot-operation="records.create" data-dot-entity="vote"
       onSubmit={(event) => {
         event.preventDefault();
         void runAction("records.create", { entity: "vote", data: { choice: "yes" } });
       }}>
       <p>your current choice is yes</p>
-      <button type="submit">vote yes</button>
+      <Button type="submit">vote yes</Button>
     </form>
     <p>{records.map((record) => record.choice).join(",")}</p>
-  </>;
+  </AppShell>;
 }'''
         )
     )
@@ -323,3 +328,135 @@ export default function App() {
     mutation = next(item for item in result["operations"] if item["mutating"])
     assert mutation["args"]["data"] == {"choice": "yes"}
     assert result["field_typing"] == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("expected_code", "source"),
+    [
+        (
+            "ux_giant_heading",
+            '''export default function App() {
+  return <main><h1 style={{ fontSize: 80 }}>Cottage weekend expense planner</h1></main>;
+}''',
+        ),
+        (
+            "ux_horizontal_overflow",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><div style={{ width: 600 }}>Trip details</div></main>;
+}''',
+        ),
+        (
+            "ux_primary_control_clipped",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><button data-dot-primary-action
+    style={{ position: "fixed", left: 370, top: 100, width: 44, height: 44 }}>
+    Add
+  </button></main>;
+}''',
+        ),
+        (
+            "ux_tap_target_too_small",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><button style={{ width: 43, height: 43 }}>Add</button></main>;
+}''',
+        ),
+        (
+            "ux_missing_control_label",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><input style={{ width: 180, height: 44 }} /></main>;
+}''',
+        ),
+        (
+            "ux_raw_json_copy",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><p>Paste valid JSON to configure the trip.</p></main>;
+}''',
+        ),
+        (
+            "ux_schema_admin_copy",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><p>Configure the expense entity schema.</p></main>;
+}''',
+        ),
+        (
+            "ux_visible_identifier",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1><p>Enter the guest_name below.</p></main>;
+}''',
+        ),
+    ],
+)
+async def test_chromium_acceptance_rejects_mobile_ux_regressions(
+    expected_code: str,
+    source: str,
+) -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(_source(source))
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle)
+
+    assert failed.value.issues[0].code == expected_code
+
+
+@pytest.mark.anyio
+async def test_chromium_ux_audit_only_checks_user_visible_copy() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''export default function App() {
+  const internal_field_name = "guest_name";
+  return <main data-schema-version="trip_expense">
+    <h1>Trip planner</h1>
+    <label>Guest name
+      <input name={internal_field_name} style={{ width: 180, height: 44 }} />
+    </label>
+    <button data-dot-operation="records.create" data-dot-entity="trip_expense"
+      style={{ width: 120, height: 44 }}>Add guest</button>
+  </main>;
+}'''
+        )
+    )
+
+    result = await runner.smoke(bundle)
+
+    assert result["ux_audit"] == {
+        "passed": True,
+        "viewport": {"width": 390, "height": 844},
+    }
+
+
+@pytest.mark.anyio
+async def test_chromium_ux_audit_accepts_all_compact_dot_controls() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import {
+  AppShell, Button, Checkbox, Segment, SegmentedControl
+} from "@dot/ui";
+export default function App() {
+  const [filter, setFilter] = useState("open");
+  const [done, setDone] = useState(false);
+  return <AppShell title="Trip planner">
+    <Button size="sm">Add guest</Button>
+    <SegmentedControl label="Filter" value={filter} onValueChange={setFilter}>
+      <Segment value="open">Open</Segment>
+      <Segment value="done">Done</Segment>
+    </SegmentedControl>
+    <Checkbox label="Packed" checked={done} onCheckedChange={setDone} />
+  </AppShell>;
+}'''
+        )
+    )
+
+    result = await runner.smoke(bundle)
+
+    assert result["ux_audit"]["passed"] is True

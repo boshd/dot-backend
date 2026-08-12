@@ -204,6 +204,28 @@ class SlowProvider(DeterministicLocalProvider):
         return await super().generate(app_blueprint)
 
 
+class UnavailableProvider(DeterministicLocalProvider):
+    name = "unavailable"
+    version = "test"
+
+    async def generate(self, app_blueprint: AppBlueprint) -> GeneratedSource:
+        del app_blueprint
+        raise RuntimeError("sensitive upstream quota response")
+
+
+class UnavailableRepairProvider(RepairingProvider):
+    async def repair(
+        self,
+        app_blueprint: AppBlueprint,
+        previous: GeneratedSource,
+        issues: tuple[ValidationIssue, ...],
+        *,
+        attempt: int,
+    ) -> GeneratedSource:
+        del app_blueprint, previous, issues, attempt
+        raise RuntimeError("sensitive repair provider response")
+
+
 class FakeSmokeRunner:
     name = "fake-browser"
     version = "test"
@@ -372,57 +394,38 @@ async def test_repair_receives_policy_and_typescript_issues_together() -> None:
 
 
 @pytest.mark.anyio
-async def test_exhausted_custom_build_promotes_trusted_declarative_fallback() -> None:
-    fallback_blueprint = blueprint()
-    fallback_blueprint["manifest"] = {
-        "schema_version": 1,
-        "entities": [
-            {
-                "name": "expense",
-                "fields": [
-                    {"name": "amount", "type": "money"},
-                    {"name": "nights", "type": "integer"},
-                    {"name": "metadata", "type": "object"},
-                    {"name": "split_between", "type": "array"},
-                ],
-            }
-        ],
-    }
-    completion = await AppBuildPipeline(
-        NeverRepairsProvider(),
-        max_repair_attempts=0,
-        allow_declarative_fallback=True,
-    ).build(claim(blueprint=fallback_blueprint))
+async def test_exhausted_custom_build_is_rejected_instead_of_publishing_fallback() -> None:
+    with pytest.raises(BuildRejectedError) as rejected:
+        await AppBuildPipeline(
+            NeverRepairsProvider(),
+            max_repair_attempts=0,
+        ).build(claim())
 
-    assert completion.artifact.browser_bundle is None
-    assert completion.artifact.as_dict()["browser_bundle"] is None
-    assert completion.artifact.provider_metadata["fallback_mode"] == "declarative"
-    assert "network_access" in completion.artifact.provider_metadata[
-        "custom_code_issue_codes"
-    ]
-    assert completion.artifact.test_results["custom_code"]["status"] == "rejected"
-    assert "fallback" in completion.metrics.stage_duration_ms
-    main = completion.artifact.render_document["root"]["children"][1]
-    assert [
-        field["type"] for field in main["children"][0]["children"][1]["fields"]
-    ] == ["currency", "integer", "object", "array"]
-    assert main["children"][0]["children"][2]["type"] == "list"
-    assert main["children"][0]["children"][2]["source"] == "expense"
+    assert "network_access" in {issue.code for issue in rejected.value.issues}
 
 
 @pytest.mark.anyio
-async def test_custom_build_timeout_promotes_trusted_declarative_fallback() -> None:
-    completion = await AppBuildPipeline(
-        SlowProvider(),
-        timeout_seconds=0.001,
-        allow_declarative_fallback=True,
-    ).build(claim())
+async def test_custom_build_timeout_does_not_publish_fallback() -> None:
+    with pytest.raises(TimeoutError, match="worker deadline"):
+        await AppBuildPipeline(
+            SlowProvider(),
+            timeout_seconds=0.001,
+        ).build(claim())
 
-    assert completion.artifact.browser_bundle is None
-    assert completion.artifact.provider_metadata["fallback_mode"] == "declarative"
-    assert completion.artifact.provider_metadata["custom_code_issue_codes"] == [
-        "custom_code_timeout"
-    ]
+
+@pytest.mark.anyio
+async def test_source_provider_failure_does_not_publish_fallback() -> None:
+    with pytest.raises(RuntimeError, match="sensitive upstream quota response"):
+        await AppBuildPipeline(UnavailableProvider()).build(claim())
+
+
+@pytest.mark.anyio
+async def test_repair_provider_failure_does_not_publish_fallback() -> None:
+    with pytest.raises(RuntimeError, match="sensitive repair provider response"):
+        await AppBuildPipeline(
+            UnavailableRepairProvider(),
+            max_repair_attempts=1,
+        ).build(claim())
 
 
 @pytest.mark.anyio
@@ -851,7 +854,7 @@ async def test_worker_completes_and_fails_claims() -> None:
     )
     assert not rejected.completed
     assert rejected.failed[0].code == "source_rejected"
-    assert rejected.failed[0].retryable is False
+    assert rejected.failed[0].retryable is True
     assert rejected.failed[0].issues[0].code in {"network_access", "external_url"}
 
 

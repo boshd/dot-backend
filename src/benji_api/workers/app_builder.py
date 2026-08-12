@@ -102,16 +102,16 @@ async def run() -> None:
             )
 
     poll_seconds = _positive_float("APP_BUILDER_POLL_INTERVAL_SECONDS", 0.5)
-    timeout_seconds = _positive_float("APP_BUILDER_TIMEOUT_SECONDS", 240.0)
+    timeout_seconds = _positive_float("APP_BUILDER_TIMEOUT_SECONDS", 420.0)
     repair_attempts = _bounded_int(
         "APP_BUILDER_MAX_REPAIR_ATTEMPTS",
-        2,
+        4,
         minimum=0,
         maximum=4,
     )
     lease_seconds = _bounded_int(
         "APP_BUILDER_LEASE_SECONDS",
-        300,
+        600,
         minimum=60,
         maximum=600,
     )
@@ -146,7 +146,6 @@ async def run() -> None:
         timeout_seconds=timeout_seconds,
         smoke_runner=smoke_runner,
         require_browser_smoke=True,
-        allow_declarative_fallback=True,
     )
     logger.info("App builder started with provider=%s", pipeline.provider.name)
     try:
