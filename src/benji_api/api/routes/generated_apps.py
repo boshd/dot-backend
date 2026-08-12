@@ -10,6 +10,7 @@ from benji_api.api.dependencies import get_optional_authenticated_user, resolve_
 from benji_api.config import Settings, get_settings
 from benji_api.db.session import get_session
 from benji_api.models.generated_app import GeneratedApp
+from benji_api.models.generated_app_v2 import GeneratedAppRuntimeKind
 from benji_api.models.user import User
 from benji_api.schemas.phone import PhoneNumber
 from benji_api.services.generated_apps import (
@@ -191,6 +192,7 @@ async def _get_bundle(session: AsyncSession, *, public_id: str) -> GeneratedAppB
 
 
 def _summary(app: GeneratedApp, *, settings: Settings) -> GeneratedAppSummaryResponse:
+    is_code_app = app.runtime_kind == GeneratedAppRuntimeKind.CODE.value
     return GeneratedAppSummaryResponse(
         id=app.id,
         public_id=app.public_id,
@@ -199,9 +201,13 @@ def _summary(app: GeneratedApp, *, settings: Settings) -> GeneratedAppSummaryRes
         template=app.template,
         theme=app.theme,
         access_mode=app.access_mode,
-        app_url=generated_app_url(
-            base_url=settings.generated_app_public_url,
-            public_id=app.public_id,
+        app_url=(
+            f"{settings.generated_app_public_url}/a/{app.public_id}"
+            if is_code_app
+            else generated_app_url(
+                base_url=settings.generated_app_public_url,
+                public_id=app.public_id,
+            )
         ),
         created_at=app.created_at,
         updated_at=app.updated_at,

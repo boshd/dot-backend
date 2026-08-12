@@ -9,6 +9,7 @@ EMPHASIS_ASTERISK = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
 HEADING = re.compile(r"(?m)^#{1,6}\s+")
 BLOCKQUOTE = re.compile(r"(?m)^>\s?")
 PARAGRAPH_BREAK = re.compile(r"\n\s*\n+")
+HTTP_URL = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # This is deliberately not part of the model contract or prompt. It only prevents a malformed
 # provider response from turning into an unbounded sequence of paid outbound messages.
@@ -40,3 +41,15 @@ def prepare_text_bubbles(messages: tuple[str, ...] | list[str]) -> tuple[str, ..
         if (clean := plain_text_bubble(paragraph))
     )
     return bubbles[:DELIVERY_BUBBLE_SAFETY_LIMIT]
+
+
+def prepare_app_completion_bubbles(
+    messages: tuple[str, ...] | list[str],
+    *,
+    app_url: str,
+) -> tuple[str, ...]:
+    """Keep model-authored prose while making every authored URL the trusted app URL."""
+    bubbles = tuple(HTTP_URL.sub(app_url, bubble) for bubble in prepare_text_bubbles(messages))
+    if any(app_url in bubble for bubble in bubbles):
+        return bubbles
+    return (*bubbles[: DELIVERY_BUBBLE_SAFETY_LIMIT - 1], app_url)

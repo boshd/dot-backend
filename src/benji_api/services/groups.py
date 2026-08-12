@@ -19,6 +19,13 @@ from benji_api.models.channel import (
     ConversationMemberStatus,
     GroupResponseMode,
 )
+from benji_api.models.generated_app import GeneratedApp
+from benji_api.models.generated_app_v2 import (
+    GeneratedAppAccessTicket,
+    GeneratedAppMembership,
+    GeneratedAppRole,
+    GeneratedAppSession,
+)
 from benji_api.models.user import User
 from benji_api.services.users import (
     find_user_by_identifier,
@@ -489,18 +496,28 @@ async def apply_linq_group_event(
             .where(
                 ConversationMember.conversation_id == conversation.id,
                 ConversationMember.status == ConversationMemberStatus.ACTIVE.value,
+                ConversationMember.user_id.is_not(None),
                 ConversationMember.id != member.id,
             )
             .order_by(ConversationMember.joined_at, ConversationMember.created_at)
         )
         if replacement is not None:
-            member.role = ConversationMemberRole.MEMBER.value
-            replacement.role = ConversationMemberRole.OWNER.value
-            conversation.group_owner_source = "transferred"
-            if replacement.user_id is not None:
-                conversation.user_id = replacement.user_id
+            await transfer_group_ownership(
+                session,
+                conversation=conversation,
+                successor=replacement,
+                source="transferred",
+                departing_owner_user_id=member.user_id or conversation.user_id,
+            )
         else:
+            departing_owner_user_id = member.user_id or conversation.user_id
+            member.role = ConversationMemberRole.MEMBER.value
             conversation.group_owner_source = "unclaimed"
+            await _revoke_unclaimed_group_app_owner(
+                session,
+                conversation_id=conversation.id,
+                departing_owner_user_id=departing_owner_user_id,
+            )
     return True
 
 
@@ -525,6 +542,14 @@ async def claim_group_owner(
 ) -> bool:
     if conversation.group_owner_source not in {None, "unclaimed", "legacy_inferred"}:
         return False
+    if member.user_id is not None:
+        await transfer_group_ownership(
+            session,
+            conversation=conversation,
+            successor=member,
+            source=source,
+        )
+        return True
     current_owners = (
         await session.scalars(
             select(ConversationMember).where(
@@ -537,9 +562,235 @@ async def claim_group_owner(
         current.role = ConversationMemberRole.MEMBER.value
     member.role = ConversationMemberRole.OWNER.value
     conversation.group_owner_source = source
-    if member.user_id is not None:
-        conversation.user_id = member.user_id
     return True
+
+
+async def transfer_group_ownership(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    successor: ConversationMember,
+    source: str = "transferred",
+    departing_owner_user_id: UUID | None = None,
+) -> None:
+    """Transfer a group and all of its generated apps in one transaction.
+
+    The caller owns the transaction. Explicit sessions belonging to a departed owner are
+    revoked, while anonymous member access for the rest of the group remains usable.
+    """
+    if conversation.kind != ConversationKind.GROUP.value:
+        raise GroupPermissionError("Only group conversations can transfer ownership")
+    if successor.user_id is None:
+        raise GroupPermissionError("A group owner must have a linked Dot account")
+
+    await session.flush()
+    conversation_statement = select(Conversation).where(Conversation.id == conversation.id)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        conversation_statement = conversation_statement.with_for_update()
+    locked_conversation = await session.scalar(conversation_statement)
+    if locked_conversation is None:
+        raise GroupNotFoundError("Group conversation was not found")
+
+    member_statement = select(ConversationMember).where(
+        ConversationMember.conversation_id == locked_conversation.id
+    )
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        member_statement = member_statement.with_for_update()
+    members = list((await session.scalars(member_statement)).all())
+    locked_successor = next((item for item in members if item.id == successor.id), None)
+    if (
+        locked_successor is None
+        or locked_successor.user_id is None
+        or locked_successor.status != ConversationMemberStatus.ACTIVE.value
+    ):
+        raise GroupPermissionError("The new owner must be an active group member")
+
+    new_owner_id = locked_successor.user_id
+    prior_owner_ids = {locked_conversation.user_id}
+    prior_owner_ids.update(
+        item.user_id
+        for item in members
+        if item.role == ConversationMemberRole.OWNER.value and item.user_id is not None
+    )
+    for item in members:
+        if item.role == ConversationMemberRole.OWNER.value:
+            item.role = ConversationMemberRole.MEMBER.value
+    locked_successor.role = ConversationMemberRole.OWNER.value
+    locked_conversation.user_id = new_owner_id
+    locked_conversation.group_owner_source = source
+
+    app_statement = select(GeneratedApp).where(
+        GeneratedApp.conversation_id == locked_conversation.id
+    )
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        app_statement = app_statement.with_for_update()
+    generated_apps = list((await session.scalars(app_statement)).all())
+    prior_owner_ids.update(app.user_id for app in generated_apps)
+    prior_owner_ids.discard(new_owner_id)
+
+    for generated_app in generated_apps:
+        generated_app.user_id = new_owner_id
+        await _transfer_generated_app_access(
+            session,
+            app_id=generated_app.id,
+            new_owner_id=new_owner_id,
+            prior_owner_ids=prior_owner_ids,
+            departing_owner_user_id=departing_owner_user_id,
+        )
+    await session.flush()
+
+
+async def _transfer_generated_app_access(
+    session: AsyncSession,
+    *,
+    app_id: UUID,
+    new_owner_id: UUID,
+    prior_owner_ids: set[UUID],
+    departing_owner_user_id: UUID | None,
+) -> None:
+    memberships = list(
+        (
+            await session.scalars(
+                select(GeneratedAppMembership).where(GeneratedAppMembership.app_id == app_id)
+            )
+        ).all()
+    )
+    new_owner_membership = next(
+        (item for item in memberships if item.user_id == new_owner_id),
+        None,
+    )
+    if new_owner_membership is None:
+        session.add(
+            GeneratedAppMembership(
+                app_id=app_id,
+                user_id=new_owner_id,
+                role=GeneratedAppRole.OWNER.value,
+            )
+        )
+    else:
+        new_owner_membership.role = GeneratedAppRole.OWNER.value
+
+    for membership in memberships:
+        if membership.user_id == new_owner_id:
+            continue
+        if membership.user_id == departing_owner_user_id:
+            await session.delete(membership)
+        elif membership.role == GeneratedAppRole.OWNER.value:
+            membership.role = GeneratedAppRole.MEMBER.value
+
+    now = datetime.now(UTC)
+    sessions = list(
+        (
+            await session.scalars(
+                select(GeneratedAppSession).where(GeneratedAppSession.app_id == app_id)
+            )
+        ).all()
+    )
+    for app_session in sessions:
+        belongs_to_departed_owner = (
+            departing_owner_user_id is not None and app_session.user_id == departing_owner_user_id
+        )
+        has_stale_owner_access = (
+            app_session.role == GeneratedAppRole.OWNER.value and app_session.user_id != new_owner_id
+        )
+        if belongs_to_departed_owner or (
+            departing_owner_user_id is not None and has_stale_owner_access
+        ):
+            app_session.revoked_at = now
+        elif has_stale_owner_access:
+            app_session.role = GeneratedAppRole.MEMBER.value
+
+    tickets = list(
+        (
+            await session.scalars(
+                select(GeneratedAppAccessTicket).where(GeneratedAppAccessTicket.app_id == app_id)
+            )
+        ).all()
+    )
+    for ticket in tickets:
+        belongs_to_departed_owner = (
+            departing_owner_user_id is not None
+            and ticket.principal_user_id == departing_owner_user_id
+        )
+        has_stale_owner_access = (
+            ticket.role == GeneratedAppRole.OWNER.value and ticket.principal_user_id != new_owner_id
+        )
+        if belongs_to_departed_owner or (
+            departing_owner_user_id is not None and has_stale_owner_access
+        ):
+            ticket.expires_at = now
+        elif has_stale_owner_access:
+            ticket.role = GeneratedAppRole.MEMBER.value
+        if ticket.issued_by_user_id in prior_owner_ids:
+            ticket.issued_by_user_id = new_owner_id
+
+
+async def _revoke_unclaimed_group_app_owner(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    departing_owner_user_id: UUID,
+) -> None:
+    """Remove owner authority while a group has no linked successor.
+
+    Anonymous member sessions and tickets remain valid so the shared app keeps working for the
+    group. A later linked owner claim reuses the normal atomic transfer path.
+    """
+
+    app_statement = select(GeneratedApp).where(GeneratedApp.conversation_id == conversation_id)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        app_statement = app_statement.with_for_update()
+    generated_apps = list((await session.scalars(app_statement)).all())
+    now = datetime.now(UTC)
+
+    for generated_app in generated_apps:
+        memberships = list(
+            (
+                await session.scalars(
+                    select(GeneratedAppMembership).where(
+                        GeneratedAppMembership.app_id == generated_app.id
+                    )
+                )
+            ).all()
+        )
+        for membership in memberships:
+            if (
+                membership.user_id == departing_owner_user_id
+                or membership.role == GeneratedAppRole.OWNER.value
+            ):
+                await session.delete(membership)
+
+        app_sessions = list(
+            (
+                await session.scalars(
+                    select(GeneratedAppSession).where(
+                        GeneratedAppSession.app_id == generated_app.id
+                    )
+                )
+            ).all()
+        )
+        for app_session in app_sessions:
+            if (
+                app_session.user_id == departing_owner_user_id
+                or app_session.role == GeneratedAppRole.OWNER.value
+            ):
+                app_session.revoked_at = now
+
+        tickets = list(
+            (
+                await session.scalars(
+                    select(GeneratedAppAccessTicket).where(
+                        GeneratedAppAccessTicket.app_id == generated_app.id
+                    )
+                )
+            ).all()
+        )
+        for ticket in tickets:
+            if (
+                ticket.principal_user_id == departing_owner_user_id
+                or ticket.role == GeneratedAppRole.OWNER.value
+            ):
+                ticket.expires_at = now
 
 
 def group_owner_context(

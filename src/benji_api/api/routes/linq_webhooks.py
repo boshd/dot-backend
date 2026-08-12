@@ -19,6 +19,7 @@ from benji_api.config import Settings, get_settings
 from benji_api.db.session import get_session
 from benji_api.integrations.linq.client import LinqClient
 from benji_api.integrations.linq.dependencies import get_linq_client
+from benji_api.integrations.linq.media import linq_attachment_url_expiration
 from benji_api.integrations.linq.schemas import LinqInboundMessage, LinqWebhookEnvelope
 from benji_api.integrations.linq.webhooks import (
     LinqWebhookVerificationError,
@@ -30,6 +31,7 @@ from benji_api.models.channel import (
     Conversation,
     ConversationChannel,
     Message,
+    MessageAttachment,
     MessageDelivery,
     MessageDirection,
     MessageStatus,
@@ -426,6 +428,25 @@ async def receive_linq_webhook(
     session.add(inbound_message)
     conversation.updated_at = datetime.now(UTC)
     await session.flush()
+    for attachment in inbound.attachments:
+        session.add(
+            MessageAttachment(
+                message_id=inbound_message.id,
+                provider=PROVIDER,
+                provider_attachment_id=attachment.provider_attachment_id,
+                part_index=attachment.part_index,
+                kind="media",
+                filename=attachment.filename,
+                mime_type=attachment.mime_type,
+                size_bytes=attachment.size_bytes,
+                source_url=attachment.url,
+                source_url_expires_at=linq_attachment_url_expiration(
+                    attachment,
+                    observed_at=envelope.created_at,
+                ),
+                raw_payload=attachment.raw_payload,
+            )
+        )
     await cancel_pending_follow_ups(session, conversation_id=conversation.id)
 
     messaging_preference = None

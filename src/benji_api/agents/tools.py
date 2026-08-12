@@ -1,10 +1,15 @@
+import asyncio
+import contextlib
+import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from benji_api.agents.types import AgentTool, ToolContext, ToolDefinition
@@ -12,17 +17,31 @@ from benji_api.agents.web_search import WebSearchProvider
 from benji_api.agents.web_search_dependencies import build_web_search_provider
 from benji_api.config import Settings
 from benji_api.db.session import async_session_factory
+from benji_api.generated_app_contract import DOT_REMINDER_CREATE_CAPABILITY
 from benji_api.integrations.catalog import get_integration
 from benji_api.integrations.google.client import (
     GoogleIntegrationClient,
     GoogleProviderError,
 )
 from benji_api.memory.service import forget_user_memories, list_user_memories
+from benji_api.models.agent import AgentToolCall, ToolCallStatus
+from benji_api.models.channel import (
+    Conversation,
+    ConversationKind,
+    Message,
+    MessageDirection,
+)
 from benji_api.models.finance import (
     FinancialAccount,
     FinancialConnection,
     FinancialConnectionStatus,
     FinancialTransaction,
+)
+from benji_api.models.generated_app import GeneratedAppAccessMode
+from benji_api.models.generated_app_v2 import (
+    GeneratedAppDataRecord,
+    GeneratedAppRole,
+    GeneratedAppRuntimeKind,
 )
 from benji_api.models.integration import (
     IntegrationAccount,
@@ -30,6 +49,12 @@ from benji_api.models.integration import (
     IntegrationStatus,
 )
 from benji_api.models.schedule import ScheduledTaskRecurrence
+from benji_api.models.user import LanguagePreference, OnboardingStatus, User
+from benji_api.services.account_management import (
+    ACCOUNT_DELETION_GRACE_SECONDS,
+    cancel_account_deletion,
+    schedule_account_deletion,
+)
 from benji_api.services.finance import disconnect_financial_connection
 from benji_api.services.financial_goals import (
     cancel_financial_goal,
@@ -38,21 +63,44 @@ from benji_api.services.financial_goals import (
 )
 from benji_api.services.generated_app_specs import (
     GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA,
-    GENERATED_APP_MODULES_TOOL_SCHEMA,
     normalize_tool_initial_records,
 )
 from benji_api.services.generated_apps import (
-    create_composable_generated_app,
-    create_generated_app,
+    GeneratedAppBundle,
+    archive_generated_app,
+    create_owned_generated_app_record,
+    delete_owned_generated_app_record,
     generated_app_url,
+    get_owned_generated_app,
+    list_generated_apps,
+    update_owned_generated_app_record,
 )
+from benji_api.services.generated_apps_v2 import (
+    StoredRollback,
+    create_code_app_build,
+    create_data_record,
+    delete_data_record,
+    get_owned_code_app,
+    issue_access_ticket,
+    list_data_records,
+    queue_owned_code_app_revision,
+    rollback_owned_code_app,
+    update_data_record,
+)
+from benji_api.services.groups import group_app_participant_names, list_conversation_members
 from benji_api.services.integrations import (
     IntegrationAuthorizationError,
     IntegrationNotConfiguredError,
     build_google_integration_client,
     create_integration_connect_link,
+    disconnect_google_integration,
     get_valid_google_access_token,
 )
+from benji_api.services.language_preferences import (
+    LanguagePreferenceProposal,
+    apply_language_preference,
+)
+from benji_api.services.onboarding import OnboardingProfileCandidates, apply_profile_candidates
 from benji_api.services.schedules import (
     AGENT_REACHOUT_ACTION,
     cancel_scheduled_task,
@@ -61,10 +109,26 @@ from benji_api.services.schedules import (
     preferred_delivery_provider,
 )
 
+_JOURNALED_GENERATED_APP_TOOLS = {
+    "create_personal_app",
+    "add_custom_app_record",
+    "update_custom_app_record",
+    "delete_custom_app_record",
+    "revise_custom_app",
+    "rollback_custom_app",
+}
+_TOOL_CALL_LEASE = timedelta(seconds=30)
+
 
 class ToolRegistry:
-    def __init__(self, tools: list[AgentTool] | None = None) -> None:
+    def __init__(
+        self,
+        tools: list[AgentTool] | None = None,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
         self._tools: dict[str, AgentTool] = {}
+        self._session_factory = session_factory
         for tool in tools or []:
             self.register(tool)
 
@@ -79,7 +143,10 @@ class ToolRegistry:
 
     def only(self, names: set[str]) -> "ToolRegistry":
         """Return a view containing only explicitly allowed capability tools."""
-        return ToolRegistry([tool for name, tool in self._tools.items() if name in names])
+        return ToolRegistry(
+            [tool for name, tool in self._tools.items() if name in names],
+            session_factory=self._session_factory,
+        )
 
     async def execute(
         self,
@@ -91,11 +158,211 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return {"ok": False, "error": f"unknown tool: {name}"}, False
+        journaled = (
+            name in _JOURNALED_GENERATED_APP_TOOLS
+            and context.agent_run_id is not None
+            and context.tool_call_id is not None
+        )
+        claimant: str | None = None
+        if journaled:
+            claimant, replay = await self._start_tool_call(
+                name=name,
+                context=context,
+                arguments=arguments,
+            )
+            if replay is not None:
+                return replay
+        lease_heartbeat: asyncio.Task[None] | None = None
+        if journaled and claimant is not None:
+            lease_heartbeat = asyncio.create_task(
+                self._renew_tool_call_lease(context=context, claimant=claimant)
+            )
         try:
-            output = await tool.execute(context=context, arguments=arguments)
-        except Exception as error:
-            return {"ok": False, "error": str(error)[:1_000]}, False
-        return {"ok": True, "result": output}, True
+            try:
+                output = await tool.execute(context=context, arguments=arguments)
+            except Exception as error:
+                result = ({"ok": False, "error": str(error)[:1_000]}, False)
+            else:
+                result = ({"ok": True, "result": output}, True)
+        finally:
+            if lease_heartbeat is not None:
+                lease_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await lease_heartbeat
+        if journaled:
+            if claimant is None:  # pragma: no cover - journal start returns one or a replay.
+                raise RuntimeError("Tool-call journal was not claimed")
+            return await self._finish_tool_call(
+                context=context,
+                claimant=claimant,
+                output=result[0],
+                succeeded=result[1],
+            )
+        return result
+
+    async def _start_tool_call(
+        self,
+        *,
+        name: str,
+        context: ToolContext,
+        arguments: dict[str, Any],
+    ) -> tuple[str | None, tuple[dict[str, Any], bool] | None]:
+        if context.agent_run_id is None or context.tool_call_id is None:  # pragma: no cover
+            raise RuntimeError("Journaled tool call is missing its durable identity")
+        factory = self._session_factory or async_session_factory
+        claimant = uuid4().hex
+        while True:
+            wait_seconds = 0.05
+            async with factory() as session:
+                call = await session.scalar(
+                    select(AgentToolCall).where(
+                        AgentToolCall.agent_run_id == context.agent_run_id,
+                        AgentToolCall.external_call_id == context.tool_call_id,
+                    )
+                )
+                now = datetime.now(UTC)
+                if call is None:
+                    session.add(
+                        AgentToolCall(
+                            agent_run_id=context.agent_run_id,
+                            external_call_id=context.tool_call_id,
+                            tool_name=name,
+                            arguments=arguments,
+                            output={},
+                            status=ToolCallStatus.RUNNING.value,
+                            attempts=1,
+                            claimed_by=claimant,
+                            lease_expires_at=now + _TOOL_CALL_LEASE,
+                        )
+                    )
+                    try:
+                        await session.commit()
+                        return claimant, None
+                    except IntegrityError:
+                        # A concurrent executor created the journal row. Re-read it rather
+                        # than running alongside the winner.
+                        await session.rollback()
+                        continue
+                _validate_journal_call(call, name=name, arguments=arguments)
+                if call.status != ToolCallStatus.RUNNING.value:
+                    return None, _journal_result(call)
+                lease_expires_at = _aware_utc_datetime(call.lease_expires_at)
+                if lease_expires_at is None or lease_expires_at <= now:
+                    claimed = await session.scalar(
+                        update(AgentToolCall)
+                        .where(
+                            AgentToolCall.id == call.id,
+                            AgentToolCall.status == ToolCallStatus.RUNNING.value,
+                            AgentToolCall.lease_expires_at == call.lease_expires_at,
+                        )
+                        .values(
+                            claimed_by=claimant,
+                            lease_expires_at=now + _TOOL_CALL_LEASE,
+                            attempts=AgentToolCall.attempts + 1,
+                        )
+                        .returning(AgentToolCall.id)
+                    )
+                    if claimed is not None:
+                        await session.commit()
+                        return claimant, None
+                    await session.rollback()
+                    continue
+                wait_seconds = min(
+                    0.1,
+                    max(0.01, (lease_expires_at - now).total_seconds()),
+                )
+            await asyncio.sleep(wait_seconds)
+
+    async def _finish_tool_call(
+        self,
+        *,
+        context: ToolContext,
+        claimant: str,
+        output: dict[str, Any],
+        succeeded: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        if context.agent_run_id is None or context.tool_call_id is None:  # pragma: no cover
+            raise RuntimeError("Journaled tool call is missing its durable identity")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            statement = select(AgentToolCall).where(
+                AgentToolCall.agent_run_id == context.agent_run_id,
+                AgentToolCall.external_call_id == context.tool_call_id,
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            call = await session.scalar(statement.execution_options(populate_existing=True))
+            if call is None:  # pragma: no cover - start always commits the journal first.
+                raise RuntimeError("Tool-call journal disappeared during execution")
+            if call.status != ToolCallStatus.RUNNING.value:
+                return _journal_result(call)
+            if call.claimed_by != claimant:
+                raise RuntimeError("Tool-call journal lease was reclaimed")
+            call.output = output
+            call.status = (
+                ToolCallStatus.COMPLETED.value if succeeded else ToolCallStatus.FAILED.value
+            )
+            call.claimed_by = None
+            call.lease_expires_at = None
+            await session.commit()
+            return output, succeeded
+
+    async def _renew_tool_call_lease(
+        self,
+        *,
+        context: ToolContext,
+        claimant: str,
+    ) -> None:
+        if context.agent_run_id is None or context.tool_call_id is None:  # pragma: no cover
+            return
+        factory = self._session_factory or async_session_factory
+        while True:
+            await asyncio.sleep(_TOOL_CALL_LEASE.total_seconds() / 3)
+            async with factory() as session:
+                renewed = await session.scalar(
+                    update(AgentToolCall)
+                    .where(
+                        AgentToolCall.agent_run_id == context.agent_run_id,
+                        AgentToolCall.external_call_id == context.tool_call_id,
+                        AgentToolCall.status == ToolCallStatus.RUNNING.value,
+                        AgentToolCall.claimed_by == claimant,
+                    )
+                    .values(lease_expires_at=datetime.now(UTC) + _TOOL_CALL_LEASE)
+                    .returning(AgentToolCall.id)
+                )
+                if renewed is None:
+                    await session.rollback()
+                    return
+                await session.commit()
+
+
+def _validate_journal_call(
+    call: AgentToolCall,
+    *,
+    name: str,
+    arguments: dict[str, Any],
+) -> None:
+    if call.tool_name != name or call.arguments != arguments:
+        raise RuntimeError("Tool-call identity was reused with different arguments")
+
+
+def _journal_result(call: AgentToolCall) -> tuple[dict[str, Any], bool]:
+    if not isinstance(call.output, dict):
+        raise RuntimeError("Stored tool-call output is invalid")
+    if call.status not in {
+        ToolCallStatus.COMPLETED.value,
+        ToolCallStatus.FAILED.value,
+    }:
+        raise RuntimeError("Stored tool-call status is invalid")
+    return dict(call.output), call.status == ToolCallStatus.COMPLETED.value
+
+
+def _aware_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 class CurrentDateTimeTool:
@@ -477,6 +744,7 @@ class ListConnectedIntegrationsTool:
             )
             integration["accounts"].append(
                 {
+                    "account_id": str(account.id),
                     "email": account.email,
                     "display_name": account.display_name,
                     "status": grant.status,
@@ -511,6 +779,83 @@ class ListConnectedIntegrationsTool:
         return {"integrations": integrations, "count": len(integrations)}
 
 
+class DisconnectGoogleIntegrationTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        google_client: GoogleIntegrationClient | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._google_client = google_client
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="disconnect_google_integration",
+            description=(
+                "Disconnect one Gmail or Google Calendar grant for one connected account. Use "
+                "list_connected_integrations first to get its account_id. This removes Dot's "
+                "access and notification subscription for that service. Call only after a "
+                "direct, explicit disconnect request; if the user is merely asking what is "
+                "connected, do not call it."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "integration": {
+                        "type": "string",
+                        "enum": ["google_calendar", "gmail"],
+                    },
+                    "account_id": {"type": "string"},
+                },
+                "required": ["integration", "account_id"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        integration = arguments.get("integration")
+        if integration not in {"google_calendar", "gmail"}:
+            raise ValueError("integration must be google_calendar or gmail")
+        try:
+            account_id = UUID(str(arguments.get("account_id")))
+        except ValueError as error:
+            raise ValueError("account_id must be a valid ID") from error
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            disconnected = await disconnect_google_integration(
+                session,
+                user_id=context.user_id,
+                account_id=account_id,
+                integration_key=integration,
+                settings=self._settings,
+                google_client=self._google_client,
+            )
+            await session.commit()
+        if disconnected is None:
+            return {
+                "disconnected": False,
+                "integration": integration,
+                "account_id": str(account_id),
+            }
+        return {
+            "disconnected": True,
+            "integration": disconnected.integration_key,
+            "account_id": str(disconnected.account_id),
+            "account_email": disconnected.account_email,
+            "provider_access_revoked": disconnected.provider_access_revoked,
+            "message_hint": (
+                "Dot can no longer use this service for the account. If another Google service "
+                "remains connected, Google keeps the shared consent until that service is also "
+                "disconnected."
+            ),
+        }
+
+
 class CreateGeneratedAppTool:
     def __init__(
         self,
@@ -526,38 +871,126 @@ class CreateGeneratedAppTool:
         return ToolDefinition(
             name="create_personal_app",
             description=(
-                "Create one safe declarative web app composed from independently useful modules. "
-                "Use every module the request needs instead of collapsing a multi-part workflow "
-                "into one generic checklist. For example, a birthday-planning app normally needs "
-                "an overview with the known date and venue, todos, a guest_list for RSVPs, and an "
-                "itinerary; it may also need expenses or notes. Use collection for a bounded "
-                "custom dataset that the reviewed modules do "
-                "not cover. Seed facts already known from the conversation. The user's explicit "
-                "request authorizes this reversible creation; do not ask for confirmation again."
+                "Queue a truly custom, persistent app for Dot to generate, test, and send when it "
+                "is ready. Describe the user's product rather than choosing a template: its real "
+                "job, workflows, information, starting data, and an intentional visual direction. "
+                "Choose collaborative access when the user wants other people to use or edit the "
+                "app. Use only capabilities and data the user requested. An explicit build request "
+                "authorizes this reversible creation; do not ask for confirmation again."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "minLength": 1, "maxLength": 120},
                     "description": {"type": "string", "maxLength": 500},
-                    "theme": {
+                    "purpose": {
                         "type": "string",
-                        "enum": ["coral", "sage", "ocean", "plum", "gold"],
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "The concrete outcome this app should create for its users.",
+                    },
+                    "product_brief": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4_000,
+                        "description": (
+                            "A cohesive brief covering the requested workflows, interaction model, "
+                            "important states, calculations, and useful defaults."
+                        ),
+                    },
+                    "visual_direction": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1_000,
+                        "description": (
+                            "Task-specific visual hierarchy, mood, density, and useful visual "
+                            "metaphors. Avoid a generic admin dashboard."
+                        ),
                     },
                     "access_mode": {
                         "type": "string",
-                        "enum": ["private_link", "collaborative_link"],
+                        "enum": [
+                            GeneratedAppAccessMode.PRIVATE_LINK.value,
+                            GeneratedAppAccessMode.COLLABORATIVE_LINK.value,
+                        ],
+                        "description": (
+                            "Use collaborative_link when the user asked to share, collaborate, "
+                            "collect responses, or let other people edit. Otherwise use "
+                            "private_link. Group-chat apps are always collaborative."
+                        ),
                     },
-                    "modules": GENERATED_APP_MODULES_TOOL_SCHEMA,
-                    "initial_records": GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA,
+                    "entities": {
+                        "type": "array",
+                        "maxItems": 24,
+                        "description": "Persistent data types the app needs.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                                },
+                                "description": {"type": "string", "maxLength": 240},
+                                "fields": {
+                                    "type": "array",
+                                    "maxItems": 32,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {
+                                                "type": "string",
+                                                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                                            },
+                                            "type": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "string", "number", "integer", "boolean",
+                                                    "date", "datetime", "object", "array",
+                                                ],
+                                            },
+                                            "required": {"type": "boolean"},
+                                        },
+                                        "required": ["name", "type", "required"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            },
+                            "required": ["name", "description", "fields"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "capabilities": {
+                        "type": "array",
+                        "maxItems": 1,
+                        "items": {
+                            "type": "string",
+                            "enum": [DOT_REMINDER_CREATE_CAPABILITY],
+                        },
+                        "description": (
+                            "Include dot.reminder.create only when the user explicitly asked for "
+                            "this app to set reminders or notify them later. Otherwise pass []."
+                        ),
+                    },
+                    "seed_data": {
+                        "description": (
+                            "Known starting facts and example content. Keep this JSON small and "
+                            "never include secrets or unrelated private data. Encode it as JSON."
+                        ),
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 16_000,
+                    },
                 },
                 "required": [
                     "title",
                     "description",
-                    "theme",
+                    "purpose",
+                    "product_brief",
+                    "visual_direction",
                     "access_mode",
-                    "modules",
-                    "initial_records",
+                    "entities",
+                    "capabilities",
+                    "seed_data",
                 ],
                 "additionalProperties": False,
             },
@@ -566,61 +999,984 @@ class CreateGeneratedAppTool:
     async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         factory = self._session_factory or async_session_factory
         async with factory() as session:
-            if "modules" in arguments:
-                bundle = await create_composable_generated_app(
-                    session,
-                    user_id=context.user_id,
-                    conversation_id=context.conversation_id,
-                    title=arguments.get("title"),
-                    description=arguments.get("description"),
-                    theme=arguments.get("theme"),
-                    access_mode=arguments.get("access_mode"),
-                    modules=arguments.get("modules"),
-                    initial_records=normalize_tool_initial_records(
-                        arguments.get("initial_records")
-                    ),
-                )
+            conversation = await session.get(Conversation, context.conversation_id)
+            if conversation is None:
+                raise ValueError("conversation was not found")
+            if conversation.kind == ConversationKind.DIRECT.value:
+                if conversation.user_id != context.user_id:
+                    raise ValueError("conversation does not belong to this user")
+                app_owner_id = context.user_id
             else:
-                participants = arguments.get("participants")
-                if not isinstance(participants, list) or not all(
-                    isinstance(participant, str) for participant in participants
-                ):
-                    raise ValueError("participants must be a list of names")
-                bundle = await create_generated_app(
-                    session,
-                    user_id=context.user_id,
-                    conversation_id=context.conversation_id,
-                    title=arguments.get("title"),
-                    description=arguments.get("description"),
-                    template=arguments.get("template"),
-                    theme=arguments.get("theme"),
-                    access_mode=arguments.get("access_mode"),
-                    currency=arguments.get("currency"),
-                    unit=arguments.get("unit"),
-                    target_number=arguments.get("target_number"),
-                    target_direction=arguments.get("target_direction"),
-                    participants=participants,
+                # Group apps belong to the group's canonical owner, regardless of which linked
+                # member made the request. Access stays collaborative and group-scoped.
+                members = await list_conversation_members(
+                    session, conversation_id=conversation.id
                 )
-        modules = bundle.version.specification.get("modules", [])
+                requester_is_member = any(
+                    member_user is not None and member_user.id == context.user_id
+                    for _, member_user in members
+                )
+                if not requester_is_member:
+                    raise ValueError("user is not an active member of this group")
+                app_owner_id = conversation.user_id
+            entities = _code_app_entities(arguments.get("entities"))
+            capabilities = arguments.get("capabilities")
+            if not isinstance(capabilities, list) or any(
+                item != DOT_REMINDER_CREATE_CAPABILITY for item in capabilities
+            ):
+                raise ValueError("capabilities must contain only supported explicit grants")
+            if len(capabilities) > 1 or len(set(capabilities)) != len(capabilities):
+                raise ValueError("capabilities contains duplicate or excessive grants")
+            seed_data_raw = arguments.get("seed_data")
+            if not isinstance(seed_data_raw, str):
+                raise ValueError("seed_data must be JSON text")
+            try:
+                seed_data = json.loads(seed_data_raw)
+            except json.JSONDecodeError as error:
+                raise ValueError("seed_data must contain valid JSON") from error
+            if not isinstance(seed_data, dict):
+                raise ValueError("seed_data JSON must be an object")
+            if conversation.kind == ConversationKind.GROUP.value:
+                seed_data = {
+                    **seed_data,
+                    "group": {
+                        "title": conversation.title,
+                        "participants": group_app_participant_names(members),
+                    },
+                }
+            accent = _app_accent(arguments.get("visual_direction"))
+            # Completion follows the channel that requested the build. A web request must
+            # appear in the canonical web conversation without unexpectedly double-texting
+            # an otherwise connected Linq thread.
+            delivery_provider = context.delivery_provider
+            app, job, ticket = await create_code_app_build(
+                session,
+                user_id=app_owner_id,
+                conversation_id=context.conversation_id,
+                requester_user_id=context.user_id,
+                title=arguments.get("title"),
+                description=arguments.get("description"),
+                access_mode=arguments.get("access_mode"),
+                delivery_provider=delivery_provider,
+                request={
+                    "blueprint": {
+                        "title": arguments.get("title"),
+                        "description": arguments.get("description"),
+                        "purpose": arguments.get("purpose"),
+                        "layout": "custom_workspace",
+                        "accent": accent,
+                        "manifest": {
+                            "schema_version": 1,
+                            "entities": entities,
+                            "capabilities": capabilities,
+                        },
+                        "seed_data": seed_data,
+                        "product_brief": arguments.get("product_brief"),
+                        "visual_direction": arguments.get("visual_direction"),
+                    }
+                },
+                idempotency_key=_agent_tool_idempotency_key(context),
+                app_base_url=self._settings.generated_app_public_url,
+                idempotency_request_hash=_agent_tool_request_hash(
+                    context,
+                    tool_name="create_personal_app",
+                    arguments=arguments,
+                ),
+            )
+            del ticket
         return {
-            "app_id": str(bundle.app.id),
-            "title": bundle.app.title,
-            "template": bundle.app.template,
-            "modules": [
-                {"id": module["id"], "type": module["type"]}
-                for module in modules
-                if isinstance(module, dict) and "id" in module and "type" in module
-            ],
-            "access_mode": bundle.app.access_mode,
-            "app_url": generated_app_url(
-                base_url=self._settings.generated_app_public_url,
-                public_id=bundle.app.public_id,
-            ),
+            "app_id": str(app.id),
+            "build_job_id": str(job.id),
+            "title": str(job.request["blueprint"]["title"]),
+            "access_mode": app.access_mode,
+            "status": "queued",
             "message_hint": (
-                "Send the link to the user. Anyone with a collaborative link can add data; "
-                "a private link should not be shared."
+                "Say naturally that you're building it now. Do not send a link or claim it is "
+                "ready; Dot will be woken automatically after the tested revision is live."
             ),
         }
+
+
+class ListGeneratedAppsTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="list_personal_apps",
+            description=(
+                "List the user's active generated apps, including stable IDs and links. Use when "
+                "the user asks what Dot has made or when an exact app ID is needed before deletion."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del arguments
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            apps = await list_generated_apps(session, user_id=context.user_id)
+        return {
+            "apps": [
+                {
+                    "app_id": str(app.id),
+                    "title": app.title,
+                    "description": app.description,
+                    "access_mode": app.access_mode,
+                    "runtime_kind": app.runtime_kind,
+                    "app_url": (
+                        f"{self._settings.generated_app_public_url}/a/{app.public_id}"
+                        if app.runtime_kind == GeneratedAppRuntimeKind.CODE.value
+                        else generated_app_url(
+                            base_url=self._settings.generated_app_public_url,
+                            public_id=app.public_id,
+                        )
+                    ),
+                    "updated_at": app.updated_at.isoformat(),
+                }
+                for app in apps
+            ],
+            "count": len(apps),
+        }
+
+
+class InspectCustomAppTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="inspect_custom_app",
+            description=(
+                "Privately inspect an owned custom code app, its deployed data contract, and "
+                "latest build state. Use list_personal_apps first if the app ID is unknown. This "
+                "is only for a one-to-one chat and must never be used in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"app_id": {"type": "string"}},
+                "required": ["app_id"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(
+                session,
+                app_id=app_id,
+                user_id=context.user_id,
+            )
+        revision = owned.revision
+        build = owned.build
+        return {
+            "app_id": str(owned.app.id),
+            "title": owned.app.title,
+            "description": owned.app.description,
+            "app_url": f"{self._settings.generated_app_public_url}/a/{owned.app.public_id}",
+            "access_mode": owned.app.access_mode,
+            "current_version": owned.app.current_version,
+            "rollback_available": (
+                owned.deployment is not None
+                and owned.deployment.previous_revision_id is not None
+            ),
+            "previous_revision_id": (
+                str(owned.deployment.previous_revision_id)
+                if owned.deployment is not None
+                and owned.deployment.previous_revision_id is not None
+                else None
+            ),
+            "active_revision": (
+                {
+                    "revision_id": str(revision.id),
+                    "revision_number": revision.revision_number,
+                    "manifest": revision.manifest,
+                    "created_at": revision.created_at.isoformat(),
+                }
+                if revision is not None
+                else None
+            ),
+            "latest_build": (
+                {
+                    "build_job_id": str(build.id),
+                    "status": build.status,
+                    "attempts": build.attempts,
+                    "updated_at": build.updated_at.isoformat(),
+                }
+                if build is not None
+                else None
+            ),
+        }
+
+
+class CreateCustomAppLinkTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="create_custom_app_link",
+            description=(
+                "Create a fresh, expiring handoff link for an owned custom code app, preserving "
+                "whether the app is private or collaborative. "
+                "Use when the owner asks to open it, needs the link again, or says an earlier "
+                "link expired. Use list_personal_apps first if its ID is unknown. Never invent "
+                "or reconstruct a link, and never use this tool in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"app_id": {"type": "string"}},
+                "required": ["app_id"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(
+                session,
+                app_id=app_id,
+                user_id=context.user_id,
+            )
+            ticket = await issue_access_ticket(
+                session,
+                app_id=owned.app.id,
+                issuer_user_id=context.user_id,
+                principal_user_id=(
+                    None
+                    if owned.app.access_mode
+                    == GeneratedAppAccessMode.COLLABORATIVE_LINK.value
+                    else context.user_id
+                ),
+                role=(
+                    GeneratedAppRole.MEMBER.value
+                    if owned.app.access_mode
+                    == GeneratedAppAccessMode.COLLABORATIVE_LINK.value
+                    else GeneratedAppRole.OWNER.value
+                ),
+                ttl_seconds=7 * 86_400,
+            )
+            await session.commit()
+        return {
+            "app_id": str(owned.app.id),
+            "title": owned.app.title,
+            "app_url": (
+                f"{self._settings.generated_app_public_url}/a/"
+                f"{owned.app.public_id}#handoff={ticket}"
+            ),
+            "private": (
+                owned.app.access_mode == GeneratedAppAccessMode.PRIVATE_LINK.value
+            ),
+            "access_mode": owned.app.access_mode,
+            "expires_in_days": 7,
+        }
+
+
+class ListCustomAppRecordsTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="list_custom_app_records",
+            description=(
+                "Privately read persisted records for one declared entity in an owned custom "
+                "app. Inspect the app first for the exact entity name. Never use in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "entity": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 25},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 10_000},
+                },
+                "required": ["app_id", "entity", "limit", "offset"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        entity = _required_string_argument(arguments.get("entity"), "entity", 64)
+        limit = _bounded_integer_argument(arguments.get("limit"), "limit", 1, 25)
+        offset = _bounded_integer_argument(arguments.get("offset"), "offset", 0, 10_000)
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(
+                session,
+                app_id=app_id,
+                user_id=context.user_id,
+            )
+            records, total = await list_data_records(
+                session,
+                app_id=app_id,
+                actor=owned.actor,
+                entity=entity,
+                limit=limit,
+                offset=offset,
+            )
+        return {
+            "app_id": str(app_id),
+            "entity": entity,
+            "records": [_code_app_record_payload(record) for record in records],
+            "total": total,
+            "offset": offset,
+            "has_more": offset + len(records) < total,
+        }
+
+
+class CreateCustomAppRecordTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="add_custom_app_record",
+            description=(
+                "Add one persisted record to an owned custom app after the user directly asks "
+                "to log or add it. Inspect the app for its entity fields first. data_json must "
+                "be a JSON object containing only declared fields. Never use in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "entity": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                    },
+                    "data_json": {"type": "string", "minLength": 2, "maxLength": 16_000},
+                },
+                "required": ["app_id", "entity", "data_json"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        entity = _required_string_argument(arguments.get("entity"), "entity", 64)
+        data = _json_object_argument(arguments.get("data_json"), "data_json", 16_000)
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(session, app_id=app_id, user_id=context.user_id)
+            record = await create_data_record(
+                session,
+                app_id=app_id,
+                actor=owned.actor,
+                entity=entity,
+                data=data,
+                idempotency_key=(
+                    _agent_tool_idempotency_key(context) or f"agent-create:{uuid4()}"
+                ),
+            )
+        return {"app_id": str(app_id), "record": _code_app_record_payload(record)}
+
+
+class UpdateCustomAppRecordTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="update_custom_app_record",
+            description=(
+                "Update one custom-app record the user directly asked to change. Read it first, "
+                "then pass its current version and complete desired data as JSON. Never use in a "
+                "group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_id": {"type": "string"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                    "data_json": {"type": "string", "minLength": 2, "maxLength": 16_000},
+                },
+                "required": ["app_id", "record_id", "expected_version", "data_json"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record_id = _uuid_argument(arguments.get("record_id"), "record_id")
+        expected_version = _bounded_integer_argument(
+            arguments.get("expected_version"), "expected_version", 1, 2_147_483_647
+        )
+        data = _json_object_argument(arguments.get("data_json"), "data_json", 16_000)
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(session, app_id=app_id, user_id=context.user_id)
+            record = await update_data_record(
+                session,
+                app_id=app_id,
+                record_id=record_id,
+                actor=owned.actor,
+                expected_version=expected_version,
+                data=data,
+                idempotency_key=(
+                    _agent_tool_idempotency_key(context) or f"agent-update:{uuid4()}"
+                ),
+            )
+        return {"app_id": str(app_id), "record": _code_app_record_payload(record)}
+
+
+class DeleteCustomAppRecordTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="delete_custom_app_record",
+            description=(
+                "Permanently delete one custom-app record. Read it first for its exact ID and "
+                "version, and call only after the user explicitly asks to remove that item. "
+                "Never use in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_id": {"type": "string"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                },
+                "required": ["app_id", "record_id", "expected_version"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record_id = _uuid_argument(arguments.get("record_id"), "record_id")
+        expected_version = _bounded_integer_argument(
+            arguments.get("expected_version"), "expected_version", 1, 2_147_483_647
+        )
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            owned = await get_owned_code_app(session, app_id=app_id, user_id=context.user_id)
+            await delete_data_record(
+                session,
+                app_id=app_id,
+                record_id=record_id,
+                actor=owned.actor,
+                expected_version=expected_version,
+                idempotency_key=(
+                    _agent_tool_idempotency_key(context) or f"agent-delete:{uuid4()}"
+                ),
+            )
+        return {"app_id": str(app_id), "deleted_record_id": str(record_id)}
+
+
+class ReviseCustomAppTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="revise_custom_app",
+            description=(
+                "Queue a tested revision of an existing owned custom app after the user asks for "
+                "a product, behavior, data-model, or visual change. Preserve everything they did "
+                "not ask to change. Pass a full manifest only when its data schema or an explicit "
+                "capability grant must change; pass null otherwise. Grant dot.reminder.create only "
+                "when the user explicitly asks this app to set reminders or notify them later. "
+                "The completion event sends the live result. Never use in a group."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "change_request": {"type": "string", "minLength": 1, "maxLength": 4_000},
+                    "title": {"type": ["string", "null"], "maxLength": 120},
+                    "description": {"type": ["string", "null"], "maxLength": 500},
+                    "visual_direction": {"type": ["string", "null"], "maxLength": 1_000},
+                    "manifest_json": {"type": ["string", "null"], "maxLength": 32_000},
+                    "seed_data_json": {"type": ["string", "null"], "maxLength": 32_000},
+                },
+                "required": [
+                    "app_id",
+                    "change_request",
+                    "title",
+                    "description",
+                    "visual_direction",
+                    "manifest_json",
+                    "seed_data_json",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        change_request = _required_string_argument(
+            arguments.get("change_request"), "change_request", 4_000
+        )
+        title = _optional_string_argument(arguments.get("title"), "title", 120)
+        description = _optional_string_argument(
+            arguments.get("description"), "description", 500, allow_empty=True
+        )
+        visual_direction = _optional_string_argument(
+            arguments.get("visual_direction"), "visual_direction", 1_000
+        )
+        manifest = _optional_json_object_argument(
+            arguments.get("manifest_json"), "manifest_json", 32_000
+        )
+        seed_data = _optional_json_object_argument(
+            arguments.get("seed_data_json"), "seed_data_json", 32_000
+        )
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            delivery_provider = await preferred_delivery_provider(
+                session,
+                conversation_id=context.conversation_id,
+            )
+            job = await queue_owned_code_app_revision(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+                revision_request=change_request,
+                title=title,
+                description=description,
+                visual_direction=visual_direction,
+                manifest=manifest,
+                seed_data=seed_data,
+                delivery_provider=delivery_provider,
+                idempotency_key=_agent_tool_idempotency_key(context),
+                idempotency_request_hash=_agent_tool_request_hash(
+                    context,
+                    tool_name="revise_custom_app",
+                    arguments=arguments,
+                ),
+            )
+        return {
+            "app_id": str(app_id),
+            "build_job_id": str(job.id),
+            "status": job.status,
+            "message_hint": (
+                "Say naturally that you're making the requested change. Do not claim it is live "
+                "yet; Dot will be woken automatically after the revised app passes its checks."
+            ),
+        }
+
+
+class RollbackCustomAppTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="rollback_custom_app",
+            description=(
+                "Immediately restore an owned custom app's previous deployed revision after the "
+                "user explicitly asks to undo or roll back the latest deployed app change. This "
+                "keeps the same app link and can itself be reversed by rolling back again. Never "
+                "use in a group or while a revision build is still in progress. Inspect first "
+                "and pass the active revision ID so a duplicate or stale call cannot undo itself."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "expected_active_revision_id": {"type": "string"},
+                },
+                "required": ["app_id", "expected_active_revision_id"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        expected_active_revision_id = _uuid_argument(
+            arguments.get("expected_active_revision_id"), "expected_active_revision_id"
+        )
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            rolled_back = await rollback_owned_code_app(
+                session,
+                app_id=app_id,
+                user_id=context.user_id,
+                expected_active_revision_id=expected_active_revision_id,
+                idempotency_key=_agent_tool_idempotency_key(context),
+            )
+            if isinstance(rolled_back, StoredRollback):
+                return {
+                    "app_id": str(rolled_back.app_id),
+                    "title": rolled_back.title,
+                    "app_url": (
+                        f"{self._settings.generated_app_public_url}/a/"
+                        f"{rolled_back.public_id}"
+                    ),
+                    "active_revision_id": str(rolled_back.active_revision_id),
+                    "active_revision_number": rolled_back.active_revision_number,
+                    "deployment_version": rolled_back.deployment_version,
+                    "rollback_is_reversible": rolled_back.rollback_is_reversible,
+                }
+            deployment = rolled_back.deployment
+            revision = rolled_back.revision
+            if deployment is None or revision is None:
+                raise RuntimeError("Rollback did not produce a deployed revision")
+            return {
+                "app_id": str(rolled_back.app.id),
+                "title": rolled_back.app.title,
+                "app_url": (
+                    f"{self._settings.generated_app_public_url}/a/"
+                    f"{rolled_back.app.public_id}"
+                ),
+                "active_revision_id": str(revision.id),
+                "active_revision_number": revision.revision_number,
+                "deployment_version": deployment.deployment_version,
+                "rollback_is_reversible": deployment.previous_revision_id is not None,
+            }
+
+
+class DeleteGeneratedAppTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="delete_personal_app",
+            description=(
+                "Disable one of the user's generated apps and its public link. Use "
+                "list_personal_apps first if the exact app_id is unknown. This is destructive; "
+                "call only after the user directly asks to delete that specific app. A direct "
+                "request such as 'delete my birthday app' is sufficient, but a vague cleanup "
+                "discussion is not."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_kind": {"type": ["string", "null"]},
+                    "record_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["app_id", "record_kind", "record_limit"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            app_id = UUID(str(arguments.get("app_id")))
+        except ValueError as error:
+            raise ValueError("app_id must be a valid ID") from error
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            app = await archive_generated_app(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+            )
+            await session.commit()
+        return {
+            "app_id": str(app_id),
+            "deleted": app is not None,
+            "message_hint": (
+                "The app and its public link are disabled. Do not share the old link as active."
+            ),
+        }
+
+
+class GetGeneratedAppTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="get_personal_app",
+            description=(
+                "Inspect one owned generated app's modules and current records. Use "
+                "list_personal_apps first if its exact app_id is unknown, and use this before "
+                "editing records so their IDs and full validated data are known."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_kind": {
+                        "type": ["string", "null"],
+                        "description": "Optional record-kind filter, or null for every kind.",
+                    },
+                    "record_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                },
+                "required": ["app_id", "record_kind", "record_limit"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record_kind = arguments.get("record_kind")
+        if record_kind is not None and not isinstance(record_kind, str):
+            raise ValueError("record_kind must be a string or null")
+        record_limit = arguments.get("record_limit")
+        if not isinstance(record_limit, int) or not 1 <= record_limit <= 100:
+            raise ValueError("record_limit must be between 1 and 100")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            bundle = await get_owned_generated_app(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+            )
+        return _generated_app_bundle_payload(
+            bundle,
+            settings=self._settings,
+            record_kind=record_kind,
+            record_limit=record_limit,
+        )
+
+
+class CreateGeneratedAppRecordTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="add_personal_app_record",
+            description=(
+                "Add a validated record to one of the user's owned generated apps. Inspect the "
+                "app first so module_id, record kind, configured participants, and custom fields "
+                "are correct. The user's direct request to log or add the item authorizes this "
+                "reversible write. actor_name should be null; Dot fills it from the private "
+                "profile."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record": GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA["items"],
+                },
+                "required": ["app_id", "record"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record = _normalized_tool_record(arguments.get("record"))
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            user = await _require_direct_conversation(session, context=context)
+            bundle, created_record = await create_owned_generated_app_record(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+                module_id=record["module_id"],
+                kind=record["kind"],
+                data=record["data"],
+                actor_name=user.display_name,
+            )
+        payload = _generated_app_bundle_payload(bundle, settings=self._settings)
+        payload["created_record_id"] = str(created_record.id)
+        return payload
+
+
+class UpdateGeneratedAppRecordTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="update_personal_app_record",
+            description=(
+                "Update one record in an owned generated app. First inspect the app for the exact "
+                "app_id and record_id, then send the record's full desired validated data with "
+                "the same module_id and kind. Use only for a change the user directly requests."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_id": {"type": "string"},
+                    "record": GENERATED_APP_INITIAL_RECORDS_TOOL_SCHEMA["items"],
+                },
+                "required": ["app_id", "record_id", "record"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record_id = _uuid_argument(arguments.get("record_id"), "record_id")
+        desired = _normalized_tool_record(arguments.get("record"))
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            current = await get_owned_generated_app(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+            )
+            existing = next((item for item in current.records if item.id == record_id), None)
+            if existing is None:
+                raise ValueError("app record was not found")
+            if existing.module_id != desired["module_id"] or existing.kind != desired["kind"]:
+                raise ValueError("record module_id and kind cannot be changed")
+            bundle = await update_owned_generated_app_record(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+                record_id=record_id,
+                data=desired["data"],
+            )
+        payload = _generated_app_bundle_payload(bundle, settings=self._settings)
+        payload["updated_record_id"] = str(record_id)
+        return payload
+
+
+class DeleteGeneratedAppRecordTool:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="delete_personal_app_record",
+            description=(
+                "Permanently delete one record from an owned generated app. Inspect the app first "
+                "to obtain the exact app_id and record_id. This is destructive: call only after "
+                "the user explicitly asks to remove that specific item."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"},
+                    "record_id": {"type": "string"},
+                },
+                "required": ["app_id", "record_id"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        app_id = _uuid_argument(arguments.get("app_id"), "app_id")
+        record_id = _uuid_argument(arguments.get("record_id"), "record_id")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            bundle = await delete_owned_generated_app_record(
+                session,
+                user_id=context.user_id,
+                app_id=app_id,
+                record_id=record_id,
+            )
+        payload = _generated_app_bundle_payload(bundle, settings=self._settings)
+        payload["deleted_record_id"] = str(record_id)
+        return payload
 
 
 class GoogleCalendarEventsTool:
@@ -1415,6 +2771,239 @@ class CancelFinancialGoalTool:
         return {"goal_id": str(goal_id), "cancelled": cancelled}
 
 
+class GetAccountSettingsTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="get_account_settings",
+            description=(
+                "Read the private user's current Dot profile and communication preferences. "
+                "Use when they ask what details or settings Dot has for them."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del arguments
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            user = await _require_direct_conversation(session, context=context)
+        return _account_settings_payload(user)
+
+
+class UpdateAccountSettingTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="update_account_setting",
+            description=(
+                "Update one private Dot account setting when the user directly supplies or "
+                "corrects it. Supported fields are display name, ISO birth date, city, country, "
+                "and conversation language. Do not infer a new personal fact from weak context."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "enum": [
+                            "display_name",
+                            "birth_date",
+                            "location_city",
+                            "location_country",
+                            "preferred_language_mode",
+                        ],
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "The new value. birth_date uses YYYY-MM-DD. Language is auto, "
+                            "english, arabic_script, or egyptian_franco."
+                        ),
+                    },
+                },
+                "required": ["field", "value"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        field = arguments.get("field")
+        value = arguments.get("value")
+        if not isinstance(field, str) or not isinstance(value, str):
+            raise ValueError("field and value are required")
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            user = await _require_direct_conversation(session, context=context)
+            if field == "preferred_language_mode":
+                try:
+                    mode = LanguagePreference(value)
+                except ValueError as error:
+                    raise ValueError(
+                        "preferred language must be auto, english, arabic_script, or "
+                        "egyptian_franco"
+                    ) from error
+                apply_language_preference(
+                    user=user,
+                    proposal=LanguagePreferenceProposal(action="set", mode=mode),
+                )
+            elif field in {
+                "display_name",
+                "birth_date",
+                "location_city",
+                "location_country",
+            }:
+                candidate_values = {
+                    "display_name": None,
+                    "birth_date": None,
+                    "location_city": None,
+                    "location_country": None,
+                }
+                candidate_values[field] = value
+                result = apply_profile_candidates(
+                    user=user,
+                    candidates=OnboardingProfileCandidates(**candidate_values),
+                )
+                if field in result.rejected_fields:
+                    raise ValueError(f"invalid {field}")
+            else:
+                raise ValueError("unsupported account setting")
+            await session.commit()
+        return {
+            "updated": True,
+            "field": field,
+            "settings": _account_settings_payload(user),
+        }
+
+
+class DeleteAccountTool:
+    confirmation_phrase = "delete my dot account forever"
+
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="delete_dot_account",
+            description=(
+                "Start permanent deletion of the user's Dot account, messages, private apps, "
+                "memories, and connected data. Always call this on an account-deletion request: "
+                "the tool itself checks the latest inbound message and returns an exact standalone "
+                "confirmation phrase when confirmation is still required. Never claim deletion "
+                "is scheduled unless the tool returns deletion_scheduled true."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del arguments
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            user = await _require_direct_conversation(session, context=context)
+            if user.onboarding_status != OnboardingStatus.COMPLETE.value:
+                raise ValueError("account deletion is unavailable until onboarding is complete")
+            latest_text = await session.scalar(
+                select(Message.content)
+                .where(
+                    Message.conversation_id == context.conversation_id,
+                    Message.direction == MessageDirection.INBOUND.value,
+                )
+                .order_by(Message.created_at.desc(), Message.id.desc())
+                .limit(1)
+            )
+            if not isinstance(latest_text, str) or not _matches_delete_confirmation(latest_text):
+                return {
+                    "deletion_scheduled": False,
+                    "confirmation_required": True,
+                    "confirmation_phrase": self.confirmation_phrase,
+                    "message_hint": (
+                        "Explain briefly that deletion is permanent, then ask the user to send "
+                        "the exact phrase as a standalone message. Do not soften or "
+                        "autocomplete it."
+                    ),
+                }
+            task = await schedule_account_deletion(
+                session,
+                user_id=context.user_id,
+                conversation_id=context.conversation_id,
+            )
+            await session.commit()
+        return {
+            "deletion_scheduled": True,
+            "confirmation_required": False,
+            "scheduled_for": task.scheduled_for.isoformat(),
+            "grace_seconds": ACCOUNT_DELETION_GRACE_SECONDS,
+            "message_hint": (
+                "Tell the user deletion is confirmed and will finish in about a minute. They can "
+                "still text 'cancel account deletion' during that minute. Do not say it is already "
+                "deleted."
+            ),
+        }
+
+
+class CancelAccountDeletionTool:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="cancel_account_deletion",
+            description=(
+                "Cancel a pending Dot account deletion during its short grace period. Call when "
+                "the user explicitly asks to keep the account or cancel deletion."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(self, *, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del arguments
+        factory = self._session_factory or async_session_factory
+        async with factory() as session:
+            await _require_direct_conversation(session, context=context)
+            cancelled = await cancel_account_deletion(session, user_id=context.user_id)
+            await session.commit()
+        return {"cancelled": cancelled}
+
+
 class ListMemoriesTool:
     @property
     def definition(self) -> ToolDefinition:
@@ -1499,6 +3088,193 @@ class ForgetMemoriesTool:
         }
 
 
+async def _require_direct_conversation(
+    session: AsyncSession,
+    *,
+    context: ToolContext,
+) -> User:
+    conversation = await session.get(Conversation, context.conversation_id)
+    if (
+        conversation is None
+        or conversation.kind != ConversationKind.DIRECT.value
+        or conversation.user_id != context.user_id
+    ):
+        raise ValueError("this private account action is only available in the user's direct chat")
+    user = await session.get(User, context.user_id)
+    if user is None:
+        raise ValueError("user account was not found")
+    return user
+
+
+def _account_settings_payload(user: User) -> dict[str, Any]:
+    return {
+        "display_name": user.display_name,
+        "birth_date": user.birth_date.isoformat() if user.birth_date else None,
+        "location_city": user.location_city,
+        "location_country": user.location_country,
+        "preferred_language_mode": user.preferred_language_mode,
+        "messaging_enabled": user.messaging_opted_out_at is None,
+    }
+
+
+def _matches_delete_confirmation(text: str) -> bool:
+    normalized = " ".join(text.strip().casefold().split()).rstrip(".! ")
+    return normalized == DeleteAccountTool.confirmation_phrase
+
+
+def _uuid_argument(value: Any, field_name: str) -> UUID:
+    try:
+        return UUID(str(value))
+    except ValueError as error:
+        raise ValueError(f"{field_name} must be a valid ID") from error
+
+
+def _agent_tool_idempotency_key(context: ToolContext) -> str | None:
+    """Derive one stable mutation identity from the durable model tool call."""
+
+    if context.agent_run_id is None or context.tool_call_id is None:
+        # Direct service/tests do not have a model-call identity. Production AgentRunner
+        # always supplies both values before any tool executes.
+        return None
+    source = f"{context.agent_run_id}:{context.tool_call_id}".encode()
+    return f"agent-tool:{hashlib.sha256(source).hexdigest()}"
+
+
+def _agent_tool_request_hash(
+    context: ToolContext,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "tool_name": tool_name,
+            "user_id": str(context.user_id),
+            "conversation_id": str(context.conversation_id),
+            "arguments": arguments,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _required_string_argument(value: Any, field_name: str, max_length: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    clean = value.strip()
+    if len(clean) > max_length:
+        raise ValueError(f"{field_name} is too long")
+    return clean
+
+
+def _optional_string_argument(
+    value: Any,
+    field_name: str,
+    max_length: int,
+    *,
+    allow_empty: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    clean = value.strip()
+    if not clean and not allow_empty:
+        raise ValueError(f"{field_name} must not be empty")
+    if len(clean) > max_length:
+        raise ValueError(f"{field_name} is too long")
+    return clean
+
+
+def _bounded_integer_argument(
+    value: Any,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{field_name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _json_object_argument(value: Any, field_name: str, max_length: int) -> dict[str, Any]:
+    if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+        raise ValueError(f"{field_name} must be bounded JSON text")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{field_name} must contain valid JSON") from error
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{field_name} JSON must be an object")
+    return decoded
+
+
+def _optional_json_object_argument(
+    value: Any,
+    field_name: str,
+    max_length: int,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return _json_object_argument(value, field_name, max_length)
+
+
+def _code_app_record_payload(record: GeneratedAppDataRecord) -> dict[str, Any]:
+    return {
+        "record_id": str(record.id),
+        "entity": record.entity,
+        "data": record.data,
+        "version": record.version,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+def _normalized_tool_record(value: Any) -> dict[str, Any]:
+    records = normalize_tool_initial_records([value])
+    if len(records) != 1:
+        raise ValueError("record is required")
+    return records[0]
+
+
+def _generated_app_bundle_payload(
+    bundle: GeneratedAppBundle,
+    *,
+    settings: Settings,
+    record_kind: str | None = None,
+    record_limit: int = 100,
+) -> dict[str, Any]:
+    matching_records = [
+        record for record in bundle.records if record_kind is None or record.kind == record_kind
+    ]
+    visible_records = matching_records[:record_limit]
+    return {
+        "app_id": str(bundle.app.id),
+        "title": bundle.app.title,
+        "app_url": generated_app_url(
+            base_url=settings.generated_app_public_url,
+            public_id=bundle.app.public_id,
+        ),
+        "specification": bundle.version.specification,
+        "records": [
+            {
+                "record_id": str(record.id),
+                "module_id": record.module_id,
+                "kind": record.kind,
+                "actor_name": record.actor_name,
+                "data": record.data,
+                "updated_at": record.updated_at.isoformat(),
+            }
+            for record in visible_records
+        ],
+        "record_count": len(matching_records),
+        "records_truncated": len(matching_records) > len(visible_records),
+    }
+
+
 def build_default_tool_registry(settings: Settings | None = None) -> ToolRegistry:
     tools: list[AgentTool] = [
         CurrentDateTimeTool(),
@@ -1511,9 +3287,27 @@ def build_default_tool_registry(settings: Settings | None = None) -> ToolRegistr
         CreateFinancialGoalTool(),
         ListFinancialGoalsTool(),
         CancelFinancialGoalTool(),
+        GetAccountSettingsTool(),
+        UpdateAccountSettingTool(),
+        DeleteAccountTool(),
+        CancelAccountDeletionTool(),
     ]
     if settings is not None:
         tools.append(CreateGeneratedAppTool(settings))
+        tools.append(ListGeneratedAppsTool(settings))
+        tools.append(InspectCustomAppTool(settings))
+        tools.append(CreateCustomAppLinkTool(settings))
+        tools.append(ListCustomAppRecordsTool())
+        tools.append(CreateCustomAppRecordTool())
+        tools.append(UpdateCustomAppRecordTool())
+        tools.append(DeleteCustomAppRecordTool())
+        tools.append(ReviseCustomAppTool())
+        tools.append(RollbackCustomAppTool(settings))
+        tools.append(DeleteGeneratedAppTool())
+        tools.append(GetGeneratedAppTool(settings))
+        tools.append(CreateGeneratedAppRecordTool(settings))
+        tools.append(UpdateGeneratedAppRecordTool(settings))
+        tools.append(DeleteGeneratedAppRecordTool(settings))
         search_provider = build_web_search_provider(settings)
         if search_provider is not None:
             tools.append(
@@ -1549,7 +3343,62 @@ def build_default_tool_registry(settings: Settings | None = None) -> ToolRegistr
         tools.append(GoogleCalendarEventsTool(settings))
         tools.append(SearchGmailTool(settings))
         tools.append(GetGmailMessageTool(settings))
+        tools.append(DisconnectGoogleIntegrationTool(settings))
     return ToolRegistry(tools)
+
+
+def _code_app_entities(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 24:
+        raise ValueError("entities must be a list of at most 24 items")
+    entities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_entity in value:
+        if not isinstance(raw_entity, dict):
+            raise ValueError("each entity must be an object")
+        name = raw_entity.get("name")
+        description = raw_entity.get("description")
+        raw_fields = raw_entity.get("fields")
+        if not isinstance(name, str) or not name or name in seen:
+            raise ValueError("entity names must be unique snake_case identifiers")
+        if not isinstance(description, str):
+            raise ValueError("entity description must be text")
+        if not isinstance(raw_fields, list) or len(raw_fields) > 32:
+            raise ValueError("entity fields must be a list of at most 32 items")
+        fields: dict[str, dict[str, Any]] = {}
+        for raw_field in raw_fields:
+            if not isinstance(raw_field, dict):
+                raise ValueError("each entity field must be an object")
+            field_name = raw_field.get("name")
+            field_type = raw_field.get("type")
+            required = raw_field.get("required")
+            if not isinstance(field_name, str) or field_name in fields:
+                raise ValueError("field names must be unique snake_case identifiers")
+            if field_type not in {
+                "string", "number", "integer", "boolean", "date", "datetime", "object", "array"
+            }:
+                raise ValueError("unsupported entity field type")
+            if not isinstance(required, bool):
+                raise ValueError("field required must be true or false")
+            fields[field_name] = {"type": field_type, "required": required}
+        entities.append({"name": name, "description": description, "fields": fields})
+        seen.add(name)
+    return entities
+
+
+def _app_accent(visual_direction: Any) -> str:
+    if not isinstance(visual_direction, str):
+        raise ValueError("visual_direction is required")
+    normalized = visual_direction.casefold()
+    palette = {
+        "sage": "sage",
+        "green": "sage",
+        "ocean": "ocean",
+        "blue": "ocean",
+        "plum": "plum",
+        "purple": "plum",
+        "sky": "sky",
+    }
+    return next((color for word, color in palette.items() if word in normalized), "coral")
 
 
 def _aware_datetime(value: Any, field_name: str) -> datetime:

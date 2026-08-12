@@ -24,7 +24,7 @@ from benji_api.agents.prompts.wake import build_follow_up_module, build_user_eve
 from benji_api.agents.relationship import RelationshipState, load_relationship_state
 from benji_api.agents.results import PersistedReply, PersistedTurn
 from benji_api.agents.runner import AgentRunner
-from benji_api.agents.text_style import prepare_text_bubbles
+from benji_api.agents.text_style import prepare_app_completion_bubbles, prepare_text_bubbles
 from benji_api.agents.tools import ToolRegistry
 from benji_api.agents.types import AgentMessage, ModelProvider, ToolContext
 from benji_api.config import Settings
@@ -165,6 +165,8 @@ async def run_agent_event(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> PersistedTurn:
     factory = session_factory or async_session_factory
+    required_app_url = _required_app_completion_url(event_type=event_type, payload=payload)
+    message_only = _is_message_only_app_reminder(event_type=event_type, payload=payload)
     async with conversation_turn_lock(factory, conversation_id=conversation_id):
         return await _run_agent_wake(
             conversation_id=conversation_id,
@@ -177,16 +179,17 @@ async def run_agent_event(
             source_binding_id=source_binding_id,
             idempotency_key=idempotency_key,
             provider=provider,
-            tools=tools,
+            tools=ToolRegistry([]) if message_only else tools,
             settings=settings,
             embedding_provider=embedding_provider,
             query=f"{event_type}: {payload}",
             state_modules=(build_user_event_module(event_type=event_type, payload=payload),),
             delivery_provider=delivery_provider,
-            allow_follow_up=True,
+            allow_follow_up=not message_only,
             chain_depth=0,
             session_factory=factory,
             guard_follow_up_id=None,
+            required_app_url=required_app_url,
         )
 
 
@@ -252,6 +255,7 @@ async def _run_agent_wake(
     chain_depth: int,
     session_factory: async_sessionmaker[AsyncSession] | None,
     guard_follow_up_id: UUID | None,
+    required_app_url: str | None = None,
 ) -> PersistedTurn:
     factory = session_factory or async_session_factory
     run_id: UUID | None = None
@@ -430,7 +434,12 @@ async def _run_agent_wake(
         ).run(
             instructions=instructions,
             messages=messages,
-            context=ToolContext(user_id=user_id, conversation_id=conversation_id),
+            context=ToolContext(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                agent_run_id=run_id,
+                delivery_provider=delivery_provider,
+            ),
         )
 
         async with factory() as session:
@@ -447,26 +456,54 @@ async def _run_agent_wake(
                 follow_up = await session.get(AgentFollowUp, guard_follow_up_id)
                 if follow_up is None or follow_up.status == AgentFollowUpStatus.CANCELLED.value:
                     raise AgentWakeCancelled("Follow-up was cancelled by a user message")
-            for call in result.tool_calls:
-                session.add(
-                    AgentToolCall(
-                        agent_run_id=run.id,
-                        external_call_id=call.call_id,
-                        tool_name=call.name,
-                        arguments=call.arguments,
-                        output=call.output,
-                        status=(
-                            ToolCallStatus.COMPLETED.value
-                            if call.succeeded
-                            else ToolCallStatus.FAILED.value
-                        ),
+            existing_tool_calls = {
+                call.external_call_id: call
+                for call in (
+                    await session.scalars(
+                        select(AgentToolCall).where(AgentToolCall.agent_run_id == run.id)
                     )
+                ).all()
+            }
+            for call in result.tool_calls:
+                persisted_call = existing_tool_calls.get(call.call_id)
+                if persisted_call is None:
+                    session.add(
+                        AgentToolCall(
+                            agent_run_id=run.id,
+                            external_call_id=call.call_id,
+                            tool_name=call.name,
+                            arguments=call.arguments,
+                            output=call.output,
+                            status=(
+                                ToolCallStatus.COMPLETED.value
+                                if call.succeeded
+                                else ToolCallStatus.FAILED.value
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    persisted_call.tool_name != call.name
+                    or persisted_call.arguments != call.arguments
+                ):
+                    raise RuntimeError(
+                        "Tool-call identity was reused with different arguments"
+                    )
+                persisted_call.output = call.output
+                persisted_call.status = (
+                    ToolCallStatus.COMPLETED.value
+                    if call.succeeded
+                    else ToolCallStatus.FAILED.value
                 )
 
             response_group_id = uuid4()
             replies: list[PersistedReply] = []
             persisted_messages: list[Message] = []
-            clean_messages = prepare_text_bubbles(result.messages)
+            clean_messages = (
+                prepare_app_completion_bubbles(result.messages, app_url=required_app_url)
+                if required_app_url is not None
+                else prepare_text_bubbles(result.messages)
+            )
             if not clean_messages:
                 if purpose == AgentRunPurpose.EVENT and wake_type == "schedule.triggered":
                     run.status = AgentRunStatus.COMPLETED.value
@@ -549,6 +586,32 @@ async def _run_agent_wake(
         if run_id is not None:
             await mark_run_failed(run_id, error)
         raise
+
+
+def _required_app_completion_url(
+    *,
+    event_type: str,
+    payload: dict[str, object],
+) -> str | None:
+    if event_type != "app.build.completed":
+        return None
+    app_url = payload.get("app_url")
+    if not isinstance(app_url, str) or not app_url.strip():
+        raise RuntimeError("App completion event is missing its trusted app URL")
+    return app_url
+
+
+def _is_message_only_app_reminder(
+    *,
+    event_type: str,
+    payload: dict[str, object],
+) -> bool:
+    """Keep app-authored reminder text out of Dot's capability-bearing agent loop."""
+    return (
+        event_type == "schedule.triggered"
+        and payload.get("schedule_source") == "generated_app"
+        and payload.get("tool_policy") == "message_only"
+    )
 
 
 async def _load_existing_turn(

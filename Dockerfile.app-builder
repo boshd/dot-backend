@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+
+FROM ghcr.io/astral-sh/uv:0.12.1 AS uv
+
+FROM node:22.14.0-bookworm-slim AS app-compiler
+
+WORKDIR /opt/dot-app-compiler
+
+COPY src/benji_api/app_builder/compiler/package.json \
+    src/benji_api/app_builder/compiler/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+COPY src/benji_api/app_builder/compiler/harness.mjs ./
+COPY src/benji_api/app_builder/compiler/browser_smoke.mjs ./
+COPY src/benji_api/app_builder/compiler/chromium_acceptance.mjs ./
+COPY src/benji_api/app_builder/compiler/smoke_guest.mjs ./
+COPY src/benji_api/app_builder/compiler/sdk ./sdk
+
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    DOT_APP_COMPILER_HARNESS=/opt/dot-app-compiler/harness.mjs \
+    DOT_APP_BROWSER_HARNESS=/opt/dot-app-compiler/browser_smoke.mjs \
+    DOT_APP_CHROMIUM_HARNESS=/opt/dot-app-compiler/chromium_acceptance.mjs \
+    DOT_APP_CHROMIUM_PATH=/usr/bin/chromium \
+    PATH="/app/.venv/bin:$PATH"
+
+WORKDIR /app
+
+COPY --from=uv /uv /uvx /bin/
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends chromium chromium-sandbox
+
+# Keep the large browser layer independent from SDK/harness churn so normal app-platform
+# iteration does not download Chromium again.
+COPY --from=app-compiler /usr/local/bin/node /usr/local/bin/node
+COPY --from=app-compiler /opt/dot-app-compiler /opt/dot-app-compiler
+COPY pyproject.toml uv.lock README.md ./
+
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
+
+RUN uv sync --frozen --no-dev \
+    && groupadd --gid 10001 benji \
+    && useradd --uid 10001 --gid benji --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin benji
+
+USER benji
+
+CMD ["python", "-m", "benji_api.workers.app_builder"]

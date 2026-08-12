@@ -28,6 +28,7 @@ from benji_api.config import Settings, get_settings
 from benji_api.db.base import Base
 from benji_api.db.session import get_session
 from benji_api.integrations.linq.dependencies import get_linq_client
+from benji_api.integrations.linq.schemas import LinqInboundMessage, LinqWebhookEnvelope
 from benji_api.main import app
 from benji_api.models.agent import AgentRun, AgentRunPurpose
 from benji_api.models.channel import (
@@ -35,6 +36,7 @@ from benji_api.models.channel import (
     ConversationChannel,
     ConversationMember,
     Message,
+    MessageAttachment,
     MessageDelivery,
     WebhookEvent,
 )
@@ -97,6 +99,8 @@ class FakeModelProvider:
         self.response_text = "all set — what’s up?"
         self.group_should_respond = False
         self.group_acknowledgment = ""
+        self.last_regular_messages: list[AgentMessage] = []
+        self.structured_messages: list[list[AgentMessage]] = []
 
     def start(
         self,
@@ -108,6 +112,7 @@ class FakeModelProvider:
     ) -> ModelSession:
         assert 'prompt_module name="onboarding"' not in instructions
         assert messages[-1].content
+        self.last_regular_messages = messages
         self.regular_tool_names = [tool.name for tool in tools]
         assert output is not None and output.name == "benji_conversation_turn"
         return FakeModelSession(self.response_text)
@@ -119,6 +124,7 @@ class FakeModelProvider:
         messages: list[AgentMessage],
         output: StructuredOutputDefinition,
     ) -> StructuredModelResult:
+        self.structured_messages.append(messages)
         if output.name == "dot_group_participation":
             return StructuredModelResult(
                 response_id="group-participation-1",
@@ -207,6 +213,7 @@ def message_received_payload(
     chat_id: str = "chat-1",
     sender_phone: str = "+14155552671",
     is_group: bool = False,
+    parts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "api_version": "v3",
@@ -229,7 +236,7 @@ def message_received_payload(
                 "is_me": False,
                 "service": "iMessage",
             },
-            "parts": [{"type": "text", "value": text}],
+            "parts": parts if parts is not None else [{"type": "text", "value": text}],
             "service": "iMessage",
         },
     }
@@ -962,7 +969,25 @@ async def test_completed_onboarding_unlocks_tools_on_the_next_turn(
             "create_financial_goal",
             "list_financial_goals",
             "cancel_financial_goal",
+            "get_account_settings",
+            "update_account_setting",
+            "delete_dot_account",
+            "cancel_account_deletion",
             "create_personal_app",
+            "list_personal_apps",
+            "inspect_custom_app",
+            "create_custom_app_link",
+            "list_custom_app_records",
+            "add_custom_app_record",
+            "update_custom_app_record",
+            "delete_custom_app_record",
+            "revise_custom_app",
+            "rollback_custom_app",
+            "delete_personal_app",
+            "get_personal_app",
+            "add_personal_app_record",
+            "update_personal_app_record",
+            "delete_personal_app_record",
         ]
         assert len(fake_linq.sent) == 2
         async with session_factory() as session:
@@ -975,3 +1000,92 @@ async def test_completed_onboarding_unlocks_tools_on_the_next_turn(
             AgentRunPurpose.ONBOARDING.value,
             AgentRunPurpose.CONVERSATION.value,
         ]
+
+
+@pytest.mark.anyio
+async def test_linq_media_is_persisted_once_and_reaches_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_url = "https://cdn.linqapp.com/attachments/partners/partner-1/attachment-1/photo.jpg"
+    payload = message_received_payload(
+        parts=[
+            {
+                "type": "media",
+                "id": "attachment-1",
+                "filename": "photo.jpg",
+                "mime_type": "image/jpeg",
+                "size_bytes": 123_456,
+                "url": image_url,
+            }
+        ]
+    )
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    async with linq_test_app(monkeypatch) as (
+        client,
+        session_factory,
+        _,
+        fake_model,
+    ):
+        response = await client.post(
+            "/api/v1/webhooks/linq",
+            content=body,
+            headers=signed_headers(body),
+        )
+        duplicate = await client.post(
+            "/api/v1/webhooks/linq",
+            content=body,
+            headers=signed_headers(body),
+        )
+
+        assert response.status_code == 200
+        assert duplicate.json()["duplicate"] is True
+        async with session_factory() as session:
+            message = await session.scalar(select(Message))
+            attachments = (await session.scalars(select(MessageAttachment))).all()
+        assert message is not None and message.content == "[sent an image]"
+        assert len(attachments) == 1
+        assert attachments[0].provider_attachment_id == "attachment-1"
+        assert attachments[0].source_url == image_url
+        assert attachments[0].source_url_expires_at is None
+        model_attachment = fake_model.structured_messages[-1][-1].attachments[0]
+        assert model_attachment.kind == "image"
+        assert model_attachment.url == image_url
+
+
+def test_legacy_linq_media_payload_is_parsed() -> None:
+    envelope = LinqWebhookEnvelope.model_validate(
+        {
+            "api_version": "v3",
+            "webhook_version": "2025-01-01",
+            "event_type": "message.received",
+            "event_id": "legacy-event",
+            "created_at": "2026-08-11T12:00:00Z",
+            "data": {
+                "chat_id": "legacy-chat",
+                "from_handle": {"handle": "person@example.com", "service": "iMessage"},
+                "is_group": True,
+                "message": {
+                    "id": "legacy-message",
+                    "parts": [
+                        {"type": "text", "value": "look at this"},
+                        {
+                            "type": "media",
+                            "id": "legacy-attachment",
+                            "content_type": "image/png",
+                            "url": "https://cdn.linqapp.com/temporary/image.png",
+                        },
+                    ],
+                },
+            },
+        }
+    )
+
+    inbound = LinqInboundMessage.from_envelope(envelope)
+
+    assert inbound.external_chat_id == "legacy-chat"
+    assert inbound.external_message_id == "legacy-message"
+    assert inbound.is_group is True
+    assert inbound.text == "look at this"
+    assert inbound.attachments[0].provider_attachment_id == "legacy-attachment"
+    assert inbound.attachments[0].mime_type == "image/png"

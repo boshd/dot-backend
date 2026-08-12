@@ -1,6 +1,7 @@
 from benji_api.agents.text_style import (
     DELIVERY_BUBBLE_SAFETY_LIMIT,
     plain_text_bubble,
+    prepare_app_completion_bubbles,
     prepare_text_bubbles,
 )
 
@@ -34,3 +35,14 @@ def test_prepare_text_bubbles_turns_accidental_paragraphs_into_real_bubbles() ->
         "i can also build little apps.",
         "one more beat",
     )
+
+
+def test_app_completion_bubbles_always_include_only_the_exact_trusted_url() -> None:
+    trusted_url = "https://app.example/a/demo#handoff=trusted"
+
+    assert prepare_app_completion_bubbles(
+        ["it's ready"], app_url=trusted_url
+    ) == ("it's ready", trusted_url)
+    assert prepare_app_completion_bubbles(
+        ["it's ready: https://wrong.example/a/nope"], app_url=trusted_url
+    ) == (f"it's ready: {trusted_url}",)

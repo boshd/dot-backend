@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from benji_api.config import Settings
@@ -60,6 +60,14 @@ class CompletedIntegration:
     grant: IntegrationGrant
     user_event_id: UUID
     redirect_after: str
+
+
+@dataclass(frozen=True, slots=True)
+class DisconnectedIntegration:
+    integration_key: str
+    account_id: UUID
+    account_email: str
+    provider_access_revoked: bool
 
 
 def _token_hash(token: str) -> str:
@@ -482,6 +490,103 @@ async def get_valid_google_access_token(
     account.updated_at = utc_now()
     await session.commit()
     return refreshed.access_token
+
+
+async def disconnect_google_integration(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    account_id: UUID,
+    integration_key: str,
+    settings: Settings,
+    google_client: GoogleIntegrationClient | None = None,
+) -> DisconnectedIntegration | None:
+    """Disconnect one Google capability without affecting another user's grants."""
+    definition = _available_integration(integration_key)
+    if definition.provider != "google":
+        raise IntegrationAuthorizationError("This is not a Google integration")
+    account = await session.scalar(
+        select(IntegrationAccount).where(
+            IntegrationAccount.id == account_id,
+            IntegrationAccount.user_id == user_id,
+            IntegrationAccount.provider == "google",
+        )
+    )
+    if account is None:
+        return None
+    grant = await session.scalar(
+        select(IntegrationGrant).where(
+            IntegrationGrant.account_id == account.id,
+            IntegrationGrant.integration_key == integration_key,
+            IntegrationGrant.status != IntegrationStatus.REVOKED.value,
+        )
+    )
+    if grant is None:
+        return None
+
+    client = google_client or build_google_integration_client(settings)
+    subscription = await session.scalar(
+        select(IntegrationSubscription).where(
+            IntegrationSubscription.account_id == account.id,
+            IntegrationSubscription.integration_key == integration_key,
+        )
+    )
+    if subscription is not None and subscription.status not in {
+        IntegrationSubscriptionStatus.STOPPED.value,
+        IntegrationSubscriptionStatus.EXPIRED.value,
+    }:
+        access_token = await get_valid_google_access_token(
+            session,
+            account=account,
+            settings=settings,
+            google_client=client,
+        )
+        if (
+            integration_key == "google_calendar"
+            and subscription.provider_resource_id
+            and not subscription.provider_subscription_id.startswith("pending:")
+        ):
+            await client.stop_calendar_watch(
+                access_token=access_token,
+                channel_id=subscription.provider_subscription_id,
+                resource_id=subscription.provider_resource_id,
+            )
+        elif integration_key == "gmail":
+            await client.stop_gmail_watch(access_token=access_token)
+
+    account_email = account.email
+    await session.delete(grant)
+    if subscription is not None:
+        await session.delete(subscription)
+    await session.flush()
+
+    active_grant_count = await session.scalar(
+        select(func.count())
+        .select_from(IntegrationGrant)
+        .where(
+            IntegrationGrant.account_id == account.id,
+            IntegrationGrant.status != IntegrationStatus.REVOKED.value,
+        )
+    )
+    provider_access_revoked = not active_grant_count
+    if provider_access_revoked:
+        if settings.integration_token_encryption_key is None:
+            raise IntegrationNotConfiguredError(
+                "Integration credential encryption is not configured"
+            )
+        vault = IntegrationCredentialVault(settings.integration_token_encryption_key)
+        credentials = vault.decrypt(account.credentials_ciphertext)
+        token = credentials.get("refresh_token") or credentials.get("access_token")
+        if isinstance(token, str):
+            await client.revoke_token(token)
+        await session.delete(account)
+    await session.flush()
+    return DisconnectedIntegration(
+        integration_key=integration_key,
+        account_id=account_id,
+        account_email=account_email,
+        provider_access_revoked=provider_access_revoked,
+    )
 
 
 def _as_utc(value: datetime) -> datetime:

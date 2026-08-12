@@ -17,6 +17,7 @@ from benji_api.services.auth import (
 )
 from benji_api.services.auth_rate_limit import AuthEligibilityRateLimiter
 from benji_api.services.users import resolve_user_from_phone
+from benji_api.services.waitlist_rate_limit import WaitlistRateLimiter
 
 
 @lru_cache
@@ -39,6 +40,29 @@ def get_auth_eligibility_rate_limiter(
         settings.auth_eligibility_ip_limit_per_minute,
         settings.auth_eligibility_ip_limit_per_hour,
         settings.auth_eligibility_identifier_limit_per_hour,
+    )
+
+
+@lru_cache
+def _waitlist_rate_limiter(
+    ip_per_minute: int,
+    ip_per_hour: int,
+    email_per_hour: int,
+) -> WaitlistRateLimiter:
+    return WaitlistRateLimiter(
+        ip_per_minute=ip_per_minute,
+        ip_per_hour=ip_per_hour,
+        email_per_hour=email_per_hour,
+    )
+
+
+def get_waitlist_rate_limiter(
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> WaitlistRateLimiter:
+    return _waitlist_rate_limiter(
+        settings.waitlist_ip_limit_per_minute,
+        settings.waitlist_ip_limit_per_hour,
+        settings.waitlist_email_limit_per_hour,
     )
 
 

@@ -1,0 +1,22 @@
+{
+  "name": "@dot/app-compiler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "date-fns": "4.1.0",
+    "esbuild": "0.25.12",
+    "linkedom": "0.18.13",
+    "lucide-react": "0.468.0",
+    "motion": "12.0.0",
+    "playwright-core": "1.55.0",
+    "quickjs-emscripten-core": "0.32.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "recharts": "2.15.0",
+    "typescript": "5.9.3"
+  }
+}

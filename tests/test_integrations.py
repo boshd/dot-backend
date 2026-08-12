@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from benji_api.agents.tools import (
+    DisconnectGoogleIntegrationTool,
     GetGmailMessageTool,
     GoogleCalendarEventsTool,
     ListConnectedIntegrationsTool,
@@ -34,6 +35,7 @@ from benji_api.integrations.types import (
 )
 from benji_api.main import app
 from benji_api.models import (
+    Conversation,
     IntegrationAccount,
     IntegrationGrant,
     IntegrationSubscription,
@@ -41,6 +43,7 @@ from benji_api.models import (
     UserEvent,
     WebhookEvent,
 )
+from benji_api.services.integration_credentials import IntegrationCredentialVault
 from benji_api.services.integrations import (
     complete_google_oauth,
     create_oauth_authorization,
@@ -92,6 +95,9 @@ class FakeGoogleClient:
     def __init__(self) -> None:
         self.last_code = ""
         self.calendar_tokens: dict[str, str] = {}
+        self.stopped_calendar_channels: list[tuple[str, str]] = []
+        self.gmail_stop_count = 0
+        self.revoked_tokens: list[str] = []
 
     def authorization_url(self, *, state: str, scopes: tuple[str, ...]) -> str:
         return f"https://accounts.example/authorize?state={state}&scope={' '.join(scopes)}"
@@ -147,6 +153,23 @@ class FakeGoogleClient:
             cursor="100",
             expires_at=datetime.now(UTC) + timedelta(days=7),
         )
+
+    async def stop_calendar_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        resource_id: str,
+    ) -> None:
+        del access_token
+        self.stopped_calendar_channels.append((channel_id, resource_id))
+
+    async def stop_gmail_watch(self, *, access_token: str) -> None:
+        del access_token
+        self.gmail_stop_count += 1
+
+    async def revoke_token(self, token: str) -> None:
+        self.revoked_tokens.append(token)
 
     async def list_calendar_events(
         self,
@@ -352,6 +375,7 @@ async def test_google_multi_account_connections_and_webhooks() -> None:
         assert [item["email"] for item in connected_by_key["gmail"]["accounts"]] == [
             "one@example.com"
         ]
+        assert connected_by_key["gmail"]["accounts"][0]["account_id"] == str(first_account.id)
 
         search_tool = SearchGmailTool(
             settings,
@@ -396,11 +420,30 @@ async def test_google_multi_account_connections_and_webhooks() -> None:
             "create_financial_goal",
             "list_financial_goals",
             "cancel_financial_goal",
+            "get_account_settings",
+            "update_account_setting",
+            "delete_dot_account",
+            "cancel_account_deletion",
             "create_personal_app",
+            "list_personal_apps",
+            "inspect_custom_app",
+            "create_custom_app_link",
+            "list_custom_app_records",
+            "add_custom_app_record",
+            "update_custom_app_record",
+            "delete_custom_app_record",
+            "revise_custom_app",
+            "rollback_custom_app",
+            "delete_personal_app",
+            "get_personal_app",
+            "add_personal_app_record",
+            "update_personal_app_record",
+            "delete_personal_app_record",
             "create_integration_connect_link",
             "get_calendar_events",
             "search_gmail",
             "get_gmail_message",
+            "disconnect_google_integration",
         ]
 
     async def override_session():
@@ -455,4 +498,88 @@ async def test_google_multi_account_connections_and_webhooks() -> None:
         )
         assert gmail_subscription is not None
         assert gmail_subscription.cursor == "101"
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_agent_disconnects_one_google_grant_without_breaking_the_other() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    encryption_key = Fernet.generate_key().decode()
+    settings = Settings(
+        integration_token_encryption_key=encryption_key,
+        google_oauth_client_id="google-client",
+        google_oauth_client_secret="google-secret",
+    )
+    fake_google = FakeGoogleClient()
+    vault = IntegrationCredentialVault(encryption_key)
+    async with session_factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        account = IntegrationAccount(
+            user_id=user.id,
+            provider="google",
+            provider_account_id="google-account-one",
+            email="one@example.com",
+            credentials_ciphertext=vault.encrypt(
+                {"access_token": "access-one", "refresh_token": "refresh-one"}
+            ),
+            granted_scopes=[CALENDAR_SCOPE, GMAIL_SCOPE],
+            token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        session.add(account)
+        await session.flush()
+        session.add_all(
+            [
+                IntegrationGrant(account_id=account.id, integration_key="google_calendar"),
+                IntegrationGrant(account_id=account.id, integration_key="gmail"),
+                IntegrationSubscription(
+                    account_id=account.id,
+                    integration_key="google_calendar",
+                    provider="google",
+                    provider_subscription_id="calendar-channel",
+                    provider_resource_id="calendar-resource",
+                ),
+                IntegrationSubscription(
+                    account_id=account.id,
+                    integration_key="gmail",
+                    provider="google",
+                    provider_subscription_id=f"gmail:{account.id}",
+                ),
+            ]
+        )
+        await session.commit()
+
+    tool = DisconnectGoogleIntegrationTool(
+        settings,
+        google_client=fake_google,  # type: ignore[arg-type]
+        session_factory=session_factory,
+    )
+    gmail_result = await tool.execute(
+        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+        arguments={"integration": "gmail", "account_id": str(account.id)},
+    )
+    assert gmail_result["disconnected"] is True
+    assert gmail_result["provider_access_revoked"] is False
+    assert fake_google.gmail_stop_count == 1
+    assert fake_google.revoked_tokens == []
+
+    calendar_result = await tool.execute(
+        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+        arguments={"integration": "google_calendar", "account_id": str(account.id)},
+    )
+    assert calendar_result["disconnected"] is True
+    assert calendar_result["provider_access_revoked"] is True
+    assert fake_google.stopped_calendar_channels == [("calendar-channel", "calendar-resource")]
+    assert fake_google.revoked_tokens == ["refresh-one"]
+    async with session_factory() as session:
+        assert await session.get(IntegrationAccount, account.id) is None
+        assert await session.scalar(select(func.count()).select_from(IntegrationGrant)) == 0
+        assert await session.scalar(select(func.count()).select_from(IntegrationSubscription)) == 0
     await engine.dispose()

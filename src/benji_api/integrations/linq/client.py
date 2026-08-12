@@ -1,4 +1,5 @@
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -39,6 +40,10 @@ class LinqClient:
 
     async def share_contact_card(self, *, chat_id: str) -> None:
         await self._request("POST", f"/chats/{chat_id}/share_contact_card")
+
+    async def delete_attachment(self, *, attachment_id: str) -> None:
+        safe_id = quote(attachment_id, safe="")
+        await self._request("DELETE", f"/attachments/{safe_id}")
 
     async def _request(
         self,

@@ -4,9 +4,21 @@ from uuid import UUID
 
 
 @dataclass(frozen=True, slots=True)
+class AgentAttachment:
+    kind: Literal["image", "file", "media"]
+    mime_type: str | None
+    filename: str | None
+    url: str | None
+    provider: str
+    provider_id: str | None = None
+    size_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentMessage:
     role: Literal["user", "assistant"]
     content: str
+    attachments: tuple[AgentAttachment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +96,9 @@ class ModelProvider(Protocol):
 class ToolContext:
     user_id: UUID
     conversation_id: UUID
+    agent_run_id: UUID | None = None
+    tool_call_id: str | None = None
+    delivery_provider: str | None = None
 
 
 class AgentTool(Protocol):

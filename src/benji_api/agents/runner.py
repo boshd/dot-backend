@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from benji_api.agents.conversation_output import (
@@ -95,7 +95,7 @@ class AgentRunner:
             for call in turn.tool_calls:
                 output, succeeded = await self._tools.execute(
                     name=call.name,
-                    context=context,
+                    context=replace(context, tool_call_id=call.call_id),
                     arguments=call.arguments,
                 )
                 executions.append(

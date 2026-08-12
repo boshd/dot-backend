@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
@@ -27,10 +28,28 @@ from benji_api.models import (
     Conversation,
     ConversationChannel,
     ConversationMember,
+    GeneratedApp,
+    GeneratedAppAccessTicket,
+    GeneratedAppMembership,
+    GeneratedAppSession,
     Message,
     User,
+    UserEvent,
 )
-from benji_api.services.groups import apply_linq_group_event
+from benji_api.services.generated_apps import archive_generated_app, list_generated_apps
+from benji_api.services.generated_apps_v2 import (
+    CodeAppAuthorizationError,
+    authorize_session,
+    authorize_user,
+    claim_next_build,
+    complete_build,
+    create_code_app_build,
+    redeem_access_ticket,
+)
+from benji_api.services.groups import (
+    apply_linq_group_event,
+    claim_group_owner,
+)
 
 
 class GroupModelProvider:
@@ -267,6 +286,69 @@ async def test_linq_group_owner_transfers_when_owner_leaves(
                     ),
                 ]
             )
+            app = GeneratedApp(
+                user_id=owner.id,
+                conversation_id=group.id,
+                public_id="linq-transfer-group-app",
+                title="Trip split",
+                description="",
+                template="code_app",
+                theme="dot",
+                access_mode="collaborative_link",
+                runtime_kind="code",
+                current_version=0,
+            )
+            session.add(app)
+            await session.flush()
+            expires_at = datetime.now(UTC) + timedelta(days=1)
+            owner_session = GeneratedAppSession(
+                app_id=app.id,
+                user_id=owner.id,
+                role="owner",
+                token_hash="1" * 64,
+                expires_at=expires_at,
+            )
+            anonymous_owner_session = GeneratedAppSession(
+                app_id=app.id,
+                role="owner",
+                token_hash="2" * 64,
+                expires_at=expires_at,
+            )
+            shared_member_session = GeneratedAppSession(
+                app_id=app.id,
+                role="member",
+                token_hash="3" * 64,
+                expires_at=expires_at,
+            )
+            owner_ticket = GeneratedAppAccessTicket(
+                app_id=app.id,
+                issued_by_user_id=owner.id,
+                principal_user_id=owner.id,
+                role="owner",
+                token_hash="4" * 64,
+                expires_at=expires_at,
+            )
+            shared_member_ticket = GeneratedAppAccessTicket(
+                app_id=app.id,
+                issued_by_user_id=owner.id,
+                role="member",
+                token_hash="5" * 64,
+                expires_at=expires_at,
+            )
+            session.add_all(
+                [
+                    GeneratedAppMembership(
+                        app_id=app.id,
+                        user_id=owner.id,
+                        role="owner",
+                    ),
+                    owner_session,
+                    anonymous_owner_session,
+                    shared_member_session,
+                    owner_ticket,
+                    shared_member_ticket,
+                ]
+            )
             await session.commit()
 
             handled = await apply_linq_group_event(
@@ -286,6 +368,15 @@ async def test_linq_group_owner_transfers_when_owner_leaves(
                     select(ConversationMember).where(ConversationMember.conversation_id == group.id)
                 )
             ).all()
+            memberships = list(
+                (
+                    await session.scalars(
+                        select(GeneratedAppMembership).where(
+                            GeneratedAppMembership.app_id == app.id
+                        )
+                    )
+                ).all()
+            )
 
         assert handled is True
         assert group.user_id == successor.id
@@ -293,3 +384,253 @@ async def test_linq_group_owner_transfers_when_owner_leaves(
         assert next(member for member in members if member.user_id == successor.id).role == (
             "owner"
         )
+        assert app.user_id == successor.id
+        assert [(item.user_id, item.role) for item in memberships] == [(successor.id, "owner")]
+        assert owner_session.revoked_at is not None
+        assert anonymous_owner_session.revoked_at is not None
+        assert shared_member_session.revoked_at is None
+        assert owner_ticket.expires_at < shared_member_ticket.expires_at
+        assert shared_member_ticket.issued_by_user_id == successor.id
+
+
+@pytest.mark.anyio
+async def test_unclaimed_group_revokes_departed_app_owner_until_later_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with (
+        group_test_app(monkeypatch) as (_, session_factory, _),
+        session_factory() as session,
+    ):
+        owner = User(phone_number="+14155552681", display_name="Alice")
+        session.add(owner)
+        await session.flush()
+        group = Conversation(
+            user_id=owner.id,
+            kind="group",
+            title="Trip",
+            group_owner_source="first_invoker",
+        )
+        session.add(group)
+        await session.flush()
+        owner_member = ConversationMember(
+            conversation_id=group.id,
+            user_id=owner.id,
+            external_handle=owner.phone_number,
+            role="owner",
+        )
+        future_owner_member = ConversationMember(
+            conversation_id=group.id,
+            external_handle="future-owner@example.com",
+            role="member",
+        )
+        session.add_all(
+            [
+                ConversationChannel(
+                    conversation_id=group.id,
+                    provider="linq",
+                    external_id="linq-unclaimed-chat",
+                ),
+                owner_member,
+                future_owner_member,
+            ]
+        )
+        app_record, _, _ = await create_code_app_build(
+            session,
+            user_id=owner.id,
+            conversation_id=group.id,
+            title="Trip split",
+            description="",
+            request={
+                "blueprint": {
+                    "manifest": {"schema_version": 1, "entities": [], "capabilities": []},
+                    "seed_data": {},
+                }
+            },
+        )
+        expires_at = datetime.now(UTC) + timedelta(days=1)
+        departed_owner_session = GeneratedAppSession(
+            app_id=app_record.id,
+            user_id=owner.id,
+            role="owner",
+            token_hash="6" * 64,
+            expires_at=expires_at,
+        )
+        anonymous_owner_session = GeneratedAppSession(
+            app_id=app_record.id,
+            role="owner",
+            token_hash="7" * 64,
+            expires_at=expires_at,
+        )
+        shared_member_session = GeneratedAppSession(
+            app_id=app_record.id,
+            role="member",
+            token_hash="8" * 64,
+            expires_at=expires_at,
+        )
+        departed_owner_ticket = GeneratedAppAccessTicket(
+            app_id=app_record.id,
+            issued_by_user_id=owner.id,
+            principal_user_id=owner.id,
+            role="owner",
+            token_hash="9" * 64,
+            expires_at=expires_at,
+        )
+        shared_member_ticket = GeneratedAppAccessTicket(
+            app_id=app_record.id,
+            issued_by_user_id=owner.id,
+            role="member",
+            token_hash="a" * 64,
+            expires_at=expires_at,
+        )
+        session.add_all(
+            [
+                departed_owner_session,
+                anonymous_owner_session,
+                shared_member_session,
+                departed_owner_ticket,
+                shared_member_ticket,
+            ]
+        )
+        await session.commit()
+
+        assert await apply_linq_group_event(
+            session,
+            event_type="participant.removed",
+            data={
+                "chat_id": "linq-unclaimed-chat",
+                "participant": {
+                    "handle": owner.phone_number,
+                    "status": "removed",
+                },
+            },
+        )
+        await session.commit()
+
+        assert group.group_owner_source == "unclaimed"
+        assert app_record.user_id == owner.id
+        assert departed_owner_session.revoked_at is not None
+        assert anonymous_owner_session.revoked_at is not None
+        assert shared_member_session.revoked_at is None
+        assert departed_owner_ticket.expires_at < shared_member_ticket.expires_at
+        assert not await session.scalar(
+            select(GeneratedAppMembership.id).where(
+                GeneratedAppMembership.app_id == app_record.id,
+                GeneratedAppMembership.user_id == owner.id,
+            )
+        )
+        with pytest.raises(CodeAppAuthorizationError):
+            await authorize_user(session, app_id=app_record.id, user_id=owner.id)
+        assert await list_generated_apps(session, user_id=owner.id) == []
+        assert (
+            await archive_generated_app(
+                session,
+                user_id=owner.id,
+                app_id=app_record.id,
+            )
+            is None
+        )
+
+        claim = await claim_next_build(session, worker_id="unclaimed-group-builder")
+        assert claim is not None
+        revision = await complete_build(
+            session,
+            job_id=claim.job_id,
+            worker_id="unclaimed-group-builder",
+            expected_attempt=claim.attempt,
+            manifest={"schema_version": 1, "entities": [], "capabilities": []},
+            source_files={"src/App.tsx": "export default function App() { return null }"},
+            artifact={},
+            artifact_url="artifact://unclaimed-group",
+            artifact_sha256="b" * 64,
+            sdk_version="1",
+            handoff_base_url=f"https://app.textdot.test/a/{app_record.public_id}",
+        )
+        assert revision.revision_number == 1
+        event = await session.scalar(
+            select(UserEvent).where(
+                UserEvent.event_type == "app.build.completed",
+                UserEvent.conversation_id == group.id,
+            )
+        )
+        assert event is not None
+        completion_url = str(event.payload["app_url"])
+        handoff = parse_qs(urlparse(completion_url).fragment)["handoff"][0]
+        active_tickets = list(
+            (
+                await session.scalars(
+                    select(GeneratedAppAccessTicket).where(
+                        GeneratedAppAccessTicket.app_id == app_record.id,
+                        GeneratedAppAccessTicket.expires_at > datetime.now(UTC),
+                    )
+                )
+            ).all()
+        )
+        assert active_tickets
+        assert all(ticket.principal_user_id is None for ticket in active_tickets)
+        assert all(ticket.role == "member" for ticket in active_tickets)
+        session_token, completed_session = await redeem_access_ticket(
+            session,
+            public_id=app_record.public_id,
+            token=handoff,
+        )
+        assert completed_session.user_id is None
+        assert completed_session.role == "member"
+        completed_actor = await authorize_session(
+            session,
+            app_id=app_record.id,
+            token=session_token,
+        )
+        assert completed_actor.user_id is None
+        assert completed_actor.role == "member"
+        with pytest.raises(CodeAppAuthorizationError):
+            await authorize_user(session, app_id=app_record.id, user_id=owner.id)
+
+        successor = User(phone_number="+14155552682", display_name="Bob")
+        session.add(successor)
+        await session.flush()
+        future_owner_member.user_id = successor.id
+        assert await claim_group_owner(
+            session,
+            conversation=group,
+            member=future_owner_member,
+        )
+        await session.commit()
+
+        assert group.user_id == successor.id
+        assert group.group_owner_source == "first_invoker"
+        assert app_record.user_id == successor.id
+        assert completed_session.revoked_at is None
+        assert completed_session.role == "member"
+        assert shared_member_session.revoked_at is None
+        assert shared_member_ticket.expires_at == expires_at
+        assert shared_member_ticket.issued_by_user_id == successor.id
+        claimed_active_tickets = list(
+            (
+                await session.scalars(
+                    select(GeneratedAppAccessTicket).where(
+                        GeneratedAppAccessTicket.app_id == app_record.id,
+                        GeneratedAppAccessTicket.expires_at > datetime.now(UTC),
+                    )
+                )
+            ).all()
+        )
+        assert claimed_active_tickets
+        assert all(ticket.issued_by_user_id == successor.id for ticket in claimed_active_tickets)
+        assert all(ticket.principal_user_id is None for ticket in claimed_active_tickets)
+        assert all(ticket.role == "member" for ticket in claimed_active_tickets)
+        new_membership = await session.scalar(
+            select(GeneratedAppMembership).where(
+                GeneratedAppMembership.app_id == app_record.id,
+                GeneratedAppMembership.user_id == successor.id,
+            )
+        )
+        assert new_membership is not None and new_membership.role == "owner"
+        assert (
+            await authorize_user(
+                session,
+                app_id=app_record.id,
+                user_id=successor.id,
+            )
+        ).role == "owner"
+        with pytest.raises(CodeAppAuthorizationError):
+            await authorize_user(session, app_id=app_record.id, user_id=owner.id)

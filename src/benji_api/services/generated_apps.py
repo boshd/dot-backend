@@ -1,20 +1,32 @@
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from benji_api.models.channel import Conversation, ConversationKind
+from benji_api.models.channel import (
+    Conversation,
+    ConversationKind,
+    ConversationMember,
+    ConversationMemberRole,
+    ConversationMemberStatus,
+)
 from benji_api.models.generated_app import (
     GeneratedApp,
     GeneratedAppAccessMode,
     GeneratedAppRecord,
     GeneratedAppStatus,
     GeneratedAppVersion,
+)
+from benji_api.models.generated_app_v2 import (
+    GeneratedAppAccessTicket,
+    GeneratedAppBuildJob,
+    GeneratedAppBuildStatus,
+    GeneratedAppSession,
 )
 from benji_api.models.user import utc_now
 from benji_api.services.generated_app_specs import (
@@ -24,6 +36,11 @@ from benji_api.services.generated_app_specs import (
     modules_from_specification,
     resolve_record_module,
     validate_module_record,
+)
+from benji_api.services.generated_apps_v2 import (
+    CodeAppAuthorizationError,
+    CodeAppNotFoundError,
+    authorize_user,
 )
 from benji_api.services.groups import group_app_participant_names, list_conversation_members
 
@@ -49,6 +66,38 @@ class GeneratedAppBundle:
     records: tuple[GeneratedAppRecord, ...]
 
 
+async def _locked_owned_conversation(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    user_id: UUID,
+) -> Conversation:
+    statement = select(Conversation).where(Conversation.id == conversation_id)
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    conversation = await session.scalar(statement.execution_options(populate_existing=True))
+    if conversation is None or conversation.user_id != user_id:
+        raise GeneratedAppValidationError("Conversation does not belong to this user")
+    if conversation.kind != ConversationKind.GROUP.value:
+        return conversation
+    if conversation.group_owner_source == "unclaimed":
+        raise GeneratedAppValidationError("This group does not currently have an app owner")
+    membership_statement = select(ConversationMember).where(
+        ConversationMember.conversation_id == conversation.id,
+        ConversationMember.user_id == user_id,
+        ConversationMember.status == ConversationMemberStatus.ACTIVE.value,
+        ConversationMember.role == ConversationMemberRole.OWNER.value,
+    )
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        membership_statement = membership_statement.with_for_update()
+    membership = await session.scalar(
+        membership_statement.execution_options(populate_existing=True)
+    )
+    if membership is None:
+        raise GeneratedAppValidationError("Only the active group owner can create an app")
+    return conversation
+
+
 async def create_generated_app(
     session: AsyncSession,
     *,
@@ -65,9 +114,11 @@ async def create_generated_app(
     target_direction: str | None,
     participants: list[str],
 ) -> GeneratedAppBundle:
-    conversation = await session.get(Conversation, conversation_id)
-    if conversation is None or conversation.user_id != user_id:
-        raise GeneratedAppValidationError("Conversation does not belong to this user")
+    conversation = await _locked_owned_conversation(
+        session,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
     if template not in APP_TEMPLATES:
         raise GeneratedAppValidationError("Unsupported app template")
     if theme not in APP_THEMES:
@@ -151,9 +202,11 @@ async def create_composable_generated_app(
     modules: list[dict[str, Any]],
     initial_records: list[dict[str, Any]],
 ) -> GeneratedAppBundle:
-    conversation = await session.get(Conversation, conversation_id)
-    if conversation is None or conversation.user_id != user_id:
-        raise GeneratedAppValidationError("Conversation does not belong to this user")
+    conversation = await _locked_owned_conversation(
+        session,
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
     if access_mode not in APP_ACCESS_MODES:
         raise GeneratedAppValidationError("Unsupported app access mode")
     if conversation.kind == ConversationKind.GROUP.value:
@@ -220,14 +273,86 @@ async def list_generated_apps(
         (
             await session.scalars(
                 select(GeneratedApp)
+                .join(Conversation, Conversation.id == GeneratedApp.conversation_id)
                 .where(
                     GeneratedApp.user_id == user_id,
+                    Conversation.user_id == user_id,
+                    or_(
+                        Conversation.kind != ConversationKind.GROUP.value,
+                        Conversation.group_owner_source.is_(None),
+                        Conversation.group_owner_source != "unclaimed",
+                    ),
                     GeneratedApp.status == GeneratedAppStatus.ACTIVE.value,
                 )
                 .order_by(GeneratedApp.updated_at.desc(), GeneratedApp.created_at.desc())
             )
         ).all()
     )
+
+
+async def archive_generated_app(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    app_id: UUID,
+) -> GeneratedApp | None:
+    """Disable an owned app and its public link without destroying its records."""
+    try:
+        actor = await authorize_user(session, app_id=app_id, user_id=user_id)
+    except (CodeAppAuthorizationError, CodeAppNotFoundError):
+        return None
+    app = await session.get(GeneratedApp, app_id)
+    if (
+        app is None
+        or actor.role != "owner"
+        or app.user_id != user_id
+        or app.status != GeneratedAppStatus.ACTIVE.value
+    ):
+        return None
+    now = datetime.now(UTC)
+    app.status = GeneratedAppStatus.ARCHIVED.value
+    app.updated_at = now
+    # Archiving disables every old bearer, not only discovery by the public URL. Otherwise a
+    # previously redeemed session can continue mutating data through the app-id action route.
+    await session.execute(
+        update(GeneratedAppSession)
+        .where(
+            GeneratedAppSession.app_id == app.id,
+            GeneratedAppSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    await session.execute(
+        update(GeneratedAppAccessTicket)
+        .where(
+            GeneratedAppAccessTicket.app_id == app.id,
+            GeneratedAppAccessTicket.expires_at > now,
+        )
+        .values(expires_at=now)
+    )
+    # A queued or leased build must not later reactivate or announce the archived app.
+    await session.execute(
+        update(GeneratedAppBuildJob)
+        .where(
+            GeneratedAppBuildJob.app_id == app.id,
+            GeneratedAppBuildJob.status.in_(
+                {
+                    GeneratedAppBuildStatus.QUEUED.value,
+                    GeneratedAppBuildStatus.CLAIMED.value,
+                }
+            ),
+        )
+        .values(
+            status=GeneratedAppBuildStatus.FAILED.value,
+            error="App was archived before its build completed",
+            claimed_by=None,
+            lease_expires_at=None,
+            completed_at=now,
+            updated_at=now,
+        )
+    )
+    await session.flush()
+    return app
 
 
 async def get_generated_app_by_public_id(
@@ -243,6 +368,30 @@ async def get_generated_app_by_public_id(
     )
     if app is None:
         raise GeneratedAppNotFoundError("App was not found")
+    return await _load_generated_app_bundle(session, app=app)
+
+
+async def get_owned_generated_app(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    app_id: UUID,
+) -> GeneratedAppBundle:
+    try:
+        actor = await authorize_user(session, app_id=app_id, user_id=user_id)
+    except (CodeAppAuthorizationError, CodeAppNotFoundError) as error:
+        raise GeneratedAppNotFoundError("App was not found") from error
+    app = await session.get(GeneratedApp, app_id)
+    if app is None or actor.role != "owner" or app.user_id != user_id:
+        raise GeneratedAppNotFoundError("App was not found")
+    return await _load_generated_app_bundle(session, app=app)
+
+
+async def _load_generated_app_bundle(
+    session: AsyncSession,
+    *,
+    app: GeneratedApp,
+) -> GeneratedAppBundle:
     version = await session.scalar(
         select(GeneratedAppVersion).where(
             GeneratedAppVersion.app_id == app.id,
@@ -273,6 +422,47 @@ async def create_generated_app_record(
     actor_name: str | None,
 ) -> GeneratedAppBundle:
     bundle = await get_generated_app_by_public_id(session, public_id=public_id)
+    updated, _ = await _create_generated_app_record(
+        session,
+        bundle=bundle,
+        module_id=module_id,
+        kind=kind,
+        data=data,
+        actor_name=actor_name,
+    )
+    return updated
+
+
+async def create_owned_generated_app_record(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    app_id: UUID,
+    module_id: str | None,
+    kind: str,
+    data: dict[str, Any],
+    actor_name: str | None,
+) -> tuple[GeneratedAppBundle, GeneratedAppRecord]:
+    bundle = await get_owned_generated_app(session, user_id=user_id, app_id=app_id)
+    return await _create_generated_app_record(
+        session,
+        bundle=bundle,
+        module_id=module_id,
+        kind=kind,
+        data=data,
+        actor_name=actor_name,
+    )
+
+
+async def _create_generated_app_record(
+    session: AsyncSession,
+    *,
+    bundle: GeneratedAppBundle,
+    module_id: str | None,
+    kind: str,
+    data: dict[str, Any],
+    actor_name: str | None,
+) -> tuple[GeneratedAppBundle, GeneratedAppRecord]:
     count = await session.scalar(
         select(func.count())
         .select_from(GeneratedAppRecord)
@@ -297,7 +487,7 @@ async def create_generated_app_record(
     session.add(record)
     bundle.app.updated_at = utc_now()
     await session.commit()
-    return await get_generated_app_by_public_id(session, public_id=public_id)
+    return await _load_generated_app_bundle(session, app=bundle.app), record
 
 
 async def update_generated_app_record(
@@ -308,6 +498,38 @@ async def update_generated_app_record(
     data: dict[str, Any],
 ) -> GeneratedAppBundle:
     bundle = await get_generated_app_by_public_id(session, public_id=public_id)
+    return await _update_generated_app_record(
+        session,
+        bundle=bundle,
+        record_id=record_id,
+        data=data,
+    )
+
+
+async def update_owned_generated_app_record(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    app_id: UUID,
+    record_id: UUID,
+    data: dict[str, Any],
+) -> GeneratedAppBundle:
+    bundle = await get_owned_generated_app(session, user_id=user_id, app_id=app_id)
+    return await _update_generated_app_record(
+        session,
+        bundle=bundle,
+        record_id=record_id,
+        data=data,
+    )
+
+
+async def _update_generated_app_record(
+    session: AsyncSession,
+    *,
+    bundle: GeneratedAppBundle,
+    record_id: UUID,
+    data: dict[str, Any],
+) -> GeneratedAppBundle:
     record = await session.get(GeneratedAppRecord, record_id)
     if record is None or record.app_id != bundle.app.id:
         raise GeneratedAppNotFoundError("App record was not found")
@@ -335,7 +557,7 @@ async def update_generated_app_record(
     record.data = clean_data
     bundle.app.updated_at = utc_now()
     await session.commit()
-    return await get_generated_app_by_public_id(session, public_id=public_id)
+    return await _load_generated_app_bundle(session, app=bundle.app)
 
 
 async def delete_generated_app_record(
@@ -345,6 +567,34 @@ async def delete_generated_app_record(
     record_id: UUID,
 ) -> GeneratedAppBundle:
     bundle = await get_generated_app_by_public_id(session, public_id=public_id)
+    return await _delete_generated_app_record(
+        session,
+        bundle=bundle,
+        record_id=record_id,
+    )
+
+
+async def delete_owned_generated_app_record(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    app_id: UUID,
+    record_id: UUID,
+) -> GeneratedAppBundle:
+    bundle = await get_owned_generated_app(session, user_id=user_id, app_id=app_id)
+    return await _delete_generated_app_record(
+        session,
+        bundle=bundle,
+        record_id=record_id,
+    )
+
+
+async def _delete_generated_app_record(
+    session: AsyncSession,
+    *,
+    bundle: GeneratedAppBundle,
+    record_id: UUID,
+) -> GeneratedAppBundle:
     record = await session.get(GeneratedAppRecord, record_id)
     if record is None or record.app_id != bundle.app.id:
         raise GeneratedAppNotFoundError("App record was not found")
@@ -353,7 +603,7 @@ async def delete_generated_app_record(
     bundle.app.updated_at = utc_now()
     await session.delete(record)
     await session.commit()
-    return await get_generated_app_by_public_id(session, public_id=public_id)
+    return await _load_generated_app_bundle(session, app=bundle.app)
 
 
 def generated_app_url(*, base_url: str, public_id: str) -> str:
@@ -438,9 +688,7 @@ async def _replace_group_seed_handles(
         else:
             continue
         matching = [
-            seed
-            for seed in result
-            if seed["module_id"] == module["id"] and seed["kind"] == kind
+            seed for seed in result if seed["module_id"] == module["id"] and seed["kind"] == kind
         ]
         has_unsafe_name = any(
             _unsafe_participant_name(str(seed["data"].get("name", ""))) for seed in matching
@@ -482,8 +730,7 @@ async def _replace_group_seed_handles(
 def _unsafe_participant_name(value: str) -> bool:
     clean = value.strip()
     return bool(
-        HANDLE_LIKE_PARTICIPANT.search(clean)
-        or clean.casefold() in {"group member", "everyone"}
+        HANDLE_LIKE_PARTICIPANT.search(clean) or clean.casefold() in {"group member", "everyone"}
     )
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -7,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from benji_api.agents.media import model_attachment
 from benji_api.agents.results import PersistedReply
 from benji_api.agents.types import AgentMessage
 from benji_api.db.session import async_session_factory
@@ -18,6 +20,7 @@ from benji_api.models.channel import (
     ConversationKind,
     DeliveryStatus,
     Message,
+    MessageAttachment,
     MessageDelivery,
     MessageDirection,
 )
@@ -46,6 +49,24 @@ async def load_recent_messages(
         .limit(limit)
     )
     rows = list(reversed(result.all()))
+    attachment_rows = []
+    message_ids = [message.id for message, _ in rows]
+    if message_ids:
+        attachment_rows = list(
+            (
+                await session.scalars(
+                    select(MessageAttachment)
+                    .where(MessageAttachment.message_id.in_(message_ids))
+                    .order_by(
+                        MessageAttachment.message_id,
+                        MessageAttachment.part_index,
+                    )
+                )
+            ).all()
+        )
+    attachments_by_message: dict[UUID, list[MessageAttachment]] = defaultdict(list)
+    for attachment in attachment_rows:
+        attachments_by_message[attachment.message_id].append(attachment)
     return [
         AgentMessage(
             role=("user" if message.direction == MessageDirection.INBOUND.value else "assistant"),
@@ -54,6 +75,9 @@ async def load_recent_messages(
                 if conversation.kind == ConversationKind.GROUP.value
                 and message.direction == MessageDirection.INBOUND.value
                 else message.content
+            ),
+            attachments=tuple(
+                model_attachment(attachment) for attachment in attachments_by_message[message.id]
             ),
         )
         for message, sender in rows

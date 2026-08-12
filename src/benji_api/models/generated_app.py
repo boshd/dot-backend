@@ -45,6 +45,7 @@ class GeneratedApp(Base):
         String(32), default=GeneratedAppStatus.ACTIVE.value, nullable=False
     )
     current_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    runtime_kind: Mapped[str] = mapped_column(String(24), default="legacy", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

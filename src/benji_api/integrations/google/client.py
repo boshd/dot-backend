@@ -21,6 +21,7 @@ from benji_api.integrations.types import (
 
 GOOGLE_AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKEN_REVOCATION_URL = "https://oauth2.googleapis.com/revoke"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3"
 GOOGLE_GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
@@ -164,6 +165,54 @@ class GoogleIntegrationClient:
             expires_at=_milliseconds_datetime(payload.get("expiration")),
         )
 
+    async def stop_calendar_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        resource_id: str,
+    ) -> None:
+        response = await _request(
+            "POST",
+            f"{GOOGLE_CALENDAR_API}/channels/stop",
+            timeout=self.timeout_seconds,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"id": channel_id, "resourceId": resource_id},
+        )
+        _ensure_success(
+            response,
+            "Google Calendar notification shutdown failed",
+            already_gone_statuses={404, 410},
+        )
+
+    async def stop_gmail_watch(self, *, access_token: str) -> None:
+        response = await _request(
+            "POST",
+            f"{GOOGLE_GMAIL_API}/users/me/stop",
+            timeout=self.timeout_seconds,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        _ensure_success(
+            response,
+            "Gmail notification shutdown failed",
+            already_gone_statuses={404, 410},
+        )
+
+    async def revoke_token(self, token: str) -> None:
+        response = await _request(
+            "POST",
+            GOOGLE_TOKEN_REVOCATION_URL,
+            timeout=self.timeout_seconds,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"token": token},
+        )
+        # Google's invalid-token response means the credential is already unusable.
+        _ensure_success(
+            response,
+            "Google access revocation failed",
+            already_gone_statuses={400},
+        )
+
     async def list_calendar_events(
         self,
         *,
@@ -294,6 +343,27 @@ def _json_response(response: httpx.Response, fallback: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise GoogleProviderError(fallback)
     return payload
+
+
+def _ensure_success(
+    response: httpx.Response,
+    fallback: str,
+    *,
+    already_gone_statuses: set[int] | None = None,
+) -> None:
+    if response.status_code in (already_gone_statuses or set()):
+        return
+    if not response.is_error:
+        return
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise GoogleProviderError(fallback) from error
+    detail = payload.get("error_description") if isinstance(payload, dict) else None
+    if not isinstance(detail, str) and isinstance(payload, dict):
+        nested = payload.get("error")
+        detail = nested.get("message") if isinstance(nested, dict) else nested
+    raise GoogleProviderError(detail if isinstance(detail, str) else fallback)
 
 
 async def _request(

@@ -3,7 +3,17 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from benji_api.db.base import Base
@@ -17,6 +27,7 @@ class AgentRunStatus(StrEnum):
 
 
 class ToolCallStatus(StrEnum):
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -84,7 +95,14 @@ class AgentRun(Base):
 
 class AgentToolCall(Base):
     __tablename__ = "agent_tool_calls"
-    __table_args__ = (Index("ix_agent_tool_calls_agent_run_id", "agent_run_id"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_run_id",
+            "external_call_id",
+            name="uq_agent_tool_calls_run_external_call",
+        ),
+        Index("ix_agent_tool_calls_agent_run_id", "agent_run_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     agent_run_id: Mapped[UUID] = mapped_column(
@@ -95,6 +113,9 @@ class AgentToolCall(Base):
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     output: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

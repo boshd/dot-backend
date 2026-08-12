@@ -21,7 +21,15 @@ from benji_api.models import (  # noqa: F401
     FinancialLinkSession,
     FinancialTransaction,
     GeneratedApp,
+    GeneratedAppAccessTicket,
+    GeneratedAppBuildJob,
+    GeneratedAppDataRecord,
+    GeneratedAppDeployment,
+    GeneratedAppEvent,
+    GeneratedAppMembership,
     GeneratedAppRecord,
+    GeneratedAppRevision,
+    GeneratedAppSession,
     GeneratedAppVersion,
     IntegrationAccount,
     IntegrationConnectLink,
@@ -38,6 +46,7 @@ from benji_api.models import (  # noqa: F401
     ScheduledTask,
     User,
     UserEvent,
+    WaitlistEntry,
     WebhookEvent,
 )
 

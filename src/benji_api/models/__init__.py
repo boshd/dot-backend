@@ -19,6 +19,7 @@ from benji_api.models.channel import (
     DeliveryStatus,
     GroupResponseMode,
     Message,
+    MessageAttachment,
     MessageDelivery,
     MessageDirection,
     MessageStatus,
@@ -41,6 +42,20 @@ from benji_api.models.generated_app import (
     GeneratedAppRecord,
     GeneratedAppStatus,
     GeneratedAppVersion,
+)
+from benji_api.models.generated_app_v2 import (
+    GeneratedAppAccessTicket,
+    GeneratedAppBuildJob,
+    GeneratedAppBuildStatus,
+    GeneratedAppDataRecord,
+    GeneratedAppDeployment,
+    GeneratedAppEvent,
+    GeneratedAppMembership,
+    GeneratedAppRevision,
+    GeneratedAppRevisionStatus,
+    GeneratedAppRole,
+    GeneratedAppRuntimeKind,
+    GeneratedAppSession,
 )
 from benji_api.models.integration import (
     IntegrationAccount,
@@ -74,6 +89,7 @@ from benji_api.models.user import (
     UserIdentifierStatus,
 )
 from benji_api.models.user_event import UserEvent, UserEventStatus
+from benji_api.models.waitlist import WaitlistEntry, WaitlistStatus
 
 __all__ = [
     "AgentFollowUp",
@@ -104,6 +120,18 @@ __all__ = [
     "GeneratedAppRecord",
     "GeneratedAppStatus",
     "GeneratedAppVersion",
+    "GeneratedAppAccessTicket",
+    "GeneratedAppBuildJob",
+    "GeneratedAppBuildStatus",
+    "GeneratedAppDataRecord",
+    "GeneratedAppDeployment",
+    "GeneratedAppEvent",
+    "GeneratedAppMembership",
+    "GeneratedAppRevision",
+    "GeneratedAppRevisionStatus",
+    "GeneratedAppRole",
+    "GeneratedAppRuntimeKind",
+    "GeneratedAppSession",
     "GroupResponseMode",
     "IntegrationAccount",
     "IntegrationConnectLink",
@@ -114,6 +142,7 @@ __all__ = [
     "IntegrationSubscriptionStatus",
     "MessageDirection",
     "Message",
+    "MessageAttachment",
     "MessageDelivery",
     "MessageStatus",
     "MemoryEntity",
@@ -137,4 +166,6 @@ __all__ = [
     "UserEventStatus",
     "WebhookEvent",
     "WebhookStatus",
+    "WaitlistEntry",
+    "WaitlistStatus",
 ]

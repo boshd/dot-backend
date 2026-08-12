@@ -157,6 +157,15 @@ class Settings:
             1, int(_env("AUTH_ELIGIBILITY_IDENTIFIER_LIMIT_PER_HOUR", "10"))
         )
     )
+    waitlist_ip_limit_per_minute: int = field(
+        default_factory=lambda: max(1, int(_env("WAITLIST_IP_LIMIT_PER_MINUTE", "10")))
+    )
+    waitlist_ip_limit_per_hour: int = field(
+        default_factory=lambda: max(1, int(_env("WAITLIST_IP_LIMIT_PER_HOUR", "60")))
+    )
+    waitlist_email_limit_per_hour: int = field(
+        default_factory=lambda: max(1, int(_env("WAITLIST_EMAIL_LIMIT_PER_HOUR", "6")))
+    )
     linq_api_key: str | None = field(default_factory=lambda: _optional_env("LINQ_API_KEY"))
     linq_webhook_secret: str | None = field(
         default_factory=lambda: _optional_env("LINQ_WEBHOOK_SECRET")

@@ -19,7 +19,15 @@ from benji_api.models import (
     FinancialLinkSession,
     FinancialTransaction,
     GeneratedApp,
+    GeneratedAppAccessTicket,
+    GeneratedAppBuildJob,
+    GeneratedAppDataRecord,
+    GeneratedAppDeployment,
+    GeneratedAppEvent,
+    GeneratedAppMembership,
     GeneratedAppRecord,
+    GeneratedAppRevision,
+    GeneratedAppSession,
     GeneratedAppVersion,
     IntegrationAccount,
     IntegrationConnectLink,
@@ -54,6 +62,13 @@ class UserResetPlan:
     generated_app_ids: tuple[UUID, ...]
     generated_app_version_ids: tuple[UUID, ...]
     generated_app_record_ids: tuple[UUID, ...]
+    generated_app_revision_ids: tuple[UUID, ...]
+    generated_app_build_job_ids: tuple[UUID, ...]
+    generated_app_membership_ids: tuple[UUID, ...]
+    generated_app_data_record_ids: tuple[UUID, ...]
+    generated_app_event_ids: tuple[UUID, ...]
+    generated_app_access_ticket_ids: tuple[UUID, ...]
+    generated_app_session_ids: tuple[UUID, ...]
     auth_identity_ids: tuple[UUID, ...]
     integration_account_ids: tuple[UUID, ...]
     integration_grant_ids: tuple[UUID, ...]
@@ -91,6 +106,13 @@ class UserResetPlan:
                 len(self.generated_app_ids),
                 len(self.generated_app_version_ids),
                 len(self.generated_app_record_ids),
+                len(self.generated_app_revision_ids),
+                len(self.generated_app_build_job_ids),
+                len(self.generated_app_membership_ids),
+                len(self.generated_app_data_record_ids),
+                len(self.generated_app_event_ids),
+                len(self.generated_app_access_ticket_ids),
+                len(self.generated_app_session_ids),
                 len(self.auth_identity_ids),
                 len(self.integration_account_ids),
                 len(self.integration_grant_ids),
@@ -158,6 +180,13 @@ async def build_user_reset_plan(
     generated_app_ids: tuple[UUID, ...] = ()
     generated_app_version_ids: tuple[UUID, ...] = ()
     generated_app_record_ids: tuple[UUID, ...] = ()
+    generated_app_revision_ids: tuple[UUID, ...] = ()
+    generated_app_build_job_ids: tuple[UUID, ...] = ()
+    generated_app_membership_ids: tuple[UUID, ...] = ()
+    generated_app_data_record_ids: tuple[UUID, ...] = ()
+    generated_app_event_ids: tuple[UUID, ...] = ()
+    generated_app_access_ticket_ids: tuple[UUID, ...] = ()
+    generated_app_session_ids: tuple[UUID, ...] = ()
     auth_identity_ids: tuple[UUID, ...] = ()
     integration_account_ids: tuple[UUID, ...] = ()
     integration_grant_ids: tuple[UUID, ...] = ()
@@ -314,10 +343,18 @@ async def build_user_reset_plan(
                 )
             ).all()
         )
+        # A user's reset must also remove group apps attached to conversations they own. Group
+        # ownership can move independently of the historical ``GeneratedApp.user_id`` during
+        # participant transitions, so select both authority paths before deleting conversations.
         generated_app_ids = tuple(
             (
                 await session.scalars(
-                    select(GeneratedApp.id).where(GeneratedApp.user_id == user_id)
+                    select(GeneratedApp.id).where(
+                        or_(
+                            GeneratedApp.user_id == user_id,
+                            GeneratedApp.conversation_id.in_(conversation_ids),
+                        )
+                    )
                 )
             ).all()
         )
@@ -336,6 +373,69 @@ async def build_user_reset_plan(
                     await session.scalars(
                         select(GeneratedAppRecord.id).where(
                             GeneratedAppRecord.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_revision_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppRevision.id).where(
+                            GeneratedAppRevision.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_build_job_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppBuildJob.id).where(
+                            GeneratedAppBuildJob.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_membership_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppMembership.id).where(
+                            GeneratedAppMembership.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_data_record_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppDataRecord.id).where(
+                            GeneratedAppDataRecord.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_event_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppEvent.id).where(
+                            GeneratedAppEvent.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_access_ticket_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppAccessTicket.id).where(
+                            GeneratedAppAccessTicket.app_id.in_(generated_app_ids)
+                        )
+                    )
+                ).all()
+            )
+            generated_app_session_ids = tuple(
+                (
+                    await session.scalars(
+                        select(GeneratedAppSession.id).where(
+                            GeneratedAppSession.app_id.in_(generated_app_ids)
                         )
                     )
                 ).all()
@@ -449,6 +549,13 @@ async def build_user_reset_plan(
         generated_app_ids=generated_app_ids,
         generated_app_version_ids=generated_app_version_ids,
         generated_app_record_ids=generated_app_record_ids,
+        generated_app_revision_ids=generated_app_revision_ids,
+        generated_app_build_job_ids=generated_app_build_job_ids,
+        generated_app_membership_ids=generated_app_membership_ids,
+        generated_app_data_record_ids=generated_app_data_record_ids,
+        generated_app_event_ids=generated_app_event_ids,
+        generated_app_access_ticket_ids=generated_app_access_ticket_ids,
+        generated_app_session_ids=generated_app_session_ids,
         auth_identity_ids=auth_identity_ids,
         integration_account_ids=integration_account_ids,
         integration_grant_ids=integration_grant_ids,
@@ -514,6 +621,54 @@ async def execute_user_reset(session: AsyncSession, plan: UserResetPlan) -> None
         await session.execute(
             delete(GeneratedAppRecord).where(
                 GeneratedAppRecord.id.in_(plan.generated_app_record_ids)
+            )
+        )
+    if plan.generated_app_event_ids:
+        await session.execute(
+            delete(GeneratedAppEvent).where(
+                GeneratedAppEvent.id.in_(plan.generated_app_event_ids)
+            )
+        )
+    if plan.generated_app_session_ids:
+        await session.execute(
+            delete(GeneratedAppSession).where(
+                GeneratedAppSession.id.in_(plan.generated_app_session_ids)
+            )
+        )
+    if plan.generated_app_access_ticket_ids:
+        await session.execute(
+            delete(GeneratedAppAccessTicket).where(
+                GeneratedAppAccessTicket.id.in_(plan.generated_app_access_ticket_ids)
+            )
+        )
+    if plan.generated_app_data_record_ids:
+        await session.execute(
+            delete(GeneratedAppDataRecord).where(
+                GeneratedAppDataRecord.id.in_(plan.generated_app_data_record_ids)
+            )
+        )
+    if plan.generated_app_build_job_ids:
+        await session.execute(
+            delete(GeneratedAppBuildJob).where(
+                GeneratedAppBuildJob.id.in_(plan.generated_app_build_job_ids)
+            )
+        )
+    if plan.generated_app_membership_ids:
+        await session.execute(
+            delete(GeneratedAppMembership).where(
+                GeneratedAppMembership.id.in_(plan.generated_app_membership_ids)
+            )
+        )
+    if plan.generated_app_ids:
+        await session.execute(
+            delete(GeneratedAppDeployment).where(
+                GeneratedAppDeployment.app_id.in_(plan.generated_app_ids)
+            )
+        )
+    if plan.generated_app_revision_ids:
+        await session.execute(
+            delete(GeneratedAppRevision).where(
+                GeneratedAppRevision.id.in_(plan.generated_app_revision_ids)
             )
         )
     if plan.generated_app_version_ids:

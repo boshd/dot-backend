@@ -138,7 +138,8 @@ Automated replies can be disabled without stopping webhook ingestion by setting
 After onboarding is complete, inbound messages are handled by the provider-neutral
 agent runner. It loads recent persisted cross-channel messages as context, applies the
 code-versioned Dot prompt, executes registered tools through a bounded tool loop,
-persists the run and tool calls, and sends 1–4 ordered reply bubbles through Linq or web.
+persists the run and tool calls, and sends the model's naturally segmented ordered reply bubbles
+through Linq or web.
 
 OpenAI's Responses API is the first model adapter. Add `OPENAI_API_KEY` to the
 parent `.env` and run `make start`. The default conversation model is `gpt-5.6-terra`; change it
@@ -150,9 +151,13 @@ accounts, search Gmail, and read a selected result. Every query resolves active 
 current `user_id`; access tokens stay in the provider adapter and never enter model context.
 Retrieved integration content is treated as untrusted external data.
 
-The registry can also create a reviewed template-backed mini-app after an explicit user request.
-The tool selects budget, expense-splitter, numeric-tracker, or checklist configuration and returns
-an unguessable web link; it never executes model-authored application code.
+The registry can also queue a custom app after an explicit user request. A dedicated worker
+generates React/TypeScript against Dot's fixed UI/runtime SDK, applies source policy, compiles it,
+then runs a bounded QuickJS-WASM startup/security gate followed by manifest-derived interaction and
+persistence checks in real Chromium before promoting an immutable revision. Dot is woken on
+completion and sends the stable private or collaborative link. In the product, generated JavaScript
+runs in an opaque-origin, network-blocked iframe and reaches schema-checked managed records only
+through a narrow validated bridge. Legacy declarative mini-apps remain available during migration.
 
 Current public information is available through the provider-neutral `search_web` tool. Its first
 adapter uses OpenAI Responses native web search in a separate retrieval call, then returns a
@@ -205,7 +210,7 @@ Memory data is separate from integration documents. Users can inspect or permane
 forget specific memories conversationally through guarded tools. See
 [`../docs/memory.md`](../docs/memory.md) for the storage and processing model.
 
-Generated apps use a versioned, composable module specification with validated module-scoped
-records and a bounded custom-collection escape hatch. See
-[`../docs/generated-apps.md`](../docs/generated-apps.md) for the public contract and compatibility
-rules.
+Generated apps use real React/TypeScript over a fixed branded UI/runtime SDK, with immutable
+revisions, schema-validated records, private or collaborative access, and bounded capabilities.
+See [`../docs/generated-apps.md`](../docs/generated-apps.md) for the platform contract and legacy
+compatibility rules.

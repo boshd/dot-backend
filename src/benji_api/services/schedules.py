@@ -191,6 +191,14 @@ async def dispatch_due_scheduled_task(
                 delivery_provider=task.delivery_provider,
                 session_factory=factory,
             )
+        elif task.action_type == "account.delete":
+            from benji_api.services.account_management import execute_account_deletion
+
+            await execute_account_deletion(
+                user_id=task.user_id,
+                settings=settings,
+                session_factory=factory,
+            )
         else:
             raise RuntimeError(f"No scheduled action handler for {task.action_type}")
         await _complete_task(factory, task.id)
@@ -217,6 +225,10 @@ async def _dispatch_agent_reachout(
                 "schedule_id": str(task.id),
                 "title": task.title,
                 "goal": task.payload.get("goal"),
+                "schedule_source": task.source,
+                "tool_policy": task.payload.get("tool_policy"),
+                "generated_app_id": task.payload.get("generated_app_id"),
+                "generated_app_title": task.payload.get("generated_app_title"),
                 "scheduled_for": scheduled_for.isoformat(),
                 "timezone": task.timezone,
                 "recurrence": task.recurrence,

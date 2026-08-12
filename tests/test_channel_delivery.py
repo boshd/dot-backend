@@ -7,13 +7,16 @@ from sqlalchemy.pool import StaticPool
 from benji_api.agents.channel_delivery import (
     deliver_linq_replies,
     inter_bubble_typing_delay,
+    load_recent_messages,
 )
 from benji_api.agents.results import PersistedReply
 from benji_api.db.base import Base
 from benji_api.models.channel import (
     Conversation,
     ConversationChannel,
+    ConversationKind,
     Message,
+    MessageAttachment,
     MessageDirection,
     MessageStatus,
 )
@@ -44,6 +47,70 @@ class TimelineLinqClient:
     async def stop_typing(self, *, chat_id: str) -> None:
         del chat_id
         self.timeline.append("typing:off")
+
+
+@pytest.mark.anyio
+async def test_recent_message_media_is_scoped_to_its_conversation() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    async with factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.flush()
+        direct = Conversation(user_id=user.id)
+        group = Conversation(user_id=user.id, kind=ConversationKind.GROUP.value)
+        session.add_all([direct, group])
+        await session.flush()
+        direct_message = Message(
+            conversation_id=direct.id,
+            user_id=user.id,
+            source_channel="linq",
+            direction=MessageDirection.INBOUND.value,
+            status=MessageStatus.RECEIVED.value,
+            content="private photo",
+        )
+        group_message = Message(
+            conversation_id=group.id,
+            user_id=user.id,
+            source_channel="linq",
+            direction=MessageDirection.INBOUND.value,
+            status=MessageStatus.RECEIVED.value,
+            content="group photo",
+            raw_payload={"_sender_label": "Sam"},
+        )
+        session.add_all([direct_message, group_message])
+        await session.flush()
+        session.add_all(
+            [
+                MessageAttachment(
+                    message_id=direct_message.id,
+                    provider="linq",
+                    provider_attachment_id="private",
+                    part_index=0,
+                    mime_type="image/jpeg",
+                    source_url="https://cdn.linqapp.com/attachments/partners/p/private/a.jpg",
+                ),
+                MessageAttachment(
+                    message_id=group_message.id,
+                    provider="linq",
+                    provider_attachment_id="group",
+                    part_index=0,
+                    mime_type="image/jpeg",
+                    source_url="https://cdn.linqapp.com/attachments/partners/p/group/b.jpg",
+                ),
+            ]
+        )
+        await session.commit()
+
+        messages = await load_recent_messages(session, conversation_id=group.id, limit=20)
+
+    assert len(messages) == 1
+    assert messages[0].content == "[Sam]: group photo"
+    assert [attachment.provider_id for attachment in messages[0].attachments] == ["group"]
+    await engine.dispose()
 
 
 def test_inter_bubble_typing_delay_is_length_aware_bounded_and_disableable() -> None:

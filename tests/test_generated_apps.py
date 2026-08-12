@@ -1,12 +1,18 @@
-from uuid import UUID
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from benji_api.agents.tools import CreateGeneratedAppTool
+from benji_api.agents.tools import (
+    CreateGeneratedAppRecordTool,
+    CreateGeneratedAppTool,
+    DeleteGeneratedAppRecordTool,
+    DeleteGeneratedAppTool,
+    GetGeneratedAppTool,
+    ListGeneratedAppsTool,
+    UpdateGeneratedAppRecordTool,
+)
 from benji_api.agents.types import ToolContext
 from benji_api.config import Settings, get_settings
 from benji_api.db.base import Base
@@ -15,7 +21,65 @@ from benji_api.main import app
 from benji_api.models.channel import Conversation, ConversationKind, ConversationMember
 from benji_api.models.generated_app import GeneratedAppRecord
 from benji_api.models.user import OnboardingStatus, OnboardingStep, User
-from benji_api.services.generated_apps import create_generated_app
+from benji_api.services.generated_apps import (
+    GeneratedAppNotFoundError,
+    create_composable_generated_app,
+    create_generated_app,
+)
+
+
+async def _create_legacy_app(
+    session_factory,
+    *,
+    user_id,
+    conversation_id,
+    arguments,
+):
+    """Keep legacy runtime coverage independent from the v2 conversation build tool."""
+
+    async with session_factory() as session:
+        if "modules" in arguments:
+            return await create_composable_generated_app(
+                session,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                title=arguments["title"],
+                description=arguments["description"],
+                theme=arguments["theme"],
+                access_mode=arguments["access_mode"],
+                modules=arguments["modules"],
+                initial_records=arguments["initial_records"],
+            )
+        return await create_generated_app(
+            session,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            title=arguments["title"],
+            description=arguments["description"],
+            template=arguments["template"],
+            theme=arguments["theme"],
+            access_mode=arguments["access_mode"],
+            currency=arguments["currency"],
+            unit=arguments["unit"],
+            target_number=arguments["target_number"],
+            target_direction=arguments["target_direction"],
+            participants=arguments["participants"],
+        )
+
+
+def test_get_generated_app_tool_schema_declares_record_controls() -> None:
+    definition = GetGeneratedAppTool(Settings()).definition
+
+    assert set(definition.parameters["properties"]) == {
+        "app_id",
+        "record_kind",
+        "record_limit",
+    }
+    assert set(definition.parameters["required"]) == {
+        "app_id",
+        "record_kind",
+        "record_limit",
+    }
 
 
 @pytest.mark.anyio
@@ -43,9 +107,10 @@ async def test_agent_creates_app_and_public_api_persists_records() -> None:
         web_chat_dev_identity_enabled=True,
         generated_app_public_url="https://benji.example",
     )
-    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
-    result = await tool.execute(
-        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+    bundle = await _create_legacy_app(
+        session_factory,
+        user_id=user.id,
+        conversation_id=conversation.id,
         arguments={
             "template": "budget",
             "title": "Cairo spending",
@@ -59,8 +124,41 @@ async def test_agent_creates_app_and_public_api_persists_records() -> None:
             "participants": [],
         },
     )
-    public_id = result["app_url"].rsplit("/", 1)[-1]
-    assert result["app_url"] == f"https://benji.example/apps/{public_id}"
+    result = {
+        "app_id": str(bundle.app.id),
+        "app_url": f"https://benji.example/apps/{bundle.app.public_id}",
+    }
+    public_id = bundle.app.public_id
+
+    context = ToolContext(user_id=user.id, conversation_id=conversation.id)
+    inspected = await GetGeneratedAppTool(
+        settings,
+        session_factory=session_factory,
+    ).execute(
+        context=context,
+        arguments={"app_id": result["app_id"], "record_kind": None, "record_limit": 100},
+    )
+    assert inspected["app_id"] == result["app_id"]
+    assert inspected["records"] == []
+
+    async with session_factory() as session:
+        other_user = User(phone_number="+14155552672")
+        session.add(other_user)
+        await session.flush()
+        other_conversation = Conversation(user_id=other_user.id)
+        session.add(other_conversation)
+        await session.commit()
+    with pytest.raises(GeneratedAppNotFoundError):
+        await GetGeneratedAppTool(
+            settings,
+            session_factory=session_factory,
+        ).execute(
+            context=ToolContext(
+                user_id=other_user.id,
+                conversation_id=other_conversation.id,
+            ),
+            arguments={"app_id": result["app_id"], "record_kind": None, "record_limit": 100},
+        )
 
     async def override_session():
         async with session_factory() as session:
@@ -113,9 +211,144 @@ async def test_agent_creates_app_and_public_api_persists_records() -> None:
             removed = await client.delete(f"/api/v1/apps/public/{public_id}/records/{record['id']}")
             assert removed.status_code == 200
             assert removed.json()["records"] == []
+
+            listed = await ListGeneratedAppsTool(
+                settings,
+                session_factory=session_factory,
+            ).execute(
+                context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+                arguments={},
+            )
+            assert listed["count"] == 1
+            assert listed["apps"][0]["title"] == "Cairo spending"
+            assert listed["apps"][0]["app_url"] == result["app_url"]
+
+            deleted = await DeleteGeneratedAppTool(
+                session_factory=session_factory,
+            ).execute(
+                context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+                arguments={"app_id": result["app_id"]},
+            )
+            assert deleted == {
+                "app_id": result["app_id"],
+                "deleted": True,
+                "message_hint": (
+                    "The app and its public link are disabled. Do not share the old link as active."
+                ),
+            }
+            assert (await client.get(f"/api/v1/apps/public/{public_id}")).status_code == 404
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_agent_manages_owned_app_records_with_existing_validation() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with session_factory() as session:
+        user = User(phone_number="+14155552671", display_name="Kareem")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.commit()
+
+    settings = Settings(generated_app_public_url="https://dot.example")
+    context = ToolContext(user_id=user.id, conversation_id=conversation.id)
+    app_bundle = await _create_legacy_app(
+        session_factory,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        arguments={
+            "title": "Cairo spending",
+            "description": "Daily expenses",
+            "theme": "coral",
+            "access_mode": "private_link",
+            "modules": [
+                {
+                    "id": "expenses",
+                    "type": "expenses",
+                    "title": "Expenses",
+                    "description": "What I spent",
+                    "settings": {"currency": "EGP", "budget": 10_000, "mode": "personal"},
+                }
+            ],
+            "initial_records": [],
+        },
+    )
+    app_result = {"app_id": str(app_bundle.app.id)}
+    record = {
+        "module_id": "expenses",
+        "kind": "expense",
+        "actor_name": None,
+        "data": {
+            "amount": 125,
+            "category": "food",
+            "note": "lunch",
+            "date": "2026-08-10",
+            "paid_by": None,
+            "split_between": [],
+        },
+    }
+    created = await CreateGeneratedAppRecordTool(
+        settings,
+        session_factory=session_factory,
+    ).execute(
+        context=context,
+        arguments={"app_id": app_result["app_id"], "record": record},
+    )
+    record_id = created["created_record_id"]
+    assert created["records"][0]["actor_name"] == "Kareem"
+    assert created["records"][0]["data"]["amount"] == 125.0
+
+    inspected = await GetGeneratedAppTool(
+        settings,
+        session_factory=session_factory,
+    ).execute(
+        context=context,
+        arguments={
+            "app_id": app_result["app_id"],
+            "record_kind": "expense",
+            "record_limit": 10,
+        },
+    )
+    assert inspected["record_count"] == 1
+    assert inspected["records"][0]["record_id"] == record_id
+
+    record["data"] = {**record["data"], "amount": 150, "note": "lunch and coffee"}
+    updated = await UpdateGeneratedAppRecordTool(
+        settings,
+        session_factory=session_factory,
+    ).execute(
+        context=context,
+        arguments={"app_id": app_result["app_id"], "record_id": record_id, "record": record},
+    )
+    assert updated["updated_record_id"] == record_id
+    assert updated["records"][0]["data"]["amount"] == 150.0
+
+    invalid_record = {**record, "data": {**record["data"], "amount": -1}}
+    with pytest.raises(ValueError, match="amount"):
+        await CreateGeneratedAppRecordTool(
+            settings,
+            session_factory=session_factory,
+        ).execute(
+            context=context,
+            arguments={"app_id": app_result["app_id"], "record": invalid_record},
+        )
+
+    deleted = await DeleteGeneratedAppRecordTool(
+        settings,
+        session_factory=session_factory,
+    ).execute(
+        context=context,
+        arguments={"app_id": app_result["app_id"], "record_id": record_id},
+    )
+    assert deleted["deleted_record_id"] == record_id
+    assert deleted["records"] == []
+    await engine.dispose()
 
 
 @pytest.mark.anyio
@@ -158,12 +391,10 @@ async def test_group_app_is_always_collaborative() -> None:
         )
         await session.commit()
 
-    tool = CreateGeneratedAppTool(
-        Settings(generated_app_public_url="https://dot.example"),
-        session_factory=session_factory,
-    )
-    result = await tool.execute(
-        context=ToolContext(user_id=owner.id, conversation_id=conversation.id),
+    result_bundle = await _create_legacy_app(
+        session_factory,
+        user_id=owner.id,
+        conversation_id=conversation.id,
         arguments={
             "title": "Cottage",
             "description": "Shared trip expenses.",
@@ -226,8 +457,7 @@ async def test_group_app_is_always_collaborative() -> None:
             ],
         },
     )
-
-    assert result["access_mode"] == "collaborative_link"
+    assert result_bundle.app.access_mode == "collaborative_link"
     async with session_factory() as session:
         records = (
             await session.scalars(
@@ -247,8 +477,10 @@ async def test_group_app_is_always_collaborative() -> None:
     assert expense.data["split_between"] == ["Kareem", "Alex", "Alex 2"]
     assert expense.actor_name == "Alex"
 
-    safe_result = await tool.execute(
-        context=ToolContext(user_id=owner.id, conversation_id=conversation.id),
+    safe_bundle = await _create_legacy_app(
+        session_factory,
+        user_id=owner.id,
+        conversation_id=conversation.id,
         arguments={
             "title": "Second cottage split",
             "description": "Uses known display names with handle-based expense references.",
@@ -293,7 +525,7 @@ async def test_group_app_is_always_collaborative() -> None:
         safe_records = (
             await session.scalars(
                 select(GeneratedAppRecord)
-                .where(GeneratedAppRecord.app_id == UUID(safe_result["app_id"]))
+                .where(GeneratedAppRecord.app_id == safe_bundle.app.id)
                 .order_by(GeneratedAppRecord.created_at)
             )
         ).all()
@@ -323,9 +555,10 @@ async def test_birthday_request_creates_one_seeded_multi_module_app() -> None:
         web_chat_dev_identity_enabled=True,
         generated_app_public_url="https://dot.example",
     )
-    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
-    result = await tool.execute(
-        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+    bundle = await _create_legacy_app(
+        session_factory,
+        user_id=user.id,
+        conversation_id=conversation.id,
         arguments={
             "title": "Nour's birthday",
             "description": "Plan the party in one place.",
@@ -408,14 +641,17 @@ async def test_birthday_request_creates_one_seeded_multi_module_app() -> None:
             ],
         },
     )
-    assert result["template"] == "workspace"
-    assert result["modules"] == [
+    assert bundle.app.template == "workspace"
+    assert [
+        {"id": module["id"], "type": module["type"]}
+        for module in bundle.version.specification["modules"]
+    ] == [
         {"id": "overview", "type": "overview"},
         {"id": "todos", "type": "todos"},
         {"id": "guests", "type": "guest_list"},
         {"id": "plan", "type": "itinerary"},
     ]
-    public_id = result["app_url"].rsplit("/", 1)[-1]
+    public_id = bundle.app.public_id
 
     async def override_session():
         async with session_factory() as session:
@@ -506,9 +742,10 @@ async def test_collection_module_crud_validates_configured_fields() -> None:
         await session.commit()
 
     settings = Settings(web_chat_dev_identity_enabled=True)
-    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
-    result = await tool.execute(
-        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+    bundle = await _create_legacy_app(
+        session_factory,
+        user_id=user.id,
+        conversation_id=conversation.id,
         arguments={
             "title": "Venue shortlist",
             "description": "Compare possible venues.",
@@ -556,32 +793,15 @@ async def test_collection_module_crud_validates_configured_fields() -> None:
                     "kind": "entry",
                     "actor_name": None,
                     "data": {
-                        "values": [
-                            {
-                                "field_key": "name",
-                                "text_value": "The Garden",
-                                "number_value": None,
-                                "boolean_value": None,
-                            },
-                            {
-                                "field_key": "status",
-                                "text_value": "maybe",
-                                "number_value": None,
-                                "boolean_value": None,
-                            },
-                            {
-                                "field_key": "price",
-                                "text_value": None,
-                                "number_value": 12_000,
-                                "boolean_value": None,
-                            },
-                        ]
+                        "name": "The Garden",
+                        "status": "maybe",
+                        "price": 12_000,
                     },
                 }
             ],
         },
     )
-    public_id = result["app_url"].rsplit("/", 1)[-1]
+    public_id = bundle.app.public_id
 
     async def override_session():
         async with session_factory() as session:
@@ -618,9 +838,7 @@ async def test_collection_module_crud_validates_configured_fields() -> None:
             )
             assert invalid.status_code == 422
 
-            deleted = await client.delete(
-                f"/api/v1/apps/public/{public_id}/records/{record['id']}"
-            )
+            deleted = await client.delete(f"/api/v1/apps/public/{public_id}/records/{record['id']}")
             assert deleted.status_code == 200
             assert deleted.json()["records"] == []
     finally:
@@ -643,9 +861,10 @@ async def test_split_participant_cannot_be_renamed_or_deleted_while_referenced()
         await session.commit()
 
     settings = Settings(web_chat_dev_identity_enabled=True)
-    tool = CreateGeneratedAppTool(settings, session_factory=session_factory)
-    result = await tool.execute(
-        context=ToolContext(user_id=user.id, conversation_id=conversation.id),
+    bundle = await _create_legacy_app(
+        session_factory,
+        user_id=user.id,
+        conversation_id=conversation.id,
         arguments={
             "title": "Trip split",
             "description": "Shared expenses.",
@@ -689,7 +908,7 @@ async def test_split_participant_cannot_be_renamed_or_deleted_while_referenced()
             ],
         },
     )
-    public_id = result["app_url"].rsplit("/", 1)[-1]
+    public_id = bundle.app.public_id
 
     async def override_session():
         async with session_factory() as session:
@@ -712,9 +931,7 @@ async def test_split_participant_cannot_be_renamed_or_deleted_while_referenced()
             )
             assert renamed.status_code == 422
 
-            deleted = await client.delete(
-                f"/api/v1/apps/public/{public_id}/records/{alice['id']}"
-            )
+            deleted = await client.delete(f"/api/v1/apps/public/{public_id}/records/{alice['id']}")
             assert deleted.status_code == 422
 
             unchanged = await client.get(f"/api/v1/apps/public/{public_id}")
@@ -859,15 +1076,11 @@ async def test_legacy_expense_splitter_keeps_participant_references() -> None:
             )
             assert expense["module_id"] == "expenses"
 
-            blocked = await client.delete(
-                f"/api/v1/apps/public/{public_id}/records/{alice['id']}"
-            )
+            blocked = await client.delete(f"/api/v1/apps/public/{public_id}/records/{alice['id']}")
             assert blocked.status_code == 422
 
             assert (
-                await client.delete(
-                    f"/api/v1/apps/public/{public_id}/records/{expense['id']}"
-                )
+                await client.delete(f"/api/v1/apps/public/{public_id}/records/{expense['id']}")
             ).status_code == 200
             assert (
                 await client.delete(f"/api/v1/apps/public/{public_id}/records/{alice['id']}")
