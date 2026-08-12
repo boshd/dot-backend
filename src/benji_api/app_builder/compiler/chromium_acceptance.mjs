@@ -5,8 +5,8 @@ const MAX_INPUT_BYTES = 3_600_000;
 const MAX_OUTPUT_BYTES = 512_000;
 const MAX_STEPS = 24;
 const MAX_OPERATIONS = 100;
+const MAX_REVEAL_CLICKS = 8;
 let acceptanceTargetSequence = 0;
-let primaryWorkflowRevealed = false;
 
 function respond(value, code = 0) {
   const encoded = JSON.stringify(value);
@@ -389,33 +389,111 @@ async function discoverSubmitForm(frame, step) {
   return forms.nth(best[0].index);
 }
 
-async function interactionTarget(frame, step, { required }) {
+async function revealSemanticForm(page, frame, step, revealState) {
+  while (revealState.clicks < MAX_REVEAL_CLICKS) {
+    const prefix = `dot-acceptance-reveal-${++acceptanceTargetSequence}`;
+    const candidates = await frame.evaluate(({ rawStep, seen, markerPrefix }) => {
+      const visible = (element) => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" &&
+          Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+      };
+      const entity = String(rawStep.entity || "").replaceAll("_", " ").toLowerCase();
+      const entityParts = entity.split(/\s+/).filter((part) => part.length > 2);
+      const occurrences = new Map();
+      const result = [];
+      for (const [index, element] of [...document.querySelectorAll(
+        "button, [role=button], [role=tab], summary",
+      )].entries()) {
+        if (!visible(element) || element.closest("form")) continue;
+        if (element.hasAttribute("disabled") || element.getAttribute("aria-disabled") === "true") {
+          continue;
+        }
+        const explicitType = String(element.getAttribute("type") || "").toLowerCase();
+        if (["submit", "reset"].includes(explicitType)) continue;
+        const label = [
+          element.getAttribute("aria-label"),
+          element.getAttribute("title"),
+          element.textContent,
+        ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 160);
+        const normalized = label.toLowerCase();
+        if (!normalized || /\b(?:delete|remove|disconnect|sign out|log out|reset|clear|destroy)\b/.test(normalized)) {
+          continue;
+        }
+        const baseKey = [
+          element.tagName.toLowerCase(),
+          element.getAttribute("role") || "",
+          normalized,
+        ].join("|");
+        const occurrence = occurrences.get(baseKey) || 0;
+        occurrences.set(baseKey, occurrence + 1);
+        const key = `${baseKey}|${occurrence}`;
+        if (seen.includes(key)) continue;
+        let score = 0;
+        if (entity && normalized.includes(entity)) score += 120;
+        score += entityParts.filter((part) => normalized.includes(part)).length * 30;
+        if (/\b(?:add|new|create|log|start|open|show|edit|manage)\b/.test(normalized)) score += 40;
+        if (element.hasAttribute("data-dot-primary-action")) score += 25;
+        if (element.getAttribute("role") === "tab") score += 15;
+        if (element.getAttribute("aria-expanded") === "false") score += 10;
+        const marker = `${markerPrefix}-${index}`;
+        element.setAttribute("data-dot-acceptance-reveal", marker);
+        result.push({
+          key,
+          label,
+          score,
+          index,
+          selector: `[data-dot-acceptance-reveal="${marker}"]`,
+        });
+      }
+      return result.sort((left, right) => right.score - left.score || left.index - right.index);
+    }, {
+      rawStep: step,
+      seen: [...revealState.seen],
+      markerPrefix: prefix,
+    });
+    const candidate = candidates[0];
+    if (!candidate) return null;
+    revealState.seen.add(candidate.key);
+    revealState.clicks += 1;
+    const locator = frame.locator(candidate.selector);
+    if (await locator.count() !== 1 || !(await locator.isVisible()) || !(await locator.isEnabled())) {
+      continue;
+    }
+    const before = await hostState(page);
+    const beforeMutations = before.operations.filter((item) => item.mutating).length;
+    const beforeViolations = before.violations.length;
+    try {
+      await locator.click({ timeout: 1_000 });
+    } catch {
+      continue;
+    }
+    await page.waitForTimeout(150);
+    const after = await hostState(page);
+    const newMutations = after.operations.filter((item) => item.mutating).slice(beforeMutations);
+    if (newMutations.length || after.violations.length > beforeViolations) {
+      fail(
+        "acceptance_reveal_mutation",
+        `workflow reveal “${candidate.label}” attempted a mutation instead of revealing a form`,
+      );
+    }
+    await assertVisibleExperience(frame);
+    const form = await discoverSubmitForm(frame, step);
+    revealState.explored.push({
+      entity: step.entity,
+      label: candidate.label,
+      matched: Boolean(form),
+    });
+    if (form) return form;
+  }
+  return null;
+}
+
+async function interactionTarget(page, frame, step, { required, revealState }) {
   if (step.event_type === "submit") {
     let form = await discoverSubmitForm(frame, step);
-    if (!form && !primaryWorkflowRevealed) {
-      const triggers = frame.locator("[data-dot-primary-action]");
-      const visibleTriggerIndexes = await triggers.evaluateAll((elements) => elements
-        .map((element, index) => ({ element, index }))
-        .filter(({ element }) => {
-          const style = getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          return style.display !== "none" && style.visibility !== "hidden" &&
-            Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
-        })
-        .map(({ index }) => index));
-      if (visibleTriggerIndexes.length > 1) {
-        fail(
-          "acceptance_flow_ambiguous",
-          `app rendered ${visibleTriggerIndexes.length} primary workflow triggers`,
-        );
-      }
-      if (visibleTriggerIndexes.length === 1) {
-        primaryWorkflowRevealed = true;
-        await triggers.nth(visibleTriggerIndexes[0]).click();
-        await assertVisibleExperience(frame);
-        form = await discoverSubmitForm(frame, step);
-      }
-    }
+    if (!form) form = await revealSemanticForm(page, frame, step, revealState);
     if (!form && required) {
       const fields = Object.keys(stepFieldHints(step));
       fail(
@@ -756,25 +834,14 @@ function mutationMatches(operation, step) {
 async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
   const fieldTyping = [];
   const acceptance = [];
+  const revealState = { clicks: 0, explored: [], seen: new Set() };
   let requiredMutationCount = 0;
   let refreshVerified = 0;
   let persistedRenderVerified = 0;
   for (const step of acceptancePlan) {
     if (!step || typeof step !== "object") continue;
     const required = step.required === true;
-    if (step.operation === "ui.reveal_primary") {
-      const trigger = await expectSingleVisible(frame, step.selector, {
-        required,
-        label: "primary workflow trigger",
-      });
-      if (trigger) {
-        await trigger.click();
-        await assertVisibleExperience(frame);
-      }
-      acceptance.push({ operation: step.operation, passed: true });
-      continue;
-    }
-    const target = await interactionTarget(frame, step, { required });
+    const target = await interactionTarget(page, frame, step, { required, revealState });
     if (!target) {
       acceptance.push({ operation: step.operation, entity: step.entity, passed: !required });
       continue;
@@ -894,6 +961,7 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
   return {
     acceptance,
     field_typing: fieldTyping,
+    workflow_reveals: revealState.explored,
     required_mutations_verified: requiredMutationCount,
     record_refreshes_verified: refreshVerified,
     persisted_renders_verified: persistedRenderVerified,

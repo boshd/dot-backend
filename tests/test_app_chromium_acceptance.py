@@ -319,7 +319,7 @@ export default function App() {
 
 
 @pytest.mark.anyio
-async def test_chromium_acceptance_seeds_dependency_before_revealing_later_form() -> None:
+async def test_chromium_acceptance_reveals_marker_free_dependency_then_primary_form() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
         pytest.skip("real Chromium acceptance runtime is unavailable")
@@ -333,19 +333,21 @@ import {
 export default function App() {
   const { records: people } = useRecords<{ id: string; name: string }>("participant");
   const { records: expenses } = useRecords<{ id: string; amount: number }>("expense");
+  const [peopleOpen, setPeopleOpen] = useState(false);
   const [name, setName] = useState("");
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState("");
   const [paidBy, setPaidBy] = useState("");
   const [split, setSplit] = useState(false);
   return <AppShell title="Cottage costs">
-    <form onSubmit={(event) => {
+    <Button aria-label="Add participant" onClick={() => setPeopleOpen(true)}>add tripmate</Button>
+    {peopleOpen ? <form onSubmit={(event) => {
       event.preventDefault();
       void runAction("records.create", { entity: "participant", data: { name } });
     }}>
       <Input label="Tripmate" name="name" value={name} onValueChange={setName} />
       <Button type="submit">add tripmate</Button>
-    </form>
+    </form> : null}
     <PrimaryWorkflowTrigger onClick={() => setOpen(true)}>add expense</PrimaryWorkflowTrigger>
     {open ? <form onSubmit={(event) => {
       event.preventDefault();
@@ -395,6 +397,46 @@ export default function App() {
         "paid_by": "test",
         "split_between": ["test"],
     }
+    assert result["workflow_reveals"] == [
+        {"entity": "participant", "label": "Add participant add tripmate", "matched": True},
+        {"entity": "expense", "label": "add expense", "matched": True},
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_never_treats_a_mutation_as_a_reveal() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { runAction } from "@dot/app-runtime";
+import { AppShell, Button } from "@dot/ui";
+export default function App() {
+  return <AppShell title="Tripmates">
+    <Button onClick={() => void runAction("records.create", {
+      entity: "participant", data: { name: "Kareem" },
+    })}>add participant</Button>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=plan)
+
+    assert failed.value.issues[0].code == "acceptance_reveal_mutation"
 
 
 @pytest.mark.anyio
