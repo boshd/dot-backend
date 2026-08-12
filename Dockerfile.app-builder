@@ -30,8 +30,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY --from=uv /uv /uvx /bin/
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=dot-app-builder-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=dot-app-builder-apt-lists,target=/var/lib/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-sandbox
 
