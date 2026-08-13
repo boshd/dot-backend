@@ -152,3 +152,13 @@ def test_core_prompt_keeps_hard_capability_privacy_and_action_policies() -> None
     assert "never invent an app link" in normalized
     assert "never silently create recurring outreach" in normalized
     assert DOT_PROMPT_VERSION
+
+
+def test_core_prompt_reports_background_app_builds_truthfully() -> None:
+    normalized = " ".join(BENJI_CORE_PROMPT.content.split()).lower()
+
+    assert "`waiting` means it has not been claimed yet" in normalized
+    assert "`actively building and checking` means the worker is already" in normalized
+    assert 'never call that phase queued or "stuck in the queue"' in normalized
+    assert 'don\'t say you\'re "keeping an eye on it"' in normalized
+    assert "trusted completion event will bring you back" in normalized

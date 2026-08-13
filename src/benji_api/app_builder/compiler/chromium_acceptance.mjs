@@ -364,32 +364,59 @@ async function discoverSubmitForm(frame, step) {
         return [...form.querySelectorAll(`[name="${safe}"]`)].some(visible);
       });
       const required = requiredNames.filter((name) => present.includes(name));
+      const submitLabels = submitters.map((element) => [
+        element.getAttribute("aria-label"),
+        element.getAttribute("title"),
+        element.textContent,
+      ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 100));
       return {
         index,
         visible: visible(form),
         submitters: submitters.length,
+        submitLabels,
         present,
-        requiredCoverage: required.length === requiredNames.length,
+        missingRequired: requiredNames.filter((name) => !required.includes(name)),
         score: required.length * 100 + present.length,
       };
     });
   }, step);
-  const usable = candidates.filter((item) =>
-    item.visible && item.submitters === 1 && item.requiredCoverage
-  );
-  if (!usable.length) return null;
+  const usable = candidates.filter((item) => item.visible && item.submitters === 1);
+  if (!usable.length) return { form: null, candidates, score: 0 };
   const bestScore = Math.max(...usable.map((item) => item.score));
   const best = usable.filter((item) => item.score === bestScore);
   if (best.length !== 1) {
+    const reason = bestScore === 0 ? "with no declared-field signal" : `at score ${bestScore}`;
     fail(
       "acceptance_flow_ambiguous",
-      `could not identify one ${step.operation} form from declared fields; ${best.length} forms shared score ${bestScore}`,
+      `could not identify one ${step.entity || step.operation} form; ${best.length} visible forms tied ${reason}; candidates=${JSON.stringify(candidates)}`,
     );
   }
-  return forms.nth(best[0].index);
+  return {
+    form: forms.nth(best[0].index),
+    candidates,
+    score: bestScore,
+  };
+}
+
+function flowDiagnostics(step, discovery, revealState) {
+  const required = Array.isArray(step.required_payload_fields)
+    ? step.required_payload_fields
+    : Array.isArray(step.required_fields)
+      ? step.required_fields
+      : [];
+  const forms = (discovery?.candidates || []).map((item) => ({
+    index: item.index,
+    visible: item.visible,
+    submit: item.submitLabels,
+    present: item.present,
+    missing_required: item.missingRequired,
+  }));
+  const explored = (revealState?.explored || []).map((item) => item.label);
+  return `required=${JSON.stringify(required)} forms=${JSON.stringify(forms)} explored=${JSON.stringify(explored)}`;
 }
 
 async function revealSemanticForm(page, frame, step, revealState) {
+  let latestDiscovery = revealState.discovery;
   while (revealState.clicks < MAX_REVEAL_CLICKS) {
     const prefix = `dot-acceptance-reveal-${++acceptanceTargetSequence}`;
     const candidates = await frame.evaluate(({ rawStep, seen, markerPrefix }) => {
@@ -454,7 +481,10 @@ async function revealSemanticForm(page, frame, step, revealState) {
       markerPrefix: prefix,
     });
     const candidate = candidates[0];
-    if (!candidate) return null;
+    if (!candidate) {
+      revealState.discovery = latestDiscovery;
+      return null;
+    }
     revealState.seen.add(candidate.key);
     revealState.clicks += 1;
     const locator = frame.locator(candidate.selector);
@@ -462,7 +492,11 @@ async function revealSemanticForm(page, frame, step, revealState) {
       continue;
     }
     const before = await hostState(page);
+    const beforeText = (await frame.locator("body").innerText()).trim();
     const beforeMutations = before.operations.filter((item) => item.mutating).length;
+    const beforeLists = before.operations.filter(
+      (item) => item.operation === "records.list" && item.args?.entity === step.entity,
+    ).length;
     const beforeViolations = before.violations.length;
     try {
       await locator.click({ timeout: 1_000 });
@@ -472,45 +506,88 @@ async function revealSemanticForm(page, frame, step, revealState) {
     await page.waitForTimeout(150);
     const after = await hostState(page);
     const newMutations = after.operations.filter((item) => item.mutating).slice(beforeMutations);
-    if (newMutations.length || after.violations.length > beforeViolations) {
+    const newViolations = after.violations.slice(beforeViolations);
+    if (newViolations.length) {
       fail(
         "acceptance_reveal_mutation",
-        `workflow reveal “${candidate.label}” attempted a mutation instead of revealing a form`,
+        `workflow action “${candidate.label}” violated the gesture contract: ${JSON.stringify(newViolations)}`,
       );
     }
+    if (newMutations.length) {
+      if (newMutations.length !== 1) {
+        fail(
+          "acceptance_duplicate_mutation",
+          `workflow action “${candidate.label}” produced ${newMutations.length} mutations; expected exactly one ${step.operation}`,
+        );
+      }
+      if (!mutationMatches(newMutations[0], step)) {
+        fail(
+          "acceptance_reveal_mutation",
+          `workflow action “${candidate.label}” performed an unexpected mutation; expected ${step.operation} for ${step.entity || "the declared target"}, observed=${JSON.stringify(newMutations)}`,
+        );
+      }
+      revealState.explored.push({
+        entity: step.entity,
+        label: candidate.label,
+        matched: true,
+        direct_action: true,
+      });
+      return {
+        kind: "direct_action",
+        beforeMutations,
+        beforeLists,
+        beforeText,
+      };
+    }
     await assertVisibleExperience(frame);
-    const form = await discoverSubmitForm(frame, step);
+    const previouslyHadForm = Boolean(latestDiscovery?.form);
+    const discovery = await discoverSubmitForm(frame, step);
+    latestDiscovery = discovery;
     revealState.explored.push({
       entity: step.entity,
       label: candidate.label,
-      matched: Boolean(form),
+      matched: Boolean(discovery.form),
     });
-    if (form) return form;
+    if (discovery.form && (discovery.score > 0 || !previouslyHadForm)) {
+      return { kind: "form", target: discovery.form };
+    }
   }
+  revealState.discovery = latestDiscovery;
   return null;
 }
 
 async function interactionTarget(page, frame, step, { required, revealState }) {
   if (step.event_type === "submit") {
-    let form = await discoverSubmitForm(frame, step);
-    if (!form) form = await revealSemanticForm(page, frame, step, revealState);
-    if (!form && required) {
-      const fields = Object.keys(stepFieldHints(step));
+    const discovery = await discoverSubmitForm(frame, step);
+    revealState.discovery = discovery;
+    if (discovery.form && discovery.score > 0) {
+      return { kind: "form", target: discovery.form };
+    }
+    const revealed = await revealSemanticForm(page, frame, step, revealState);
+    if (revealed) return revealed;
+    // A single zero-signal form may still implement a valid derived-data workflow. Its observed
+    // mutation remains authoritative, but multiple zero-signal forms are rejected above.
+    const zeroSignalDiscovery = revealState.discovery || discovery;
+    if (zeroSignalDiscovery.form) {
+      return { kind: "form", target: zeroSignalDiscovery.form };
+    }
+    if (required) {
       fail(
         "acceptance_flow_missing",
-        `no visible submit form matched the declared ${step.entity || step.operation} fields: ${fields.join(", ")}`,
+        `no usable ${step.entity || step.operation} create workflow was found; ${flowDiagnostics(step, revealState.discovery, revealState)}`,
       );
     }
-    return form;
+    return null;
   }
   if (typeof step.selector !== "string") {
     if (required) fail("acceptance_flow_missing", `no interaction target declared for ${step.operation}`);
     return null;
   }
-  return expectSingleVisible(frame, step.selector, {
+  const target = await expectSingleVisible(frame, step.selector, {
     required,
     label: "interaction target",
   });
+  return target ? { kind: "target", target } : null;
 }
 
 async function visible(locator) {
@@ -712,6 +789,27 @@ async function assertFocused(locator, selector) {
   if (!focused) fail("acceptance_input_focus_lost", `field lost focus while typing: ${selector}`);
 }
 
+function browserTemporalValue(type, value) {
+  const text = String(value).trim();
+  if (type === "date") {
+    const match = text.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match?.[1] || text;
+  }
+  if (type === "datetime-local") {
+    const match = text.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})/);
+    return match ? `${match[1]}T${match[2]}:${match[3]}` : text.replace(/Z$/, "");
+  }
+  if (type === "month") {
+    const match = text.match(/^(\d{4}-\d{2})/);
+    return match?.[1] || text;
+  }
+  if (type === "time") {
+    const match = text.match(/(?:^|T)(\d{2}):(\d{2})/);
+    return match ? `${match[1]}:${match[2]}` : text.replace(/Z$/, "");
+  }
+  return text.replace(/Z$/, "");
+}
+
 async function enterField(frame, selector, value) {
   const candidates = frame.locator(selector);
   const candidateCount = await candidates.count();
@@ -782,7 +880,7 @@ async function enterField(frame, selector, value) {
   await locator.click();
   await assertFocused(locator, selector);
   if (["date", "datetime-local", "month", "time", "week"].includes(metadata.type)) {
-    await locator.fill(desired.replace(/Z$/, ""));
+    await locator.fill(browserTemporalValue(metadata.type, desired));
     await assertFocused(locator, selector);
     return { mode: "browser-fill", value: await locator.inputValue() };
   }
@@ -831,21 +929,107 @@ function mutationMatches(operation, step) {
   return true;
 }
 
+async function verifyMutationOutcome(
+  page,
+  frame,
+  step,
+  { beforeMutations, beforeLists, beforeText, interaction, timeoutMs, required },
+) {
+  await page.waitForFunction(
+    (minimum) => window.__DOT_ACCEPTANCE__.operations.filter((item) => item.mutating).length >= minimum,
+    beforeMutations + 1,
+    { timeout: Math.min(timeoutMs, 4_000) },
+  ).catch(async () => {
+    const debugState = await hostState(page).catch(() => ({}));
+    const body = await frame.locator("body").innerText().catch(() => "");
+    fail(
+      "acceptance_flow_missing",
+      `${interaction} did not call ${step.operation}; state=${JSON.stringify(debugState)} body=${body.slice(0, 300)}`,
+    );
+  });
+  await page.waitForTimeout(200);
+  const after = await hostState(page);
+  if (after.violations.length) {
+    fail(after.violations[0].code, "one user gesture attempted more than one mutation");
+  }
+  const newMutations = after.operations.filter((item) => item.mutating).slice(beforeMutations);
+  if (newMutations.length !== 1) {
+    fail(
+      "acceptance_duplicate_mutation",
+      `${interaction} produced ${newMutations.length} mutations; expected exactly one ${step.operation}`,
+    );
+  }
+  if (!mutationMatches(newMutations[0], step)) {
+    fail(
+      "acceptance_required_field_missing",
+      `${interaction} did not produce the declared ${step.operation} payload; observed=${JSON.stringify(newMutations[0])}`,
+    );
+  }
+
+  let recordRefreshes = 0;
+  let persistedRenders = 0;
+  if (step.operation === "records.create" && typeof step.entity === "string") {
+    await page.waitForFunction(
+      ([entity, minimum]) => window.__DOT_ACCEPTANCE__.operations.filter(
+        (item) => item.operation === "records.list" && item.args?.entity === entity,
+      ).length > minimum,
+      [step.entity, beforeLists],
+      { timeout: Math.min(timeoutMs, 4_000) },
+    ).catch(() => fail(
+      "acceptance_records_refresh_missing",
+      `${step.entity} was saved but the app did not refresh its records`,
+    ));
+    recordRefreshes = 1;
+    await frame.waitForFunction(
+      (previous) => document.body.innerText.trim() !== previous,
+      beforeText,
+      { timeout: 600 },
+    ).catch(() => undefined);
+    const afterText = (await frame.locator("body").innerText()).trim();
+    if (afterText !== beforeText) persistedRenders = 1;
+    else if (required) {
+      fail(
+        "acceptance_persisted_result_missing",
+        `${step.entity} refreshed after save but the persisted result was not visible`,
+      );
+    }
+  }
+  return { recordRefreshes, persistedRenders };
+}
+
 async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
   const fieldTyping = [];
   const acceptance = [];
-  const revealState = { clicks: 0, explored: [], seen: new Set() };
+  const workflowReveals = [];
   let requiredMutationCount = 0;
   let refreshVerified = 0;
   let persistedRenderVerified = 0;
   for (const step of acceptancePlan) {
     if (!step || typeof step !== "object") continue;
     const required = step.required === true;
-    const target = await interactionTarget(page, frame, step, { required, revealState });
-    if (!target) {
+    const revealState = { clicks: 0, explored: [], seen: new Set(), discovery: null };
+    const interaction = await interactionTarget(page, frame, step, { required, revealState });
+    workflowReveals.push(...revealState.explored);
+    if (!interaction) {
       acceptance.push({ operation: step.operation, entity: step.entity, passed: !required });
       continue;
     }
+    if (interaction.kind === "direct_action") {
+      const verified = await verifyMutationOutcome(page, frame, step, {
+        beforeMutations: interaction.beforeMutations,
+        beforeLists: interaction.beforeLists,
+        beforeText: interaction.beforeText,
+        interaction: "direct workflow action",
+        timeoutMs,
+        required,
+      });
+      requiredMutationCount += required ? 1 : 0;
+      refreshVerified += verified.recordRefreshes;
+      persistedRenderVerified += verified.persistedRenders;
+      acceptance.push({ operation: step.operation, entity: step.entity, passed: true });
+      continue;
+    }
+    const target = interaction.target;
     const fieldHints = stepFieldHints(step);
     const targetId = `dot-acceptance-${++acceptanceTargetSequence}`;
     const targetSelector = await target.evaluate((element, testId) => {
@@ -898,70 +1082,23 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
       (item) => item.operation === "records.list" && item.args?.entity === step.entity,
     ).length;
     await submit.click();
-    await page.waitForFunction(
-      (minimum) => window.__DOT_ACCEPTANCE__.operations.filter((item) => item.mutating).length >= minimum,
-      beforeMutations + 1,
-      { timeout: Math.min(timeoutMs, 4_000) },
-    ).catch(async () => {
-      const debugState = await hostState(page).catch(() => ({}));
-      const body = await frame.locator("body").innerText().catch(() => "");
-      fail(
-        "acceptance_flow_missing",
-        `submit did not call ${step.operation}; submit=${JSON.stringify(submitMetadata)} state=${JSON.stringify(debugState)} body=${body.slice(0, 300)}`,
-      );
+    const verified = await verifyMutationOutcome(page, frame, step, {
+      beforeMutations,
+      beforeLists,
+      beforeText,
+      interaction: `form submit ${JSON.stringify(submitMetadata)}`,
+      timeoutMs,
+      required,
     });
-    await page.waitForTimeout(200);
-    const after = await hostState(page);
-    if (after.violations.length) {
-      fail(after.violations[0].code, "one user gesture attempted more than one mutation");
-    }
-    const newMutations = after.operations.filter((item) => item.mutating).slice(beforeMutations);
-    if (newMutations.length !== 1) {
-      fail(
-        "acceptance_duplicate_mutation",
-        `one submit produced ${newMutations.length} mutations; expected exactly one ${step.operation}`,
-      );
-    }
-    if (!mutationMatches(newMutations[0], step)) {
-      fail(
-        "acceptance_required_field_missing",
-        `${step.operation} did not persist every required declared field`,
-      );
-    }
     requiredMutationCount += required ? 1 : 0;
-    if (step.operation === "records.create" && typeof step.entity === "string") {
-      await page.waitForFunction(
-        ([entity, minimum]) => window.__DOT_ACCEPTANCE__.operations.filter(
-          (item) => item.operation === "records.list" && item.args?.entity === entity,
-        ).length > minimum,
-        [step.entity, beforeLists],
-        { timeout: Math.min(timeoutMs, 4_000) },
-      ).catch(() => fail(
-        "acceptance_records_refresh_missing",
-        `${step.entity} was saved but the app did not refresh its records`,
-      ));
-      refreshVerified += 1;
-      let afterText = beforeText;
-      await frame.waitForFunction(
-        (previous) => document.body.innerText.trim() !== previous,
-        beforeText,
-        { timeout: 600 },
-      ).catch(() => undefined);
-      afterText = (await frame.locator("body").innerText()).trim();
-      if (afterText !== beforeText) persistedRenderVerified += 1;
-      else if (required) {
-        fail(
-          "acceptance_persisted_result_missing",
-          `${step.entity} refreshed after save but the persisted result was not visible`,
-        );
-      }
-    }
+    refreshVerified += verified.recordRefreshes;
+    persistedRenderVerified += verified.persistedRenders;
     acceptance.push({ operation: step.operation, entity: step.entity, passed: true });
   }
   return {
     acceptance,
     field_typing: fieldTyping,
-    workflow_reveals: revealState.explored,
+    workflow_reveals: workflowReveals,
     required_mutations_verified: requiredMutationCount,
     record_refreshes_verified: refreshVerified,
     persisted_renders_verified: persistedRenderVerified,

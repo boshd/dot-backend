@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from benji_api.app_builder.browser_smoke import AppBrowserSmokeError
 from benji_api.app_builder.pipeline import (
     AppBuildPipeline,
     BuildRejectedError,
@@ -247,6 +248,58 @@ class FakeSmokeRunner:
         )
 
 
+class SequencedIssueSmokeRunner(FakeSmokeRunner):
+    def __init__(self, outcomes: list[ValidationIssue | None]) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+
+    async def smoke(
+        self,
+        bundle: object,
+        *,
+        acceptance_plan: tuple[object, ...] = (),
+    ) -> MappingProxyType[str, object]:
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise AppBrowserSmokeError((outcome,))
+        return await super().smoke(bundle, acceptance_plan=acceptance_plan)
+
+
+class ConvergenceProvider(DeterministicLocalProvider):
+    name = "convergence"
+    version = "test"
+
+    def __init__(self) -> None:
+        self.repairs = 0
+        self.regenerations = 0
+        self.regeneration_diagnostics: tuple[ValidationIssue, ...] = ()
+
+    async def repair(
+        self,
+        app_blueprint: AppBlueprint,
+        previous: GeneratedSource,
+        issues: tuple[ValidationIssue, ...],
+        *,
+        attempt: int,
+    ) -> GeneratedSource:
+        del previous, issues, attempt
+        self.repairs += 1
+        return await super().generate(app_blueprint)
+
+    async def regenerate(
+        self,
+        app_blueprint: AppBlueprint,
+        issues: tuple[ValidationIssue, ...],
+        *,
+        attempt: int,
+    ) -> GeneratedSource:
+        del attempt
+        self.regenerations += 1
+        self.regeneration_diagnostics = issues
+        return await super().generate(app_blueprint)
+
+
 class MissingStaticSmokeRunner(FakeSmokeRunner):
     async def smoke(
         self,
@@ -409,6 +462,81 @@ async def test_repair_receives_policy_and_typescript_issues_together() -> None:
 
 
 @pytest.mark.anyio
+async def test_repeated_acceptance_failure_forces_one_clean_regeneration() -> None:
+    issue = ValidationIssue(
+        "acceptance_flow_missing",
+        "no visible submit form matched the declared workout fields: title",
+        "workout",
+    )
+    evolved_diagnostic = ValidationIssue(
+        "acceptance_flow_missing",
+        "no visible submit form matched the declared workout fields: title, notes",
+        "workout",
+    )
+    provider = ConvergenceProvider()
+    smoke = SequencedIssueSmokeRunner([issue, evolved_diagnostic, None])
+
+    completion = await AppBuildPipeline(
+        provider,
+        max_repair_attempts=4,
+        smoke_runner=smoke,
+    ).build(claim())
+
+    assert provider.repairs == 1
+    assert provider.regenerations == 1
+    assert provider.regeneration_diagnostics == (issue, evolved_diagnostic)
+    assert smoke.calls == 3
+    assert completion.metrics.generation_attempts == 3
+    assert completion.metrics.repair_attempts == 2
+
+
+@pytest.mark.anyio
+async def test_repeated_acceptance_after_clean_regeneration_stops_early() -> None:
+    issue = ValidationIssue(
+        "acceptance_flow_missing",
+        "no visible submit form matched the declared workout fields",
+    )
+    provider = ConvergenceProvider()
+    smoke = SequencedIssueSmokeRunner([issue, issue, issue, None, None])
+
+    with pytest.raises(BuildRejectedError) as rejected:
+        await AppBuildPipeline(
+            provider,
+            max_repair_attempts=4,
+            smoke_runner=smoke,
+        ).build(claim())
+
+    assert rejected.value.issues == (issue,)
+    assert provider.repairs == 1
+    assert provider.regenerations == 1
+    assert smoke.calls == 3
+
+
+@pytest.mark.anyio
+async def test_acceptance_progress_across_entities_is_not_mistaken_for_convergence() -> None:
+    participant = ValidationIssue(
+        "acceptance_flow_missing",
+        "no usable participant create workflow was found; forms=[]",
+    )
+    workout = ValidationIssue(
+        "acceptance_flow_missing",
+        "no usable workout_session create workflow was found; forms=[]",
+    )
+    provider = ConvergenceProvider()
+    smoke = SequencedIssueSmokeRunner([participant, workout, None])
+
+    await AppBuildPipeline(
+        provider,
+        max_repair_attempts=4,
+        smoke_runner=smoke,
+    ).build(claim())
+
+    assert provider.repairs == 2
+    assert provider.regenerations == 0
+    assert smoke.calls == 3
+
+
+@pytest.mark.anyio
 async def test_exhausted_custom_build_is_rejected_instead_of_publishing_fallback() -> None:
     with pytest.raises(BuildRejectedError) as rejected:
         await AppBuildPipeline(
@@ -537,6 +665,45 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert "do not return css files, classname props, inline style props" in (
         normalized_instructions
     )
+
+
+@pytest.mark.anyio
+async def test_openai_repair_prompts_explain_acceptance_and_clean_rebuild() -> None:
+    app_blueprint = AppBlueprint.from_mapping(blueprint())
+    local = await DeterministicLocalProvider().generate(app_blueprint)
+    client = FakeOpenAIClient(
+        {
+            "files": [source_file.as_dict() for source_file in local.files],
+            "entrypoint": local.entrypoint,
+        }
+    )
+    provider = OpenAIAppSourceProvider(client=client)
+    issues = (
+        ValidationIssue(
+            "acceptance_flow_missing",
+            "no visible submit form matched the declared expense fields",
+        ),
+        ValidationIssue(
+            "acceptance_reveal_mutation",
+            "workflow reveal Add expense attempted a mutation",
+        ),
+    )
+
+    await provider.repair(app_blueprint, local, issues, attempt=1)
+    repair_prompt = client.responses.requests[-1]["input"][0]["content"]
+    assert "ACTIONABLE REPAIR GUIDANCE" in repair_prompt
+    assert "one visible semantic form" in repair_prompt
+    assert 'exactly one visible Button type="submit"' in repair_prompt
+    assert "Make its intent unambiguous" in repair_prompt
+    assert "Derived or contextual fields do not need fake inputs" in repair_prompt
+
+    await provider.regenerate(app_blueprint, issues, attempt=2)
+    regeneration_prompt = client.responses.requests[-1]["input"][0]["content"]
+    assert "same acceptance failure" in regeneration_prompt
+    assert "Discard that implementation" in regeneration_prompt
+    assert "Do not patch the old workflow again" in regeneration_prompt
+    assert "ACCUMULATED DIAGNOSTICS FROM PRIOR CANDIDATES" in regeneration_prompt
+    assert "PREVIOUS RESULT" not in regeneration_prompt
 
 
 def test_source_policy_blocks_privileged_browser_and_dependency_access() -> None:
@@ -728,7 +895,7 @@ async def test_worker_completes_and_fails_claims() -> None:
     )
     assert not rejected.completed
     assert rejected.failed[0].code == "source_rejected"
-    assert rejected.failed[0].retryable is True
+    assert rejected.failed[0].retryable is False
     assert rejected.failed[0].issues[0].code in {"network_access", "external_url"}
 
 

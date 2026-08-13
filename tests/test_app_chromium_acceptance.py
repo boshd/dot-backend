@@ -319,6 +319,107 @@ export default function App() {
 
 
 @pytest.mark.anyio
+async def test_chromium_acceptance_allows_dynamic_array_builder_without_array_control() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
+export default function App() {
+  const { records } = useRecords<{ id: string; name: string; exercise_names: string[] }>("routine");
+  const [name, setName] = useState("");
+  const [exercise, setExercise] = useState("Bench press");
+  return <AppShell title="Routines"><form onSubmit={(event) => {
+    event.preventDefault();
+    void runAction("records.create", {
+      entity: "routine", data: { name, exercise_names: [exercise] },
+    });
+  }}>
+    <Input label="Routine name" name="name" value={name} onValueChange={setName} />
+    <Input label="First exercise" name="exercise_draft" value={exercise}
+      onValueChange={setExercise} />
+    <Button type="submit">save routine</Button>
+  </form>
+  <p>{records.map((record) => `${record.name}: ${record.exercise_names.join(", ")}`).join("; ")}</p>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "routine",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test", "exercise_names": []},
+            "required_payload_fields": ["name", "exercise_names"],
+            "allowed_payload_fields": ["name", "exercise_names"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutation = next(item for item in result["operations"] if item["mutating"])
+    assert mutation["args"]["data"] == {
+        "name": "test",
+        "exercise_names": ["Bench press"],
+    }
+    assert result["field_typing"] == [
+        {"field": "name", "mode": "trusted-keyboard", "value": "test", "characters": 4}
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_formats_datetime_local_for_browser_fill() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
+export default function App() {
+  const { records } = useRecords<{ id: string; started_at: string }>("workout");
+  const [startedAt, setStartedAt] = useState("");
+  return <AppShell title="Workout"><form onSubmit={(event) => {
+    event.preventDefault();
+    void runAction("records.create", {
+      entity: "workout", data: { started_at: startedAt },
+    });
+  }}>
+    <Input type="datetime-local" label="Started at" name="started_at"
+      value={startedAt} onValueChange={setStartedAt} />
+    <Button type="submit">start workout</Button>
+  </form><p>{records.map((record) => record.started_at).join(", ")}</p></AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "workout",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"started_at": "2026-01-01T09:00:00Z"},
+            "required_payload_fields": ["started_at"],
+            "allowed_payload_fields": ["started_at"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutation = next(item for item in result["operations"] if item["mutating"])
+    assert mutation["args"]["data"] == {"started_at": "2026-01-01T09:00"}
+    assert result["field_typing"] == [
+        {"field": "started_at", "mode": "browser-fill", "value": "2026-01-01T09:00"}
+    ]
+
+
+@pytest.mark.anyio
 async def test_chromium_acceptance_reveals_marker_free_dependency_then_primary_form() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
@@ -404,7 +505,111 @@ export default function App() {
 
 
 @pytest.mark.anyio
-async def test_chromium_acceptance_never_treats_a_mutation_as_a_reveal() -> None:
+async def test_chromium_acceptance_uses_fresh_reveal_budget_for_each_entity() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button, Input } from "@dot/ui";
+export default function App() {
+  const { records: firstRecords } = useRecords<{ id: string; name: string }>("first_item");
+  const { records: secondRecords } = useRecords<{ id: string; name: string }>("second_item");
+  const [phase, setPhase] = useState<"first" | "second">("first");
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const entity = phase === "first" ? "first_item" : "second_item";
+  return <AppShell title="Two steps">
+    {!open ? <Button onClick={() => setOpen(true)}>add item</Button> : null}
+    {open ? <form onSubmit={async (event) => {
+      event.preventDefault();
+      await runAction("records.create", { entity, data: { name } });
+      setName("");
+      setOpen(false);
+      if (phase === "first") setPhase("second");
+    }}>
+      <Input label="Name" name="name" value={name} onValueChange={setName} />
+      <Button type="submit">save item</Button>
+    </form> : null}
+    <p>{firstRecords.length} first, {secondRecords.length} second</p>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = tuple(
+        {
+            "operation": "records.create",
+            "entity": entity,
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        }
+        for entity in ("first_item", "second_item")
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutations = [item for item in result["operations"] if item["mutating"]]
+    assert [item["args"]["entity"] for item in mutations] == ["first_item", "second_item"]
+    assert result["workflow_reveals"] == [
+        {"entity": "first_item", "label": "add item", "matched": True},
+        {"entity": "second_item", "label": "add item", "matched": True},
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_accepts_matching_direct_create_action() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Button } from "@dot/ui";
+export default function App() {
+  const { records } = useRecords<{ id: string; name: string }>("participant");
+  return <AppShell title="Tripmates">
+    <Button onClick={() => void runAction("records.create", {
+      entity: "participant", data: { name: "Kareem" },
+    })}>add participant</Button>
+    <p>{records.map((record) => record.name).join(", ")}</p>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    assert result["required_mutations_verified"] == 1
+    assert result["record_refreshes_verified"] == 1
+    assert result["persisted_renders_verified"] == 1
+    assert result["workflow_reveals"] == [
+        {
+            "entity": "participant",
+            "label": "add participant",
+            "matched": True,
+            "direct_action": True,
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_rejects_direct_action_for_wrong_entity() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
         pytest.skip("real Chromium acceptance runtime is unavailable")
@@ -415,7 +620,7 @@ import { AppShell, Button } from "@dot/ui";
 export default function App() {
   return <AppShell title="Tripmates">
     <Button onClick={() => void runAction("records.create", {
-      entity: "participant", data: { name: "Kareem" },
+      entity: "expense", data: { name: "Lunch" },
     })}>add participant</Button>
   </AppShell>;
 }'''
@@ -437,10 +642,39 @@ export default function App() {
         await runner.smoke(bundle, acceptance_plan=plan)
 
     assert failed.value.issues[0].code == "acceptance_reveal_mutation"
+    assert "expense" in failed.value.issues[0].message
 
 
 @pytest.mark.anyio
-async def test_chromium_acceptance_requires_named_controls_for_required_fields() -> None:
+async def test_chromium_acceptance_reports_form_and_reveal_diagnostics() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { AppShell, Button } from "@dot/ui";
+export default function App() {
+  const [open, setOpen] = useState(false);
+  return <AppShell title="Vote">
+    <Button onClick={() => setOpen(true)}>show details</Button>
+    {open ? <p>still no voting form</p> : null}
+  </AppShell>;
+}'''
+        )
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=_vote_plan())
+
+    assert failed.value.issues[0].code == "acceptance_flow_missing"
+    assert 'required=["choice"]' in failed.value.issues[0].message
+    assert 'forms=[]' in failed.value.issues[0].message
+    assert 'explored=["show details"]' in failed.value.issues[0].message
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_allows_derived_required_field_without_control() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
         pytest.skip("real Chromium acceptance runtime is unavailable")
@@ -476,10 +710,11 @@ export default function App() {
         },
     )
 
-    with pytest.raises(AppBrowserSmokeError) as failed:
-        await runner.smoke(bundle, acceptance_plan=plan)
+    result = await runner.smoke(bundle, acceptance_plan=plan)
 
-    assert failed.value.issues[0].code == "acceptance_flow_missing"
+    mutation = next(item for item in result["operations"] if item["mutating"])
+    assert mutation["args"]["data"] == {"choice": "yes"}
+    assert result["field_typing"] == []
 
 
 @pytest.mark.anyio

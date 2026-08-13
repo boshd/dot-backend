@@ -137,6 +137,7 @@ async def test_private_agent_tools_manage_code_app_records_and_queue_revision() 
     )
     assert inspected["active_revision"]["manifest"] == MANIFEST
     assert inspected["app_url"] == f"https://app.textdot.test/a/{code_app.public_id}"
+    assert inspected["latest_build"]["phase"] == "succeeded"
 
     fresh_link = await CreateCustomAppLinkTool(
         settings,
@@ -254,6 +255,54 @@ async def test_private_agent_tools_manage_code_app_records_and_queue_revision() 
         },
     )
     assert deleted["deleted_record_id"] == record_id
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_inspect_custom_app_exposes_truthful_build_phase() -> None:
+    engine, factory = await _database()
+    owner, direct, code_app = await _deployed_app(factory)
+    tool = InspectCustomAppTool(Settings(), session_factory=factory)
+    context = ToolContext(user_id=owner.id, conversation_id=direct.id)
+
+    async with factory() as session:
+        await queue_code_app_revision(
+            session,
+            user_id=owner.id,
+            app_id=code_app.id,
+            request={"blueprint": {"title": "Revision one"}},
+        )
+
+    waiting = await tool.execute(context=context, arguments={"app_id": str(code_app.id)})
+    assert waiting["latest_build"]["status"] == GeneratedAppBuildStatus.QUEUED.value
+    assert waiting["latest_build"]["phase"] == "waiting"
+    assert waiting["latest_build"]["attempts"] == 0
+
+    async with factory() as session:
+        claim = await claim_next_build(session, worker_id="phase-builder")
+        assert claim is not None
+
+    active = await tool.execute(context=context, arguments={"app_id": str(code_app.id)})
+    assert active["latest_build"]["status"] == GeneratedAppBuildStatus.CLAIMED.value
+    assert active["latest_build"]["phase"] == "actively building and checking"
+    assert active["latest_build"]["attempts"] == 1
+
+    async with factory() as session:
+        await fail_build(
+            session,
+            job_id=claim.job_id,
+            worker_id="phase-builder",
+            expected_attempt=claim.attempt,
+            error='{"code":"source_rejected","retryable":false}',
+            retryable=False,
+        )
+
+    failed = await tool.execute(context=context, arguments={"app_id": str(code_app.id)})
+    assert failed["latest_build"]["status"] == GeneratedAppBuildStatus.FAILED.value
+    assert failed["latest_build"]["phase"] == "failed"
+    assert failed["latest_build"]["attempts"] == 1
+    assert failed["latest_build"]["updated_at"]
+
     await engine.dispose()
 
 

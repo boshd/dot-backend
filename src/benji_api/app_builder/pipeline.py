@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from time import monotonic
 from types import MappingProxyType
+from typing import Any
 
 from benji_api.app_builder.browser_smoke import AppBrowserSmokeError
 from benji_api.app_builder.compiler import AppCompilationError, EsbuildAppCompiler
@@ -51,6 +53,7 @@ _COMPILATION_BLOCKING_POLICY_CODES = frozenset(
         "too_many_files",
     }
 )
+_ACCEPTANCE_ISSUE_PREFIX = "acceptance_"
 DOT_APP_DEPENDENCY_LOCK = MappingProxyType(
     {
         "@dot/app-runtime": "2",
@@ -120,6 +123,9 @@ class AppBuildPipeline:
         stages = _StageTimer({})
         attempts = 0
         repairs = 0
+        issue_history: list[tuple[ValidationIssue, ...]] = []
+        seen_acceptance_fingerprints: set[tuple[tuple[str, str, str], ...]] = set()
+        clean_regeneration_used = False
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 blueprint = await stages.measure(
@@ -176,27 +182,65 @@ class AppBuildPipeline:
                             )
                     if not issues:
                         break
+                    issue_history.append(issues)
+                    acceptance_fingerprint = _acceptance_issue_fingerprint(issues)
+                    repeated_acceptance = (
+                        acceptance_fingerprint is not None
+                        and acceptance_fingerprint in seen_acceptance_fingerprints
+                    )
+                    if acceptance_fingerprint is not None:
+                        seen_acceptance_fingerprints.add(acceptance_fingerprint)
                     logger.info(
                         "Generated app candidate needs repair job_id=%s attempt=%s issues=%s",
                         claim.job_id,
                         attempts,
-                        [issue.code for issue in issues],
+                        _safe_issue_log_payload(issues),
                     )
+                    if repeated_acceptance and clean_regeneration_used:
+                        logger.info(
+                            "Generated app convergence stopped job_id=%s attempt=%s "
+                            "reason=repeated_acceptance_after_clean_regeneration issues=%s",
+                            claim.job_id,
+                            attempts,
+                            _safe_issue_log_payload(issues),
+                        )
+                        raise BuildRejectedError(issues)
                     if repairs >= self.max_repair_attempts:
                         raise BuildRejectedError(issues)
                     repairs += 1
                     attempts += 1
-                    previous = generated
-                    generated = await stages.measure(
-                        "repair",
-                        partial(
-                            self.provider.repair,
-                            blueprint,
-                            previous,
-                            issues,
-                            attempt=repairs,
-                        ),
-                    )
+                    if repeated_acceptance:
+                        clean_regeneration_used = True
+                        diagnostics = _accumulated_diagnostics(issue_history)
+                        logger.info(
+                            "Generated app convergence reset job_id=%s attempt=%s "
+                            "reason=repeated_acceptance issues=%s",
+                            claim.job_id,
+                            attempts,
+                            _safe_issue_log_payload(diagnostics),
+                        )
+                        generated = await stages.measure(
+                            "repair",
+                            partial(
+                                _regenerate_with_diagnostics,
+                                self.provider,
+                                blueprint,
+                                diagnostics,
+                                attempt=repairs,
+                            ),
+                        )
+                    else:
+                        previous = generated
+                        generated = await stages.measure(
+                            "repair",
+                            partial(
+                                self.provider.repair,
+                                blueprint,
+                                previous,
+                                issues,
+                                attempt=repairs,
+                            ),
+                        )
                 if browser_bundle is None:
                     raise RuntimeError("validated app build has no browser bundle")
                 artifact = await stages.measure(
@@ -363,6 +407,81 @@ def _dedupe_issues(issues: tuple[ValidationIssue, ...]) -> tuple[ValidationIssue
     )
 
 
+def _acceptance_issue_fingerprint(
+    issues: tuple[ValidationIssue, ...],
+) -> tuple[tuple[str, str, str], ...] | None:
+    acceptance = sorted(
+        (issue.code, _acceptance_issue_scope(issue), issue.path or "")
+        for issue in issues
+        if issue.code.startswith(_ACCEPTANCE_ISSUE_PREFIX)
+    )
+    return tuple(acceptance) or None
+
+
+def _acceptance_issue_scope(issue: ValidationIssue) -> str:
+    """Keep fingerprints stable while distinguishing progress across entity workflows."""
+
+    message = " ".join(issue.message.lower().split())
+    for pattern in (
+        r"no usable ([a-z0-9_-]+) create workflow",
+        r"identify one ([a-z0-9_-]+) form",
+        r"declared ([a-z0-9_-]+) fields",
+        r"discovered ([a-z0-9_-]+) form",
+        r"expected records\.(?:create|update|delete) for ([a-z0-9_-]+)",
+        r"\"entity\":\"([a-z0-9_-]+)\"",
+        r"^([a-z0-9_-]+) (?:was saved|refreshed after save)",
+        r"name=\"([a-z0-9_-]+)\"",
+        r"for ([a-z0-9_.-]+)(?:\s|$)",
+        r"call ([a-z0-9_.-]+)(?:;|\s|$)",
+    ):
+        match = re.search(pattern, message)
+        if match is not None:
+            return match.group(1)
+    if issue.code == "acceptance_reveal_mutation":
+        return "workflow_reveal"
+    # Dynamic selectors, captured runtime state, and body text should not make the same failure
+    # look new on every candidate. The code remains the authoritative fallback scope.
+    return issue.code
+
+
+def _accumulated_diagnostics(
+    history: list[tuple[ValidationIssue, ...]],
+) -> tuple[ValidationIssue, ...]:
+    # Keep the clean-regeneration prompt bounded while preserving every distinct diagnostic.
+    flattened = tuple(issue for candidate in history for issue in candidate)
+    return _dedupe_issues(flattened)[:30]
+
+
+async def _regenerate_with_diagnostics(
+    provider: AppSourceProvider,
+    blueprint: AppBlueprint,
+    issues: tuple[ValidationIssue, ...],
+    *,
+    attempt: int,
+) -> GeneratedSource:
+    regenerate: Any = getattr(provider, "regenerate", None)
+    if callable(regenerate):
+        return await regenerate(blueprint, issues, attempt=attempt)
+    # Older/custom providers remain compatible. This is still a clean source generation rather
+    # than another local patch, although only providers with `regenerate` receive diagnostics.
+    return await provider.generate(blueprint)
+
+
+def _safe_issue_log_payload(
+    issues: tuple[ValidationIssue, ...],
+) -> list[dict[str, str]]:
+    payload: list[dict[str, str]] = []
+    for issue in issues:
+        item = {
+            "code": " ".join(issue.code.split())[:80],
+            "message": " ".join(issue.message.split())[:800],
+        }
+        if issue.path is not None:
+            item["path"] = " ".join(issue.path.split())[:240]
+        payload.append(item)
+    return payload
+
+
 def _acceptance_plan(
     blueprint: AppBlueprint,
 ) -> tuple[MappingProxyType[str, object], ...]:
@@ -492,9 +611,10 @@ async def process_next_build(hooks: BuildJobHooks, pipeline: AppBuildPipeline) -
                 revision_id=claim.revision_id,
                 code="source_rejected",
                 message=str(exc),
-                # A fresh generation can escape a bad local optimum after the bounded in-build
-                # repair loop. The durable queue still caps total attempts.
-                retryable=True,
+                # The bounded pipeline already tried local repair plus one clean regeneration
+                # when acceptance stopped converging. Requeueing the same blueprint only repeats
+                # that model spend; timeouts and provider/infrastructure failures remain retryable.
+                retryable=False,
                 issues=exc.issues,
                 duration_ms=max(0, round((monotonic() - started) * 1000)),
             ),
@@ -584,7 +704,7 @@ async def _fail_build_safely(
         claim.app_id,
         failure.code,
         failure.retryable,
-        [issue.code for issue in failure.issues],
+        _safe_issue_log_payload(failure.issues),
     )
     try:
         await hooks.fail_build(claim, failure)

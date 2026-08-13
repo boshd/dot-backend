@@ -193,6 +193,54 @@ def _workflow_guidance(blueprint: AppBlueprint) -> str:
     return "\n".join(f"- {line}" for line in lines)
 
 
+def _repair_guidance(
+    issues: tuple[ValidationIssue, ...],
+    *,
+    repeated_acceptance: bool = False,
+) -> str:
+    codes = {issue.code for issue in issues}
+    guidance: list[str] = []
+    if repeated_acceptance:
+        guidance.append(
+            "The same acceptance failure survived an earlier local repair. Do not patch the old "
+            "workflow again: replace the failing entity workflow with a small, explicit "
+            "implementation built directly from the blueprint and installed SDK declarations."
+        )
+    if "acceptance_flow_missing" in codes:
+        guidance.append(
+            "For each entity named by acceptance_flow_missing, make the create path obvious and "
+            "reachable. When the user must enter data, render one visible semantic form with "
+            "clearly labelled @dot/ui controls; give each visible user-editable control the "
+            "matching "
+            "manifest field name and use exactly one visible Button type=\"submit\". Derived or "
+            "contextual fields do not need fake inputs: assemble them in the handler. The "
+            "submitted runAction(\"records.create\", { entity, data }) payload is authoritative "
+            "and must include "
+            "every required field exactly once. A direct Button action is valid when no input is "
+            "needed and its complete payload is already available."
+        )
+    if "acceptance_reveal_mutation" in codes:
+        guidance.append(
+            "A control was interpreted as workflow disclosure but mutated data. Make its intent "
+            "unambiguous: a PrimaryWorkflowTrigger may only reveal controls, while an intentional "
+            "direct-action Button may perform exactly one mutation when its payload is complete. "
+            "If "
+            "the action needs user input, reveal or directly show a form and mutate only on submit."
+        )
+    if "acceptance_flow_ambiguous" in codes:
+        guidance.append(
+            "Make the failing create path unambiguous: keep one visible create form and one submit "
+            "button for that entity, with distinct field names and human labels."
+        )
+    if not guidance:
+        guidance.append(
+            "Resolve every reported issue exactly, then re-check policy, TypeScript, runtime "
+            "action "
+            "shape, and the complete user workflow before returning the source."
+        )
+    return "\n".join(f"- {item}" for item in guidance)
+
+
 def _typescript_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -303,6 +351,7 @@ class OpenAIAppSourceProvider:
             f"Repair attempt {attempt}. Return the complete corrected source, not a patch. Change "
             "only what is needed to resolve every reported issue; preserve working behavior and "
             "the product intent. Re-check the exact SDK types and do not add custom styling.\n\n"
+            f"ACTIONABLE REPAIR GUIDANCE:\n{_repair_guidance(issues)}\n\n"
             f"WORKFLOW GUIDANCE:\n{_workflow_guidance(blueprint)}\n\n"
             f"BLUEPRINT:\n{json.dumps(blueprint.as_dict(), ensure_ascii=False, sort_keys=True)}\n\n"
             f"ISSUES:\n{json.dumps([issue.as_dict() for issue in issues], ensure_ascii=False)}\n\n"
@@ -312,6 +361,33 @@ class OpenAIAppSourceProvider:
             prompt,
             blueprint=blueprint,
             phase="repair",
+            repair_attempt=attempt,
+        )
+
+    async def regenerate(
+        self,
+        blueprint: AppBlueprint,
+        issues: tuple[ValidationIssue, ...],
+        *,
+        attempt: int,
+    ) -> GeneratedSource:
+        prompt = (
+            "A previous candidate and its local repair converged on the same acceptance failure. "
+            "Discard that implementation and rebuild the complete app source cleanly from the "
+            "blueprint. Do not reuse or imitate the broken workflow. Keep all product "
+            "requirements, "
+            "entities, safety boundaries, and branded SDK constraints.\n\n"
+            f"CLEAN-REBUILD GUIDANCE:\n"
+            f"{_repair_guidance(issues, repeated_acceptance=True)}\n\n"
+            f"WORKFLOW GUIDANCE:\n{_workflow_guidance(blueprint)}\n\n"
+            f"BLUEPRINT:\n{json.dumps(blueprint.as_dict(), ensure_ascii=False, sort_keys=True)}\n\n"
+            "ACCUMULATED DIAGNOSTICS FROM PRIOR CANDIDATES:\n"
+            f"{json.dumps([issue.as_dict() for issue in issues], ensure_ascii=False)}"
+        )
+        return await self._request(
+            prompt,
+            blueprint=blueprint,
+            phase="regenerate",
             repair_attempt=attempt,
         )
 

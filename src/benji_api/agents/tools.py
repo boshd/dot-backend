@@ -39,6 +39,7 @@ from benji_api.models.finance import (
 )
 from benji_api.models.generated_app import GeneratedAppAccessMode
 from benji_api.models.generated_app_v2 import (
+    GeneratedAppBuildStatus,
     GeneratedAppDataRecord,
     GeneratedAppRole,
     GeneratedAppRuntimeKind,
@@ -118,6 +119,12 @@ _JOURNALED_GENERATED_APP_TOOLS = {
     "rollback_custom_app",
 }
 _TOOL_CALL_LEASE = timedelta(seconds=30)
+_BUILD_PHASE_LABELS = {
+    GeneratedAppBuildStatus.QUEUED.value: "waiting",
+    GeneratedAppBuildStatus.CLAIMED.value: "actively building and checking",
+    GeneratedAppBuildStatus.SUCCEEDED.value: "succeeded",
+    GeneratedAppBuildStatus.FAILED.value: "failed",
+}
 
 
 class ToolRegistry:
@@ -1228,6 +1235,7 @@ class InspectCustomAppTool:
                 {
                     "build_job_id": str(build.id),
                     "status": build.status,
+                    "phase": _BUILD_PHASE_LABELS.get(build.status, "unknown"),
                     "attempts": build.attempts,
                     "updated_at": build.updated_at.isoformat(),
                 }
