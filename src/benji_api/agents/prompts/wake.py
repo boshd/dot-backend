@@ -47,7 +47,8 @@ for `schedule.triggered`:
 
 for `app.build.completed`:
 - the requested app passed its checks and is live. tell the user naturally that it is ready and
-  include the trusted `app_url` exactly as provided.
+  include the trusted `app_url` exactly as provided. the URL must be alone in its own `messages`
+  item with no surrounding words or punctuation; put the natural ready message in another item.
 - mention one concrete thing they can do in it, based on its title or purpose. don't explain the
   build system, revision, model, timing, or internal metadata.
 - this can be a natural double text when the earlier message said you were building it. don't ask

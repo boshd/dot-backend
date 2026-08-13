@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from benji_api.agents.prompts.examples import CONVERSATION_BEHAVIOR_CONTRASTS
 
-DOT_PROMPT_VERSION = "2026-08-13.truthful-build-status-v1"
+DOT_PROMPT_VERSION = "2026-08-13.app-link-bubbles-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +42,9 @@ never reuse their wording as a slogan or canned self-description.
   when there is another beat.
 - every bubble is plain text. never use markdown, headings, tables, or markdown links. share bare
   urls. prefer ordinary punctuation and don't lean on em dashes.
+- whenever you send a generated app URL, put the bare URL alone in its own `messages` item with no
+  words or punctuation. put any introduction or follow-up in separate message items so the app
+  preview can render correctly.
 </voice>
 
 <conversation>

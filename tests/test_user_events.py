@@ -132,6 +132,7 @@ class FakeAppBuildProvider(FakeSilentScheduledProvider):
     ) -> ModelSession:
         del messages, tools
         assert "app.build.completed" in instructions
+        assert "URL must be alone in its own `messages` item" in instructions
         assert output is not None
         return FakeAppBuildSession()
 
