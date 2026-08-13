@@ -537,6 +537,32 @@ async def test_acceptance_progress_across_entities_is_not_mistaken_for_convergen
 
 
 @pytest.mark.anyio
+async def test_workflow_mismatch_progress_across_entities_is_not_convergence() -> None:
+    participant = ValidationIssue(
+        "acceptance_workflow_mismatch",
+        "form produced the wrong workflow mutation; expected operation=records.create "
+        "entity=participant, observed operation=records.create entity=recommendation",
+    )
+    expense = ValidationIssue(
+        "acceptance_workflow_mismatch",
+        "form produced the wrong workflow mutation; expected operation=records.create "
+        "entity=expense, observed operation=records.create entity=participant",
+    )
+    provider = ConvergenceProvider()
+    smoke = SequencedIssueSmokeRunner([participant, expense, None])
+
+    await AppBuildPipeline(
+        provider,
+        max_repair_attempts=4,
+        smoke_runner=smoke,
+    ).build(claim())
+
+    assert provider.repairs == 2
+    assert provider.regenerations == 0
+    assert smoke.calls == 3
+
+
+@pytest.mark.anyio
 async def test_exhausted_custom_build_is_rejected_instead_of_publishing_fallback() -> None:
     with pytest.raises(BuildRejectedError) as rejected:
         await AppBuildPipeline(
@@ -630,11 +656,15 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert output_schema["properties"]["entrypoint"]["pattern"].startswith("^src/")
     assert "package manifests" in request["instructions"]
     assert "PrimaryWorkflowTrigger" in request["instructions"]
+    assert "WorkflowForm" in request["instructions"]
     assert "PERSISTENCE AND USER ACTIONS" in request["instructions"]
     assert "PERSISTENCE AND ACCEPTANCE" not in request["instructions"]
     assert "data-dot-operation" not in request["instructions"]
     assert "data-dot-entity" not in request["instructions"]
     assert "data-dot-primary-action" not in request["instructions"]
+    assert "Never add `data-dot-*` attributes yourself" in request["instructions"]
+    assert "plain persisted user text" in request["instructions"]
+    assert "never embed example or external URL literals" in request["instructions"]
     assert 'options={[{ value: "high", label: "High" }]}' in request["instructions"]
     assert "onValueChange={setName}" in request["instructions"]
     assert "onCheckedChange={setDone}" in request["instructions"]
@@ -687,15 +717,33 @@ async def test_openai_repair_prompts_explain_acceptance_and_clean_rebuild() -> N
             "acceptance_reveal_mutation",
             "workflow reveal Add expense attempted a mutation",
         ),
+        ValidationIssue(
+            "acceptance_workflow_mismatch",
+            "participant workflow created a recommendation",
+        ),
+        ValidationIssue(
+            "external_url",
+            "source contains forbidden capability: external_url",
+        ),
+        ValidationIssue(
+            "acceptance_required_field_missing",
+            "participant payload omitted name",
+        ),
     )
 
     await provider.repair(app_blueprint, local, issues, attempt=1)
     repair_prompt = client.responses.requests[-1]["input"][0]["content"]
     assert "ACTIONABLE REPAIR GUIDANCE" in repair_prompt
-    assert "one visible semantic form" in repair_prompt
+    assert "one visible WorkflowForm" in repair_prompt
+    assert 'operation="records.create"' in repair_prompt
     assert 'exactly one visible Button type="submit"' in repair_prompt
     assert "Make its intent unambiguous" in repair_prompt
     assert "Derived or contextual fields do not need fake inputs" in repair_prompt
+    assert "semantic workflow target did not match" in repair_prompt
+    assert "do not share a handler or marker" in repair_prompt
+    assert "Keep the declared WorkflowForm identity" in repair_prompt
+    assert "omit undeclared fields" in repair_prompt
+    assert "stores only the value entered by the user" in repair_prompt
 
     await provider.regenerate(app_blueprint, issues, attempt=2)
     regeneration_prompt = client.responses.requests[-1]["input"][0]["content"]
@@ -814,6 +862,25 @@ export default function App() {
     )
 
     assert "reserved_primary_action_marker" in {
+        issue.code for issue in inspect_generated_source(source)
+    }
+
+
+def test_source_policy_rejects_direct_workflow_markers() -> None:
+    source = GeneratedSource(
+        files=(
+            SourceFile(
+                "src/App.tsx",
+                '''import { Card } from "@dot/ui";
+export default function App() {
+  return <Card data-dot-operation="records.create" data-dot-entity="task">bad</Card>;
+}''',
+            ),
+        ),
+        entrypoint="src/App.tsx",
+    )
+
+    assert "reserved_workflow_marker" in {
         issue.code for issue in inspect_generated_source(source)
     }
 

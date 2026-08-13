@@ -423,6 +423,9 @@ def _acceptance_issue_scope(issue: ValidationIssue) -> str:
 
     message = " ".join(issue.message.lower().split())
     for pattern in (
+        r"expected operation=[a-z0-9_.-]+ entity=([a-z0-9_-]+)",
+        r"declare operation=[a-z0-9_.-]+ entity=([a-z0-9_-]+)",
+        r"invalid payload for operation=[a-z0-9_.-]+ entity=([a-z0-9_-]+)",
         r"no usable ([a-z0-9_-]+) create workflow",
         r"identify one ([a-z0-9_-]+) form",
         r"declared ([a-z0-9_-]+) fields",

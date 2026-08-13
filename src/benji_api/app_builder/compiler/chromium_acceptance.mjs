@@ -335,6 +335,24 @@ function stepFieldHints(step) {
       : {};
 }
 
+function workflowIdentity(step) {
+  return {
+    operation: String(step.operation || ""),
+    entity: typeof step.entity === "string" ? step.entity : "",
+  };
+}
+
+function workflowIdentityText(identity) {
+  return `operation=${identity.operation || "(missing)"} entity=${identity.entity || "(none)"}`;
+}
+
+function observedMutationIdentity(operation) {
+  return {
+    operation: String(operation?.operation || ""),
+    entity: String(operation?.args?.entity || ""),
+  };
+}
+
 async function discoverSubmitForm(frame, step) {
   const forms = frame.locator("form");
   const candidates = await forms.evaluateAll((elements, rawStep) => {
@@ -357,6 +375,13 @@ async function discoverSubmitForm(frame, step) {
         ? rawStep.required_fields
         : [];
     return elements.map((form, index) => {
+      const markedOperation = String(form.getAttribute("data-dot-operation") || "");
+      const markedEntity = String(form.getAttribute("data-dot-entity") || "");
+      const semantic = Boolean(markedOperation || markedEntity);
+      const expectedOperation = String(rawStep.operation || "");
+      const expectedEntity = typeof rawStep.entity === "string" ? rawStep.entity : "";
+      const exactSemantic = semantic && markedOperation === expectedOperation &&
+        (!expectedEntity || markedEntity === expectedEntity);
       const submitters = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')]
         .filter(visible);
       const present = fieldNames.filter((name) => {
@@ -371,6 +396,10 @@ async function discoverSubmitForm(frame, step) {
       ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 100));
       return {
         index,
+        semantic,
+        exactSemantic,
+        markedOperation,
+        markedEntity,
         visible: visible(form),
         submitters: submitters.length,
         submitLabels,
@@ -380,8 +409,44 @@ async function discoverSubmitForm(frame, step) {
       };
     });
   }, step);
-  const usable = candidates.filter((item) => item.visible && item.submitters === 1);
-  if (!usable.length) return { form: null, candidates, score: 0 };
+  const exactVisible = candidates.filter((item) => item.exactSemantic && item.visible);
+  if (exactVisible.length > 1) {
+    fail(
+      "acceptance_flow_ambiguous",
+      `multiple visible workflows declare ${workflowIdentityText(workflowIdentity(step))}; candidates=${JSON.stringify(candidates)}`,
+    );
+  }
+  if (exactVisible.length === 1) {
+    const exact = exactVisible[0];
+    if (exact.submitters !== 1) {
+      fail(
+        exact.submitters > 1 ? "acceptance_flow_ambiguous" : "acceptance_flow_missing",
+        `workflow declaring ${workflowIdentityText(workflowIdentity(step))} has ${exact.submitters} visible submit controls; expected exactly one`,
+      );
+    }
+    return {
+      form: forms.nth(exact.index),
+      candidates,
+      score: exact.score,
+      matchKind: "semantic",
+      exactSemanticPresent: true,
+    };
+  }
+
+  // Marked forms belong to their declared workflow. Never reinterpret a different marked
+  // entity merely because it happens to share field names with the expected workflow.
+  const usable = candidates.filter(
+    (item) => !item.semantic && item.visible && item.submitters === 1,
+  );
+  if (!usable.length) {
+    return {
+      form: null,
+      candidates,
+      score: 0,
+      matchKind: null,
+      exactSemanticPresent: candidates.some((item) => item.exactSemantic),
+    };
+  }
   const bestScore = Math.max(...usable.map((item) => item.score));
   const best = usable.filter((item) => item.score === bestScore);
   if (best.length !== 1) {
@@ -395,6 +460,8 @@ async function discoverSubmitForm(frame, step) {
     form: forms.nth(best[0].index),
     candidates,
     score: bestScore,
+    matchKind: "legacy",
+    exactSemanticPresent: candidates.some((item) => item.exactSemantic),
   };
 }
 
@@ -406,20 +473,25 @@ function flowDiagnostics(step, discovery, revealState) {
       : [];
   const forms = (discovery?.candidates || []).map((item) => ({
     index: item.index,
+    marker: item.semantic ? {
+      operation: item.markedOperation || null,
+      entity: item.markedEntity || null,
+      exact: item.exactSemantic,
+    } : null,
     visible: item.visible,
     submit: item.submitLabels,
     present: item.present,
     missing_required: item.missingRequired,
   }));
   const explored = (revealState?.explored || []).map((item) => item.label);
-  return `required=${JSON.stringify(required)} forms=${JSON.stringify(forms)} explored=${JSON.stringify(explored)}`;
+  return `expected=${JSON.stringify(workflowIdentity(step))} required=${JSON.stringify(required)} forms=${JSON.stringify(forms)} explored=${JSON.stringify(explored)}`;
 }
 
-async function revealSemanticForm(page, frame, step, revealState) {
+async function revealSemanticForm(page, frame, step, revealState, { exactOnly = false } = {}) {
   let latestDiscovery = revealState.discovery;
   while (revealState.clicks < MAX_REVEAL_CLICKS) {
     const prefix = `dot-acceptance-reveal-${++acceptanceTargetSequence}`;
-    const candidates = await frame.evaluate(({ rawStep, seen, markerPrefix }) => {
+    const candidates = await frame.evaluate(({ rawStep, seen, markerPrefix, requireExact }) => {
       const visible = (element) => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
@@ -427,6 +499,8 @@ async function revealSemanticForm(page, frame, step, revealState) {
           Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
       };
       const entity = String(rawStep.entity || "").replaceAll("_", " ").toLowerCase();
+      const expectedOperation = String(rawStep.operation || "");
+      const expectedEntity = typeof rawStep.entity === "string" ? rawStep.entity : "";
       const entityParts = entity.split(/\s+/).filter((part) => part.length > 2);
       const occurrences = new Map();
       const result = [];
@@ -439,6 +513,14 @@ async function revealSemanticForm(page, frame, step, revealState) {
         }
         const explicitType = String(element.getAttribute("type") || "").toLowerCase();
         if (["submit", "reset"].includes(explicitType)) continue;
+        const markedOperation = String(element.getAttribute("data-dot-operation") || "");
+        const markedEntity = String(element.getAttribute("data-dot-entity") || "");
+        const semantic = Boolean(markedOperation || markedEntity);
+        const exactSemantic = semantic && markedOperation === expectedOperation &&
+          (!expectedEntity || markedEntity === expectedEntity);
+        if ((requireExact && !exactSemantic) || (!requireExact && semantic && !exactSemantic)) {
+          continue;
+        }
         const label = [
           element.getAttribute("aria-label"),
           element.getAttribute("title"),
@@ -458,6 +540,7 @@ async function revealSemanticForm(page, frame, step, revealState) {
         const key = `${baseKey}|${occurrence}`;
         if (seen.includes(key)) continue;
         let score = 0;
+        if (exactSemantic) score += 10_000;
         if (entity && normalized.includes(entity)) score += 120;
         score += entityParts.filter((part) => normalized.includes(part)).length * 30;
         if (/\b(?:add|new|create|log|start|open|show|edit|manage)\b/.test(normalized)) score += 40;
@@ -471,6 +554,10 @@ async function revealSemanticForm(page, frame, step, revealState) {
           label,
           score,
           index,
+          semantic,
+          exactSemantic,
+          markedOperation,
+          markedEntity,
           selector: `[data-dot-acceptance-reveal="${marker}"]`,
         });
       }
@@ -479,6 +566,7 @@ async function revealSemanticForm(page, frame, step, revealState) {
       rawStep: step,
       seen: [...revealState.seen],
       markerPrefix: prefix,
+      requireExact: exactOnly,
     });
     const candidate = candidates[0];
     if (!candidate) {
@@ -487,6 +575,7 @@ async function revealSemanticForm(page, frame, step, revealState) {
     }
     revealState.seen.add(candidate.key);
     revealState.clicks += 1;
+    if (candidate.exactSemantic) revealState.exactTargetAttempted = true;
     const locator = frame.locator(candidate.selector);
     if (await locator.count() !== 1 || !(await locator.isVisible()) || !(await locator.isEnabled())) {
       continue;
@@ -520,10 +609,18 @@ async function revealSemanticForm(page, frame, step, revealState) {
           `workflow action “${candidate.label}” produced ${newMutations.length} mutations; expected exactly one ${step.operation}`,
         );
       }
-      if (!mutationMatches(newMutations[0], step)) {
+      if (!mutationIdentityMatches(newMutations[0], step)) {
+        const expected = workflowIdentity(step);
+        const observed = observedMutationIdentity(newMutations[0]);
         fail(
-          "acceptance_reveal_mutation",
-          `workflow action “${candidate.label}” performed an unexpected mutation; expected ${step.operation} for ${step.entity || "the declared target"}, observed=${JSON.stringify(newMutations)}`,
+          "acceptance_workflow_mismatch",
+          `workflow action “${candidate.label}” declared ${workflowIdentityText({ operation: candidate.markedOperation, entity: candidate.markedEntity })} but performed the wrong mutation; expected ${workflowIdentityText(expected)}, observed ${workflowIdentityText(observed)}`,
+        );
+      }
+      if (!mutationPayloadMatches(newMutations[0], step)) {
+        fail(
+          "acceptance_required_field_missing",
+          `workflow action “${candidate.label}” produced an invalid payload for ${workflowIdentityText(workflowIdentity(step))}; ${payloadDiagnostics(newMutations[0], step)}`,
         );
       }
       revealState.explored.push({
@@ -531,6 +628,7 @@ async function revealSemanticForm(page, frame, step, revealState) {
         label: candidate.label,
         matched: true,
         direct_action: true,
+        semantic: candidate.exactSemantic || undefined,
       });
       return {
         kind: "direct_action",
@@ -547,8 +645,11 @@ async function revealSemanticForm(page, frame, step, revealState) {
       entity: step.entity,
       label: candidate.label,
       matched: Boolean(discovery.form),
+      semantic: candidate.exactSemantic || undefined,
     });
-    if (discovery.form && (discovery.score > 0 || !previouslyHadForm)) {
+    if (discovery.form && (
+      discovery.matchKind === "semantic" || discovery.score > 0 || !previouslyHadForm
+    )) {
       return { kind: "form", target: discovery.form };
     }
   }
@@ -560,15 +661,43 @@ async function interactionTarget(page, frame, step, { required, revealState }) {
   if (step.event_type === "submit") {
     const discovery = await discoverSubmitForm(frame, step);
     revealState.discovery = discovery;
-    if (discovery.form && discovery.score > 0) {
+    if (discovery.form && discovery.matchKind === "semantic") {
       return { kind: "form", target: discovery.form };
+    }
+
+    // A targeted SDK trigger is stronger evidence than a currently visible legacy form. This
+    // matters when two workflows share fields such as `name`: open the exact declared workflow
+    // rather than submitting whichever unrelated form happens to be visible.
+    const exactReveal = await revealSemanticForm(
+      page,
+      frame,
+      step,
+      revealState,
+      { exactOnly: true },
+    );
+    if (exactReveal) return exactReveal;
+
+    if (
+      discovery.form && discovery.score > 0 &&
+      !discovery.exactSemanticPresent && !revealState.exactTargetAttempted
+    ) {
+      return { kind: "form", target: discovery.form };
+    }
+    if (discovery.exactSemanticPresent || revealState.exactTargetAttempted) {
+      if (required) {
+        fail(
+          "acceptance_flow_missing",
+          `the exact declared workflow could not be opened; ${flowDiagnostics(step, revealState.discovery, revealState)}`,
+        );
+      }
+      return null;
     }
     const revealed = await revealSemanticForm(page, frame, step, revealState);
     if (revealed) return revealed;
     // A single zero-signal form may still implement a valid derived-data workflow. Its observed
     // mutation remains authoritative, but multiple zero-signal forms are rejected above.
     const zeroSignalDiscovery = revealState.discovery || discovery;
-    if (zeroSignalDiscovery.form) {
+    if (zeroSignalDiscovery.form && !zeroSignalDiscovery.exactSemanticPresent) {
       return { kind: "form", target: zeroSignalDiscovery.form };
     }
     if (required) {
@@ -907,9 +1036,13 @@ async function hostState(page) {
   return page.evaluate(() => JSON.parse(JSON.stringify(window.__DOT_ACCEPTANCE__)));
 }
 
-function mutationMatches(operation, step) {
+function mutationIdentityMatches(operation, step) {
   if (operation.operation !== step.operation) return false;
   if (typeof step.entity === "string" && operation.args?.entity !== step.entity) return false;
+  return true;
+}
+
+function mutationPayloadMatches(operation, step) {
   const data = operation.args?.data;
   const requiredFields = Array.isArray(step.required_payload_fields)
     ? step.required_payload_fields
@@ -927,6 +1060,22 @@ function mutationMatches(operation, step) {
     if (Object.keys(data).some((field) => !allowedFields.includes(field))) return false;
   }
   return true;
+}
+
+function payloadDiagnostics(operation, step) {
+  const required = Array.isArray(step.required_payload_fields)
+    ? step.required_payload_fields
+    : Array.isArray(step.required_fields)
+      ? step.required_fields
+      : [];
+  const allowed = Array.isArray(step.allowed_payload_fields)
+    ? step.allowed_payload_fields
+    : Array.isArray(step.allowed_fields)
+      ? step.allowed_fields
+      : [];
+  const data = operation.args?.data;
+  const observed = data && typeof data === "object" ? Object.keys(data).sort() : [];
+  return `required=${JSON.stringify(required)} allowed=${JSON.stringify(allowed)} observed_keys=${JSON.stringify(observed)}`;
 }
 
 async function verifyMutationOutcome(
@@ -959,10 +1108,18 @@ async function verifyMutationOutcome(
       `${interaction} produced ${newMutations.length} mutations; expected exactly one ${step.operation}`,
     );
   }
-  if (!mutationMatches(newMutations[0], step)) {
+  if (!mutationIdentityMatches(newMutations[0], step)) {
+    const expected = workflowIdentity(step);
+    const observed = observedMutationIdentity(newMutations[0]);
+    fail(
+      "acceptance_workflow_mismatch",
+      `${interaction} produced the wrong workflow mutation; expected ${workflowIdentityText(expected)}, observed ${workflowIdentityText(observed)}; mutation=${JSON.stringify(newMutations[0])}`,
+    );
+  }
+  if (!mutationPayloadMatches(newMutations[0], step)) {
     fail(
       "acceptance_required_field_missing",
-      `${interaction} did not produce the declared ${step.operation} payload; observed=${JSON.stringify(newMutations[0])}`,
+      `${interaction} produced an invalid payload for ${workflowIdentityText(workflowIdentity(step))}; ${payloadDiagnostics(newMutations[0], step)}`,
     );
   }
 
@@ -1007,7 +1164,13 @@ async function runAcceptance(page, frame, acceptancePlan, timeoutMs) {
   for (const step of acceptancePlan) {
     if (!step || typeof step !== "object") continue;
     const required = step.required === true;
-    const revealState = { clicks: 0, explored: [], seen: new Set(), discovery: null };
+    const revealState = {
+      clicks: 0,
+      explored: [],
+      seen: new Set(),
+      discovery: null,
+      exactTargetAttempted: false,
+    };
     const interaction = await interactionTarget(page, frame, step, { required, revealState });
     workflowReveals.push(...revealState.explored);
     if (!interaction) {

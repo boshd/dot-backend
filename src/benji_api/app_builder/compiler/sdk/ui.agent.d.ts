@@ -10,6 +10,15 @@ type SafeButtonProps = Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "clas
 type SafeInputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "className" | "style" | "color" | "size">;
 type SafeTextareaProps = Omit<React.TextareaHTMLAttributes<HTMLTextAreaElement>, "className" | "style" | "color">;
 type SafeSelectProps = Omit<React.SelectHTMLAttributes<HTMLSelectElement>, "className" | "style" | "color" | "size">;
+type SafeFormProps = Omit<React.FormHTMLAttributes<HTMLFormElement>, "className" | "style" | "color">;
+export type WorkflowOperation = "records.create";
+type WorkflowTargetProps = {
+    entity: string;
+    operation?: WorkflowOperation;
+} | {
+    entity?: never;
+    operation?: never;
+};
 type SelectOption = {
     value: string | number;
     label: ReactNode;
@@ -62,7 +71,13 @@ export declare function Button({ children, variant, size, type, ...props }: Safe
     variant?: "primary" | "accent" | "secondary" | "ghost" | "danger";
     size?: DotSize;
 }): import("react/jsx-runtime").JSX.Element;
-export declare function PrimaryWorkflowTrigger({ children, variant, size, ...props }: Omit<SafeButtonProps, "type"> & {
+export declare function WorkflowForm({ entity, operation, gap, children, ...props }: Omit<SafeFormProps, "onSubmit"> & ChildrenProps & {
+    entity: string;
+    operation?: WorkflowOperation;
+    gap?: DotSpace;
+    onSubmit: NonNullable<SafeFormProps["onSubmit"]>;
+}): import("react/jsx-runtime").JSX.Element;
+export declare function PrimaryWorkflowTrigger({ children, variant, size, entity, operation, ...props }: Omit<SafeButtonProps, "type"> & WorkflowTargetProps & {
     onClick: NonNullable<SafeButtonProps["onClick"]>;
     variant?: "primary" | "accent" | "secondary";
     size?: DotSize;

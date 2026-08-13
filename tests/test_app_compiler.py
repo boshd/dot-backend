@@ -100,6 +100,63 @@ async def test_primary_workflow_trigger_owns_the_private_acceptance_marker() -> 
 
 
 @pytest.mark.anyio
+async def test_workflow_components_own_exact_private_acceptance_targets() -> None:
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import {
+  AppShell, Button, Input, PrimaryWorkflowTrigger, WorkflowForm
+} from "@dot/ui";
+export default () => <AppShell>
+  <PrimaryWorkflowTrigger entity="participant" operation="records.create"
+    onClick={() => undefined}>add person</PrimaryWorkflowTrigger>
+  <WorkflowForm entity="participant" operation="records.create"
+    onSubmit={(event) => event.preventDefault()}>
+    <Input name="name" label="Name" />
+    <Button type="submit">Save</Button>
+  </WorkflowForm>
+</AppShell>;'''
+        )
+    )
+
+    assert "data-dot-operation" in bundle.javascript
+    assert "data-dot-entity" in bundle.javascript
+    assert "participant" in bundle.javascript
+
+
+@pytest.mark.anyio
+async def test_workflow_form_requires_an_entity_and_only_supports_create() -> None:
+    compiler = EsbuildAppCompiler()
+    with pytest.raises(AppCompilationError) as missing_entity:
+        await compiler.compile(
+            _source(
+                'import { WorkflowForm } from "@dot/ui"; '
+                'export default () => <WorkflowForm '
+                'onSubmit={(event) => event.preventDefault()}>bad</WorkflowForm>;'
+            )
+        )
+    with pytest.raises(AppCompilationError) as invalid_operation:
+        await compiler.compile(
+            _source(
+                'import { WorkflowForm } from "@dot/ui"; '
+                'export default () => <WorkflowForm entity="task" '
+                'operation="records.update" '
+                'onSubmit={(event) => event.preventDefault()}>bad</WorkflowForm>;'
+            )
+        )
+    with pytest.raises(AppCompilationError) as missing_handler:
+        await compiler.compile(
+            _source(
+                'import { WorkflowForm } from "@dot/ui"; '
+                'export default () => <WorkflowForm entity="task">bad</WorkflowForm>;'
+            )
+        )
+
+    assert missing_entity.value.issues[0].code == "typescript_type_error"
+    assert invalid_operation.value.issues[0].code == "typescript_type_error"
+    assert missing_handler.value.issues[0].code == "typescript_type_error"
+
+
+@pytest.mark.anyio
 async def test_primary_workflow_trigger_rejects_submit_type_and_missing_handler() -> None:
     compiler = EsbuildAppCompiler()
     with pytest.raises(AppCompilationError) as invalid_type:
@@ -117,9 +174,18 @@ async def test_primary_workflow_trigger_rejects_submit_type_and_missing_handler(
                 "export default () => <PrimaryWorkflowTrigger>bad</PrimaryWorkflowTrigger>;"
             )
         )
+    with pytest.raises(AppCompilationError) as operation_without_entity:
+        await compiler.compile(
+            _source(
+                'import { PrimaryWorkflowTrigger } from "@dot/ui"; '
+                'export default () => <PrimaryWorkflowTrigger operation="records.create" '
+                'onClick={() => undefined}>bad</PrimaryWorkflowTrigger>;'
+            )
+        )
 
     assert invalid_type.value.issues[0].code == "typescript_type_error"
     assert missing_handler.value.issues[0].code == "typescript_type_error"
+    assert operation_without_entity.value.issues[0].code == "typescript_type_error"
 
 
 @pytest.mark.anyio

@@ -505,6 +505,235 @@ export default function App() {
 
 
 @pytest.mark.anyio
+async def test_chromium_acceptance_uses_exact_workflow_marker_when_forms_share_fields() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction, useRecords } from "@dot/app-runtime";
+import {
+  AppShell, Button, Input, PrimaryWorkflowTrigger, WorkflowForm
+} from "@dot/ui";
+export default function App() {
+  const { records: recommendations } = useRecords<{ id: string; name: string }>("recommendation");
+  const { records: participants } = useRecords<{ id: string; name: string }>("participant");
+  const [recommendation, setRecommendation] = useState("");
+  const [participant, setParticipant] = useState("");
+  const [participantOpen, setParticipantOpen] = useState(false);
+  return <AppShell title="Portugal trip">
+    <WorkflowForm entity="recommendation" onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", {
+        entity: "recommendation", data: { name: recommendation },
+      });
+    }}>
+      <Input label="Recommendation" name="name" value={recommendation}
+        onValueChange={setRecommendation} />
+      <Button type="submit">save recommendation</Button>
+    </WorkflowForm>
+    <PrimaryWorkflowTrigger entity="participant"
+      onClick={() => setParticipantOpen(true)}>add participant</PrimaryWorkflowTrigger>
+    {participantOpen ? <WorkflowForm entity="participant" onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", {
+        entity: "participant", data: { name: participant },
+      });
+    }}>
+      <Input label="Participant" name="name" value={participant}
+        onValueChange={setParticipant} />
+      <Button type="submit">save participant</Button>
+    </WorkflowForm> : null}
+    <p>{recommendations.length} recommendations</p>
+    <p>{participants.map((person) => person.name).join(", ")}</p>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    result = await runner.smoke(bundle, acceptance_plan=plan)
+
+    mutation = next(item for item in result["operations"] if item["mutating"])
+    assert mutation["args"] == {"entity": "participant", "data": {"name": "test"}}
+    assert result["workflow_reveals"] == [
+        {
+            "entity": "participant",
+            "label": "add participant",
+            "matched": True,
+            "semantic": True,
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_rejects_semantic_form_with_wrong_mutation() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input, WorkflowForm } from "@dot/ui";
+export default function App() {
+  const [name, setName] = useState("");
+  return <AppShell title="Trip">
+    <WorkflowForm entity="participant" onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", {
+        entity: "recommendation", data: { name },
+      });
+    }}>
+      <Input label="Participant" name="name" value={name} onValueChange={setName} />
+      <Button type="submit">save participant</Button>
+    </WorkflowForm>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=plan)
+
+    assert failed.value.issues[0].code == "acceptance_workflow_mismatch"
+    assert "expected operation=records.create entity=participant" in failed.value.issues[0].message
+    assert "observed operation=records.create entity=recommendation" in (
+        failed.value.issues[0].message
+    )
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_rejects_invalid_payload_from_exact_workflow() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input, WorkflowForm } from "@dot/ui";
+export default function App() {
+  const [name, setName] = useState("");
+  return <AppShell title="Trip">
+    <WorkflowForm entity="participant" onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", {
+        entity: "participant", data: { nickname: name },
+      });
+    }}>
+      <Input label="Participant" name="name" value={name} onValueChange={setName} />
+      <Button type="submit">save participant</Button>
+    </WorkflowForm>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=plan)
+
+    assert failed.value.issues[0].code == "acceptance_required_field_missing"
+    assert 'required=["name"]' in failed.value.issues[0].message
+    assert 'allowed=["name"]' in failed.value.issues[0].message
+    assert 'observed_keys=["nickname"]' in failed.value.issues[0].message
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_never_falls_back_when_exact_hidden_workflow_exists() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { runAction } from "@dot/app-runtime";
+import { AppShell, Button, Input, WorkflowForm } from "@dot/ui";
+export default function App() {
+  const [recommendation, setRecommendation] = useState("");
+  const [participant, setParticipant] = useState("");
+  return <AppShell title="Portugal trip">
+    <form onSubmit={(event) => {
+      event.preventDefault();
+      void runAction("records.create", {
+        entity: "recommendation", data: { name: recommendation },
+      });
+    }}>
+      <Input label="Recommendation" name="name" value={recommendation}
+        onValueChange={setRecommendation} />
+      <Button type="submit">save recommendation</Button>
+    </form>
+    <div hidden>
+      <WorkflowForm entity="participant" onSubmit={(event) => {
+        event.preventDefault();
+        void runAction("records.create", {
+          entity: "participant", data: { name: participant },
+        });
+      }}>
+        <Input label="Participant" name="name" value={participant}
+          onValueChange={setParticipant} />
+        <Button type="submit">save participant</Button>
+      </WorkflowForm>
+    </div>
+  </AppShell>;
+}'''
+        )
+    )
+    plan = (
+        {
+            "operation": "records.create",
+            "entity": "participant",
+            "required": True,
+            "event_type": "submit",
+            "field_hints": {"name": "test"},
+            "required_payload_fields": ["name"],
+            "allowed_payload_fields": ["name"],
+        },
+    )
+
+    with pytest.raises(AppBrowserSmokeError) as failed:
+        await runner.smoke(bundle, acceptance_plan=plan)
+
+    assert failed.value.issues[0].code == "acceptance_flow_missing"
+    assert 'expected={"operation":"records.create","entity":"participant"}' in (
+        failed.value.issues[0].message
+    )
+
+
+@pytest.mark.anyio
 async def test_chromium_acceptance_uses_fresh_reveal_budget_for_each_entity() -> None:
     runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
     if not runner.available:
@@ -641,7 +870,9 @@ export default function App() {
     with pytest.raises(AppBrowserSmokeError) as failed:
         await runner.smoke(bundle, acceptance_plan=plan)
 
-    assert failed.value.issues[0].code == "acceptance_reveal_mutation"
+    assert failed.value.issues[0].code == "acceptance_workflow_mismatch"
+    assert "expected operation=records.create entity=participant" in failed.value.issues[0].message
+    assert "observed operation=records.create entity=expense" in failed.value.issues[0].message
     assert "expense" in failed.value.issues[0].message
 
 
@@ -779,7 +1010,9 @@ export default function App() {
     with pytest.raises(AppBrowserSmokeError) as failed:
         await runner.smoke(bundle, acceptance_plan=_vote_plan())
 
-    assert failed.value.issues[0].code == "acceptance_required_field_missing"
+    assert failed.value.issues[0].code == "acceptance_workflow_mismatch"
+    assert "expected operation=records.create entity=vote" in failed.value.issues[0].message
+    assert "observed operation=records.create entity=poll" in failed.value.issues[0].message
 
 
 @pytest.mark.anyio

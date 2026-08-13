@@ -22,6 +22,14 @@ type SafeSelectProps = Omit<
   React.SelectHTMLAttributes<HTMLSelectElement>,
   "className" | "style" | "color" | "size"
 >;
+type SafeFormProps = Omit<
+  React.FormHTMLAttributes<HTMLFormElement>,
+  "className" | "style" | "color"
+>;
+export type WorkflowOperation = "records.create";
+type WorkflowTargetProps =
+  | { entity: string; operation?: WorkflowOperation }
+  | { entity?: never; operation?: never };
 type SelectOption = {
   value: string | number;
   label: ReactNode;
@@ -205,12 +213,39 @@ export function Button({
   );
 }
 
+export function WorkflowForm({
+  entity,
+  operation = "records.create",
+  gap = "md",
+  children,
+  ...props
+}: Omit<SafeFormProps, "onSubmit"> & ChildrenProps & {
+  entity: string;
+  operation?: WorkflowOperation;
+  gap?: DotSpace;
+  onSubmit: NonNullable<SafeFormProps["onSubmit"]>;
+}) {
+  return (
+    <form
+      {...props}
+      className="dot-stack"
+      data-gap={normalizeSpace(gap)}
+      data-dot-operation={operation}
+      data-dot-entity={entity}
+    >
+      {children}
+    </form>
+  );
+}
+
 export function PrimaryWorkflowTrigger({
   children,
   variant = "primary",
   size = "md",
+  entity,
+  operation = "records.create",
   ...props
-}: Omit<SafeButtonProps, "type"> & {
+}: Omit<SafeButtonProps, "type"> & WorkflowTargetProps & {
   onClick: NonNullable<SafeButtonProps["onClick"]>;
   variant?: "primary" | "accent" | "secondary";
   size?: DotSize;
@@ -223,6 +258,8 @@ export function PrimaryWorkflowTrigger({
       data-variant={variant}
       data-size={normalizeSize(size)}
       data-dot-primary-action
+      data-dot-operation={entity ? operation : undefined}
+      data-dot-entity={entity}
     >
       {children}
     </button>

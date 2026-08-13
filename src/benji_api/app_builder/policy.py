@@ -49,6 +49,11 @@ _DESIGN_CONTRACT_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         "data-dot-primary-action is SDK-reserved; use PrimaryWorkflowTrigger",
     ),
     (
+        "reserved_workflow_marker",
+        re.compile(r"\bdata-dot-(?:operation|entity)\b"),
+        "data-dot workflow markers are SDK-reserved; use WorkflowForm or PrimaryWorkflowTrigger",
+    ),
+    (
         "custom_class_name",
         re.compile(r"<[^>]*\bclassName\s*=", re.MULTILINE),
         "className is not part of the generated-app design contract; use @dot/ui semantic props",

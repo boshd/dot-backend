@@ -68,12 +68,20 @@ PERSISTENCE AND USER ACTIONS
   `await runAction("records.delete", { record_id, expected_version })`.
 - Mutate only from an explicit click or submit. Never mutate on mount, in an effect/timer, or as an
   input changes. Call runAction directly in that handler, catch failures, and show inline feedback.
-- Give persisted controls their manifest field name and a clear human label. A create form uses a
-  visible Button `type="submit"`. If the primary form is hidden initially, use exactly one
-  PrimaryWorkflowTrigger to reveal it in one click; it is not a submit control.
+- Give persisted controls their manifest field name and a clear human label. Wrap every create
+  workflow in WorkflowForm, setting `entity` to that exact manifest entity name and `operation` to
+  `records.create`; for example, the expense entity uses `<WorkflowForm entity="expense"
+  operation="records.create" onSubmit={handler}>`. It owns the private acceptance identity. Put
+  exactly one visible Button `type="submit"` inside it. Never add `data-dot-*` attributes yourself.
+- If that WorkflowForm is hidden initially, use exactly one PrimaryWorkflowTrigger with the same
+  exact `entity` and `operation="records.create"` to reveal it in one click; it is not a submit
+  control. Forms for different entities must keep their own exact entity.
 - Every manifest entity represents user-created data and needs a working create workflow. Render
   calculated totals, balances, and recommendations from saved records; never invent a form for
   derived output.
+- Manifest fields named url, link, or similar are plain persisted user text. Render them as normal
+  labelled inputs; never embed example or external URL literals and never navigate or use network
+  access.
 - Use `await runAction("dot.reminder.create", { title, goal, run_at, timezone, recurrence })`
   only when manifest.capabilities declares it and only from a user gesture. The goal is visible,
   run_at is RFC3339, timezone is IANA, and recurrence is once, daily, or weekly.
@@ -209,7 +217,8 @@ def _repair_guidance(
     if "acceptance_flow_missing" in codes:
         guidance.append(
             "For each entity named by acceptance_flow_missing, make the create path obvious and "
-            "reachable. When the user must enter data, render one visible semantic form with "
+            "reachable. When the user must enter data, render one visible WorkflowForm with its "
+            "entity exactly matching the manifest entity and operation=\"records.create\", plus "
             "clearly labelled @dot/ui controls; give each visible user-editable control the "
             "matching "
             "manifest field name and use exactly one visible Button type=\"submit\". Derived or "
@@ -229,8 +238,29 @@ def _repair_guidance(
         )
     if "acceptance_flow_ambiguous" in codes:
         guidance.append(
-            "Make the failing create path unambiguous: keep one visible create form and one submit "
-            "button for that entity, with distinct field names and human labels."
+            "Make the failing create path unambiguous: give each entity its own WorkflowForm with "
+            "the exact manifest entity and records.create operation, one submit button, distinct "
+            "field names, and human labels. Never reuse another entity's WorkflowForm marker."
+        )
+    if "acceptance_workflow_mismatch" in codes:
+        guidance.append(
+            "The semantic workflow target did not match the mutation it performed. Keep the "
+            "WorkflowForm or PrimaryWorkflowTrigger entity and operation identical to the one "
+            "records.create call reached by that workflow; do not share a handler or marker across "
+            "different entities."
+        )
+    if "acceptance_required_field_missing" in codes:
+        guidance.append(
+            "Keep the declared WorkflowForm identity, but correct its submitted data to match the "
+            "diagnostics: include every required manifest field exactly once, omit undeclared "
+            "fields, and derive contextual values in the submit handler instead of inventing "
+            "visible inputs for them."
+        )
+    if "external_url" in codes:
+        guidance.append(
+            "Remove every embedded external URL literal. A manifest url or link field stores only "
+            "the value entered by the user through a labelled input; it does not need an example "
+            "URL, anchor, navigation, or network request."
         )
     if not guidance:
         guidance.append(
