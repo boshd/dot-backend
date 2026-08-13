@@ -23,6 +23,23 @@ LANGUAGE_PREFERENCE_OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+REACTION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "An optional native reaction to the user's current message. This is only honored when "
+        "the current channel explicitly supports reactions. Set type to none unless a prompt "
+        "module explicitly says this exact current message supports native reactions."
+    ),
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": ["none", "like", "love", "laugh", "emphasize", "question"],
+        }
+    },
+    "required": ["type"],
+    "additionalProperties": False,
+}
+
 CONVERSATION_OUTPUT = StructuredOutputDefinition(
     name="benji_conversation_turn",
     description=(
@@ -51,8 +68,9 @@ CONVERSATION_OUTPUT = StructuredOutputDefinition(
                 "additionalProperties": False,
             },
             "language_preference": LANGUAGE_PREFERENCE_OUTPUT_SCHEMA,
+            "reaction": REACTION_OUTPUT_SCHEMA,
         },
-        "required": ["messages", "follow_up", "language_preference"],
+        "required": ["messages", "follow_up", "language_preference", "reaction"],
         "additionalProperties": False,
     },
 )
@@ -69,6 +87,7 @@ class ConversationOutput:
     messages: tuple[str, ...]
     follow_up: FollowUpProposal | None = None
     language_preference: LanguagePreferenceProposal | None = None
+    reaction: str | None = None
 
 
 def parse_conversation_output(text: str) -> ConversationOutput:
@@ -108,6 +127,7 @@ def parse_conversation_output(text: str) -> ConversationOutput:
         messages=messages,
         follow_up=follow_up,
         language_preference=_parse_language_preference(data.get("language_preference")),
+        reaction=parse_reaction(data.get("reaction")),
     )
 
 
@@ -118,3 +138,16 @@ def _parse_language_preference(value: object) -> LanguagePreferenceProposal | No
         return LanguagePreferenceProposal.model_validate(value)
     except ValidationError as error:
         raise ValueError("Conversation output language preference was invalid") from error
+
+
+def parse_reaction(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Conversation output reaction was invalid")
+    reaction_type = value.get("type")
+    if reaction_type == "none":
+        return None
+    if reaction_type not in {"like", "love", "laugh", "emphasize", "question"}:
+        raise ValueError("Conversation output reaction was invalid")
+    return reaction_type

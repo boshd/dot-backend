@@ -58,6 +58,7 @@ class FakeLinqClient:
         self.sent: list[dict[str, str]] = []
         self.typing: list[bool] = []
         self.read_chats: list[str] = []
+        self.reactions: list[dict[str, Any]] = []
         self.chats: dict[str, dict[str, Any]] = {}
 
     async def send_chat_message(
@@ -84,6 +85,18 @@ class FakeLinqClient:
 
     async def get_chat(self, *, chat_id: str) -> dict[str, Any]:
         return self.chats.get(chat_id, {})
+
+    async def add_message_reaction(
+        self, *, message_id: str, reaction_type: str, part_index: int = 0
+    ) -> dict[str, Any]:
+        self.reactions.append(
+            {
+                "message_id": message_id,
+                "reaction_type": reaction_type,
+                "part_index": part_index,
+            }
+        )
+        return {"status": "accepted"}
 
 
 class FakeModelProvider:
@@ -1025,6 +1038,83 @@ async def test_completed_onboarding_unlocks_tools_on_the_next_turn(
             AgentRunPurpose.ONBOARDING.value,
             AgentRunPurpose.CONVERSATION.value,
         ]
+
+
+@pytest.mark.anyio
+async def test_completed_direct_imessage_turn_can_be_reaction_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with linq_test_app(monkeypatch) as (
+        client,
+        session_factory,
+        fake_linq,
+        fake_model,
+    ):
+        fake_model.profile = {
+            "display_name": "Kareem",
+            "birth_date": "1996-09-02",
+            "location_city": None,
+            "location_country": "Egypt",
+        }
+        first_payload = message_received_payload(
+            text="i’m Kareem, born Sep 2 1996 in Egypt"
+        )
+        first_body = json.dumps(first_payload, separators=(",", ":")).encode()
+        assert (
+            await client.post(
+                "/api/v1/webhooks/linq", content=first_body, headers=signed_headers(first_body)
+            )
+        ).status_code == 200
+
+        fake_model.response_text = (
+            '{"messages":[],"follow_up":{"should_schedule":false,"goal":"",'
+            '"due_after_seconds":0},"language_preference":{"action":"keep",'
+            '"mode":"auto"},"reaction":{"type":"like"}}'
+        )
+        second_payload = message_received_payload(
+            event_id="reaction-event",
+            message_id="reaction-target-message",
+            text="sounds good",
+        )
+        second_payload["created_at"] = "2026-08-09T12:00:01Z"
+        second_body = json.dumps(second_payload, separators=(",", ":")).encode()
+        response = await client.post(
+            "/api/v1/webhooks/linq", content=second_body, headers=signed_headers(second_body)
+        )
+
+        assert response.status_code == 200
+        assert fake_linq.reactions == [
+            {
+                "message_id": "reaction-target-message",
+                "reaction_type": "like",
+                "part_index": 0,
+            }
+        ]
+        assert len(fake_linq.sent) == 1
+        assert fake_linq.typing == [True, False, True, False]
+        assert fake_model.last_regular_messages[-1].content == "sounds good"
+        async with session_factory() as session:
+            target_message = await session.scalar(
+                select(Message).where(
+                    Message.source_external_id == "reaction-target-message"
+                )
+            )
+            reaction_message = await session.scalar(
+                select(Message).where(Message.content == "", Message.direction == "outbound")
+            )
+            delivery = await session.scalar(
+                select(MessageDelivery).where(
+                    MessageDelivery.idempotency_key == "benji:reaction-event:agent:reaction"
+                )
+            )
+        assert reaction_message is not None
+        assert target_message is not None
+        assert reaction_message.raw_payload["reaction"] == {
+            "type": "like",
+            "target_external_id": "reaction-target-message",
+            "target_message_id": str(target_message.id),
+        }
+        assert delivery is not None and delivery.status == "sent"
 
 
 @pytest.mark.anyio

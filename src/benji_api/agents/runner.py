@@ -37,6 +37,7 @@ class AgentResult:
     tool_calls: tuple[ExecutedToolCall, ...]
     follow_up: FollowUpProposal | None = None
     language_preference: LanguagePreferenceProposal | None = None
+    reaction: str | None = None
     raw_output: dict[str, Any] | None = None
     token_usage: dict[str, int] | None = None
 
@@ -87,6 +88,7 @@ class AgentRunner:
                     tool_calls=tuple(executions),
                     follow_up=conversation_output.follow_up,
                     language_preference=conversation_output.language_preference,
+                    reaction=conversation_output.reaction,
                     raw_output=_raw_output(turn.text),
                     token_usage=token_usage or None,
                 )

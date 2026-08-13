@@ -60,7 +60,8 @@ class FakeModelSession:
             text=(
                 '{"messages":["it worked"],'
                 '"follow_up":{"should_schedule":false,"goal":"","due_after_seconds":0},'
-                '"language_preference":{"action":"set","mode":"egyptian_franco"}}'
+                '"language_preference":{"action":"set","mode":"egyptian_franco"},'
+                '"reaction":{"type":"like"}}'
             ),
         )
 
@@ -107,6 +108,7 @@ async def test_agent_runner_executes_tools_until_it_gets_final_text() -> None:
     assert result.language_preference is not None
     assert result.language_preference.action == "set"
     assert result.language_preference.mode.value == "egyptian_franco"
+    assert result.reaction == "like"
     assert result.raw_output is not None
     assert result.raw_output["language_preference"] == {
         "action": "set",

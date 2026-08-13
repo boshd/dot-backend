@@ -8,6 +8,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from benji_api.agents.channel_delivery import (
+    deliver_linq_reaction,
     deliver_linq_replies,
     load_recent_messages,
     mark_run_failed,
@@ -19,10 +20,12 @@ from benji_api.agents.prompts import PromptModule, build_benji_instructions
 from benji_api.agents.prompts.base import DOT_PROMPT_VERSION
 from benji_api.agents.prompts.group import build_group_module
 from benji_api.agents.prompts.memory import build_memory_module
+from benji_api.agents.prompts.reactions import DIRECT_IMESSAGE_REACTIONS
 from benji_api.agents.prompts.relationship import build_relationship_module
 from benji_api.agents.prompts.wake import build_follow_up_module, build_user_event_module
+from benji_api.agents.reactions import direct_imessage_reaction_target
 from benji_api.agents.relationship import RelationshipState, load_relationship_state
-from benji_api.agents.results import PersistedReply, PersistedTurn
+from benji_api.agents.results import PersistedReaction, PersistedReply, PersistedTurn
 from benji_api.agents.runner import AgentRunner
 from benji_api.agents.text_style import prepare_app_completion_bubbles, prepare_text_bubbles
 from benji_api.agents.tools import ToolRegistry
@@ -43,6 +46,7 @@ from benji_api.models.agent import (
 )
 from benji_api.models.channel import (
     Conversation,
+    ConversationChannel,
     ConversationKind,
     Message,
     MessageDirection,
@@ -274,12 +278,18 @@ async def _run_agent_wake(
                 if follow_up is None or follow_up.status == AgentFollowUpStatus.CANCELLED.value:
                     raise AgentWakeCancelled("Follow-up was cancelled by a user message")
 
+            trigger = (
+                await session.get(Message, trigger_message_id)
+                if trigger_message_id is not None
+                else None
+            )
             messages = await load_recent_messages(
                 session,
                 conversation_id=conversation_id,
                 limit=settings.agent_context_message_limit,
+                through_message_id=trigger_message_id,
             )
-            context_through = await session.scalar(
+            context_through = trigger or await session.scalar(
                 select(Message)
                 .where(
                     Message.conversation_id == conversation_id,
@@ -288,15 +298,20 @@ async def _run_agent_wake(
                 .order_by(Message.created_at.desc(), Message.id.desc())
                 .limit(1)
             )
+            covered_filters = [
+                Message.conversation_id == conversation_id,
+                Message.direction == MessageDirection.INBOUND.value,
+            ]
+            if trigger is not None:
+                covered_filters.append(
+                    or_(Message.created_at < trigger.created_at, Message.id == trigger.id)
+                )
             covered_inbound_ids = tuple(
                 str(message_id)
                 for message_id in (
                     await session.scalars(
                         select(Message.id)
-                        .where(
-                            Message.conversation_id == conversation_id,
-                            Message.direction == MessageDirection.INBOUND.value,
-                        )
+                        .where(*covered_filters)
                         .order_by(Message.created_at.desc(), Message.id.desc())
                         .limit(settings.agent_context_message_limit)
                     )
@@ -309,10 +324,15 @@ async def _run_agent_wake(
                         content=f"[trusted system event context: {query}]",
                     )
                 )
-            trigger = (
-                await session.get(Message, trigger_message_id)
-                if trigger_message_id is not None
+            source_channel_binding = (
+                await session.get(ConversationChannel, source_binding_id)
+                if source_binding_id is not None
                 else None
+            )
+            reaction_target_external_id = direct_imessage_reaction_target(
+                conversation=conversation,
+                channel=source_channel_binding,
+                trigger=trigger,
             )
             memory = MemoryContext()
             relationship = RelationshipState()
@@ -349,6 +369,8 @@ async def _run_agent_wake(
                         exc_info=True,
                     )
             modules = list(state_modules)
+            if reaction_target_external_id is not None:
+                modules.append(DIRECT_IMESSAGE_REACTIONS)
             if conversation.kind == ConversationKind.GROUP.value and not any(
                 module.name == "group_conversation" for module in modules
             ):
@@ -499,12 +521,16 @@ async def _run_agent_wake(
             response_group_id = uuid4()
             replies: list[PersistedReply] = []
             persisted_messages: list[Message] = []
+            persisted_reaction: PersistedReaction | None = None
+            selected_reaction = (
+                result.reaction if reaction_target_external_id is not None else None
+            )
             clean_messages = (
                 prepare_app_completion_bubbles(result.messages, app_url=required_app_url)
                 if required_app_url is not None
                 else prepare_text_bubbles(result.messages)
             )
-            if not clean_messages:
+            if not clean_messages and selected_reaction is None:
                 if purpose == AgentRunPurpose.EVENT and wake_type == "schedule.triggered":
                     run.status = AgentRunStatus.COMPLETED.value
                     run.model_response_id = result.response_id
@@ -514,6 +540,36 @@ async def _run_agent_wake(
                     await session.commit()
                     return PersistedTurn(replies=())
                 raise RuntimeError("Agent returned an empty plain-text turn")
+            if selected_reaction is not None and reaction_target_external_id is not None:
+                reaction_message = Message(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    source_binding_id=source_binding_id,
+                    source_channel=source_channel,
+                    idempotency_key=f"{idempotency_key}:reaction",
+                    response_group_id=response_group_id,
+                    response_ordinal=-1,
+                    direction=MessageDirection.OUTBOUND.value,
+                    status=MessageStatus.COMPLETED.value,
+                    content="",
+                    raw_payload={
+                        "agent_run_id": str(run.id),
+                        "model_response_id": result.response_id,
+                        "wake_type": wake_type,
+                        "reaction": {
+                            "type": selected_reaction,
+                            "target_external_id": reaction_target_external_id,
+                            "target_message_id": str(trigger_message_id),
+                        },
+                    },
+                )
+                session.add(reaction_message)
+                await session.flush()
+                persisted_reaction = PersistedReaction(
+                    message_id=reaction_message.id,
+                    target_external_id=reaction_target_external_id,
+                    reaction_type=selected_reaction,
+                )
             for ordinal, text in enumerate(clean_messages):
                 message_key = idempotency_key if ordinal == 0 else f"{idempotency_key}:{ordinal}"
                 outbound = Message(
@@ -551,6 +607,7 @@ async def _run_agent_wake(
                 settings.memory_enabled
                 and trigger_message_id is not None
                 and conversation.kind == ConversationKind.DIRECT.value
+                and persisted_messages
             ):
                 await enqueue_memory_job(
                     session,
@@ -581,7 +638,7 @@ async def _run_agent_wake(
             run.token_usage = result.token_usage
             run.completed_at = datetime.now(UTC)
             await session.commit()
-            return PersistedTurn(replies=tuple(replies))
+            return PersistedTurn(replies=tuple(replies), reaction=persisted_reaction)
     except Exception as error:
         if run_id is not None:
             await mark_run_failed(run_id, error)
@@ -635,10 +692,27 @@ async def _load_existing_turn(
         ).all()
         if not messages:
             return None
+        reaction = next(
+            (
+                PersistedReaction(
+                    message_id=message.id,
+                    target_external_id=str(message.raw_payload["reaction"]["target_external_id"]),
+                    reaction_type=str(message.raw_payload["reaction"]["type"]),
+                )
+                for message in messages
+                if isinstance(message.raw_payload.get("reaction"), dict)
+                and message.raw_payload["reaction"].get("target_external_id")
+                and message.raw_payload["reaction"].get("type")
+            ),
+            None,
+        )
         return PersistedTurn(
             replies=tuple(
-                PersistedReply(message_id=message.id, text=message.content) for message in messages
-            )
+                PersistedReply(message_id=message.id, text=message.content)
+                for message in messages
+                if message.content
+            ),
+            reaction=reaction,
         )
 
 
@@ -659,8 +733,10 @@ async def process_agent_turn(
     allow_follow_up: bool = True,
     typing_enabled: bool = True,
 ) -> None:
+    typing_active = False
     if typing_enabled:
         await set_typing(linq_client, chat_id=chat_id, active=True)
+        typing_active = True
     idempotency_key = f"benji:{trigger_event_id}:agent"
     try:
         turn = await run_agent_turn(
@@ -677,6 +753,18 @@ async def process_agent_turn(
             state_modules=state_modules,
             allow_follow_up=allow_follow_up,
         )
+        if typing_active and turn.reaction is not None and not turn.replies:
+            await set_typing(linq_client, chat_id=chat_id, active=False)
+            typing_active = False
+        if turn.reaction is not None:
+            await deliver_linq_reaction(
+                reaction_message_id=turn.reaction.message_id,
+                target_external_id=turn.reaction.target_external_id,
+                reaction_type=turn.reaction.reaction_type,
+                channel_id=channel_id,
+                idempotency_key=idempotency_key,
+                client=linq_client,
+            )
         await deliver_linq_replies(
             replies=turn.replies,
             channel_id=channel_id,
@@ -691,5 +779,5 @@ async def process_agent_turn(
     except Exception:
         logger.exception("Agent turn failed for conversation %s", conversation_id)
     finally:
-        if typing_enabled:
+        if typing_active:
             await set_typing(linq_client, chat_id=chat_id, active=False)

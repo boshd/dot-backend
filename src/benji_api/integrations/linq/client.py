@@ -44,6 +44,24 @@ class LinqClient:
     async def share_contact_card(self, *, chat_id: str) -> None:
         await self._request("POST", f"/chats/{chat_id}/share_contact_card")
 
+    async def add_message_reaction(
+        self,
+        *,
+        message_id: str,
+        reaction_type: str,
+        part_index: int = 0,
+    ) -> dict[str, Any]:
+        safe_id = quote(message_id, safe="")
+        return await self._request(
+            "POST",
+            f"/messages/{safe_id}/reactions",
+            json={
+                "operation": "add",
+                "type": reaction_type,
+                "part_index": part_index,
+            },
+        )
+
     async def delete_attachment(self, *, attachment_id: str) -> None:
         safe_id = quote(attachment_id, safe="")
         await self._request("DELETE", f"/attachments/{safe_id}")

@@ -208,8 +208,9 @@ async def test_post_onboarding_handoff_is_injected_once() -> None:
         )
         normalized = " ".join(module.content.split())
         assert "meet it lightly" in normalized
-        assert "otherwise let the acknowledgment land" in normalized
-        assert "force a new question just to keep talking" in normalized
+        assert "still learning what dot is for" in normalized
+        assert "one-time opening" in normalized
+        assert "not permission to force a question onto every acknowledgment" in normalized
 
         normal_reply = Message(
             conversation_id=conversation.id,

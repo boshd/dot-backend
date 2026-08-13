@@ -69,9 +69,13 @@ def _turn_cue(state: RelationshipState, latest_user_text: str) -> str:
             return (
                 "this is the first easy beat after setup. meet it lightly. if the transcript "
                 "contains a concrete interest or unfinished request, a quick callback can reopen "
-                "that thread; otherwise let the acknowledgment land. do not explain the earlier "
-                "questions, label the transition, hunt for a meaningful life goal, or force a new "
-                "question just to keep talking."
+                "that thread. if no direction has emerged at all, remember that this person is "
+                "still learning what dot is for: after the light reaction, create one easy path "
+                "with a specific capability or ordinary near-term outcome question. this is a "
+                "one-time "
+                "opening, not permission to force a question onto every acknowledgment. do not "
+                "explain the earlier questions, label the transition, or hunt for a profound life "
+                "goal."
             )
         return (
             "the current message already supplies a direction. respond to it directly rather than "

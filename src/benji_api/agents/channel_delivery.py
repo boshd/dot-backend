@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from benji_api.agents.media import model_attachment
@@ -34,17 +34,34 @@ async def load_recent_messages(
     *,
     conversation_id: UUID,
     limit: int,
+    through_message_id: UUID | None = None,
 ) -> list[AgentMessage]:
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None:
         return []
+    through = (
+        await session.get(Message, through_message_id)
+        if through_message_id is not None
+        else None
+    )
+    if through_message_id is not None and (
+        through is None or through.conversation_id != conversation_id
+    ):
+        return []
+    message_filter = [
+        Message.conversation_id == conversation_id,
+        Message.content != "",
+    ]
+    if through is not None:
+        # The trigger itself plus strictly older messages prevents a later persisted inbound
+        # message from influencing a response or reaction aimed at this trigger.
+        message_filter.append(
+            or_(Message.created_at < through.created_at, Message.id == through.id)
+        )
     result = await session.execute(
         select(Message, User)
         .outerjoin(User, User.id == Message.sender_user_id)
-        .where(
-            Message.conversation_id == conversation_id,
-            Message.content != "",
-        )
+        .where(*message_filter)
         .order_by(Message.created_at.desc())
         .limit(limit)
     )
@@ -177,6 +194,41 @@ async def deliver_linq_replies(
         await mark_outbound_sent(delivery_id, response)
 
 
+async def deliver_linq_reaction(
+    *,
+    reaction_message_id: UUID,
+    target_external_id: str,
+    reaction_type: str,
+    channel_id: UUID,
+    idempotency_key: str,
+    client: LinqClient,
+) -> None:
+    """Best-effort native reaction delivery; cosmetic failure never blocks text."""
+    delivery_key = f"{idempotency_key}:reaction"
+    delivery_id = await create_outbound_delivery(
+        message_id=reaction_message_id,
+        channel_id=channel_id,
+        provider="linq",
+        idempotency_key=delivery_key,
+    )
+    if not await _delivery_needs_send(delivery_id, retry_failed=False):
+        return
+    try:
+        response = await client.add_message_reaction(
+            message_id=target_external_id,
+            reaction_type=reaction_type,
+        )
+    except Exception as error:
+        await mark_outbound_failed(delivery_id, error)
+        logger.warning(
+            "Could not add Linq reaction to message %s",
+            target_external_id,
+            exc_info=True,
+        )
+        return
+    await mark_outbound_sent(delivery_id, response)
+
+
 def inter_bubble_typing_delay(
     text: str,
     *,
@@ -193,13 +245,17 @@ def inter_bubble_typing_delay(
     return min(maximum, minimum + character_delay)
 
 
-async def _delivery_needs_send(delivery_id: UUID) -> bool:
+async def _delivery_needs_send(
+    delivery_id: UUID,
+    *,
+    retry_failed: bool = True,
+) -> bool:
     async with async_session_factory() as session:
         delivery = await session.get(MessageDelivery, delivery_id)
-        return delivery is None or delivery.status in {
-            DeliveryStatus.PENDING.value,
-            DeliveryStatus.FAILED.value,
-        }
+        retryable = {DeliveryStatus.PENDING.value}
+        if retry_failed:
+            retryable.add(DeliveryStatus.FAILED.value)
+        return delivery is None or delivery.status in retryable
 
 
 async def mark_run_failed(run_id: UUID, error: Exception) -> None:

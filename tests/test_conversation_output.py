@@ -15,6 +15,10 @@ def test_conversation_output_does_not_impose_a_model_visible_bubble_quota() -> N
     assert "maxItems" not in message_schema
     assert "natural text bubble" in message_schema["items"]["description"].lower()
     assert "language_preference" in CONVERSATION_OUTPUT.schema["required"]
+    assert "reaction" in CONVERSATION_OUTPUT.schema["required"]
+    assert "unless a prompt module explicitly says" in (
+        CONVERSATION_OUTPUT.schema["properties"]["reaction"]["description"].lower()
+    )
 
 
 def test_conversation_output_preserves_the_models_natural_segmentation() -> None:
@@ -29,12 +33,33 @@ def test_conversation_output_preserves_the_models_natural_segmentation() -> None
                     "goal": "",
                     "due_after_seconds": 0,
                 },
+                "reaction": {"type": "none"},
             }
         )
     )
 
     assert turn.messages == tuple(messages)
     assert turn.language_preference is None
+    assert turn.reaction is None
+
+
+def test_conversation_output_parses_native_reaction() -> None:
+    turn = parse_conversation_output(
+        json.dumps(
+            {
+                "messages": [],
+                "follow_up": {
+                    "should_schedule": False,
+                    "goal": "",
+                    "due_after_seconds": 0,
+                },
+                "reaction": {"type": "like"},
+            }
+        )
+    )
+
+    assert turn.messages == ()
+    assert turn.reaction == "like"
 
 
 def test_conversation_output_parses_private_language_preference_proposal() -> None:
@@ -74,6 +99,9 @@ def test_core_prompt_optimizes_for_conversational_momentum_not_a_bubble_count() 
     assert "don't tack a question or next-step offer onto every response" in normalized
     assert 'treat short replies like "yeah", "sure", "do it", or "why?"' in normalized
     assert "don't confuse momentum with constant questioning" in normalized
+    assert "carry more of the conversational load until a shared thread appears" in normalized
+    assert "don't fall into a loop of mutual validation" in normalized
+    assert '"hit me with anything"' in normalized
     assert "may simply close the current beat" in normalized
     assert 'avoid vague handoffs such as "what now?", "how can i help?"' in normalized
 
@@ -105,6 +133,7 @@ def test_core_prompt_avoids_copy_ready_positioning_and_teaches_behavioral_contra
         "small social beat",
         "unnecessary explanation",
         "low-pressure continuation",
+        "vague referral",
         "earned informality",
         "relaxed correction",
         "profile-question pushback",

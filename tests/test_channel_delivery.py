@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from benji_api.agents.channel_delivery import (
+    deliver_linq_reaction,
     deliver_linq_replies,
     inter_bubble_typing_delay,
     load_recent_messages,
@@ -47,6 +48,12 @@ class TimelineLinqClient:
     async def stop_typing(self, *, chat_id: str) -> None:
         del chat_id
         self.timeline.append("typing:off")
+
+    async def add_message_reaction(
+        self, *, message_id: str, reaction_type: str, part_index: int = 0
+    ) -> dict[str, Any]:
+        self.timeline.append(f"react:{message_id}:{reaction_type}:{part_index}")
+        return {"status": "accepted"}
 
 
 @pytest.mark.anyio
@@ -230,4 +237,53 @@ async def test_multipart_linq_delivery_restarts_typing_before_each_later_bubble(
     )
     assert timeline == []
 
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_linq_reaction_delivery_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.flush()
+        conversation = Conversation(user_id=user.id)
+        session.add(conversation)
+        await session.flush()
+        channel = ConversationChannel(
+            conversation_id=conversation.id,
+            provider="linq",
+            external_id="chat-1",
+            service="iMessage",
+        )
+        reaction_message = Message(
+            conversation_id=conversation.id,
+            user_id=user.id,
+            source_binding_id=channel.id,
+            source_channel="linq",
+            direction=MessageDirection.OUTBOUND.value,
+            status=MessageStatus.COMPLETED.value,
+            content="",
+        )
+        session.add_all([channel, reaction_message])
+        await session.commit()
+    monkeypatch.setattr("benji_api.agents.channel_delivery.async_session_factory", factory)
+    timeline: list[str] = []
+    client = TimelineLinqClient(timeline)
+    for _ in range(2):
+        await deliver_linq_reaction(
+            reaction_message_id=reaction_message.id,
+            target_external_id="inbound-1",
+            reaction_type="like",
+            channel_id=channel.id,
+            idempotency_key="turn-1",
+            client=client,  # type: ignore[arg-type]
+        )
+
+    assert timeline == ["react:inbound-1:like:0"]
     await engine.dispose()

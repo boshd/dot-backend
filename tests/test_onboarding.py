@@ -112,7 +112,11 @@ def test_onboarding_prompt_is_a_composable_conversation_state() -> None:
     assert "onboarding can unfold across the real conversation" in prompt
     assert "normalize it without asking for redundant confirmation" in normalized
     assert "lead with the person's purpose when one appears" in normalized
-    assert "ask what the friend said or what caught their interest" in normalized
+    assert "do not spend the whole first turn only asking what their friend said" in normalized
+    assert "leaving them responsible for discovering the product" in normalized
+    assert "don't let the beginning become several rounds of mutual acknowledgment" in normalized
+    assert "don't repeat \"try anything\" in different words" in normalized
+    assert "once a thread appears, stay with it instead of continuing to sell dot" in normalized
     assert 'what is "taking up space in their head"' in normalized
     assert "respond to the desired outcome first" in normalized
     assert "don't mechanically follow one profile answer" in prompt
