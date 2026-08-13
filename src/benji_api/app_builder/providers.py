@@ -43,10 +43,49 @@ HARD CONTRACT
 - Default-export one React component. Render exactly one AppShell with a short title; it owns the
   only H1. Although Heading's legacy type permits level 1, generated content uses levels 2–4.
 
-PRODUCT SHAPE
-- Build the dominant user workflow directly. Prefer a useful focused tool over a dashboard or
-  marketing page. Use compact sentence-case copy, progressive disclosure, one obvious primary
-  action, and purpose-specific information hierarchy.
+PRODUCT SHAPE AND DESIGN CONTRACT
+Complexity scales with the request; restraint scales with the screen. A single-purpose request
+(one list, one tracker, one countdown) is one quiet screen with no Tabs. A multi-area request
+(a trip hub with a plan, shared expenses, and places to eat) gets exactly one Tabs row naming
+the user's own areas, each tab holding one focused screen. Never invent areas, views, filters,
+or stats the purpose does not name. When in doubt, delete the section - but never delete an
+area the user asked for.
+- The first screen is the job. Open on the content the user will touch most. Never build an
+  overview, dashboard, or metric-summary home unless the purpose is explicitly a dashboard.
+- Per-screen furniture budget at rest: the AppShell title (once, app level), at most one
+  one-line description, at most one compact summary line (plain Text, never a Metric grid),
+  and one primary content block (one List, form, or board). Exactly one primary-variant Button
+  or PrimaryWorkflowTrigger is visible at rest per screen; every other control is quiet
+  (secondary, ghost, or a list-row affordance).
+- Whitespace is the styling. No decorative Badges, no icons as ornament, no tinted panels to
+  fill space, no stacked Cards of different tones. Accent appears in at most two places per
+  screen. Use Metric only for a genuinely numeric summary the purpose calls for, at most two
+  at rest and never as a home layout.
+- Copy is quiet: compact sentence case, no exclamation marks, and never explain the app to its
+  user ("Track your expenses below!" is wrong; the form is self-evident).
+- Shared or collaborative apps are contribution-first: keep each area's add flow one tap away
+  and attribute rows to the person who added them when participant data exists.
+
+REFERENCE SHAPES
+These compact shapes show the furniture budget in practice. They are reference shapes, not a
+menu: compose freely for purposes they do not cover, keeping the same restraint.
+- Checklist (single purpose, no Tabs): `<AppShell title="Packing"><List>{rows.map((row) =>
+  <Item key={row.id} leading={<Checkbox label={row.text} checked={row.done}
+  onCheckedChange={(next) => toggle(row, next)} />} title={row.text} />)}</List>
+  <PrimaryWorkflowTrigger entity="item" onClick={reveal}>Add item</PrimaryWorkflowTrigger>
+  </AppShell>`.
+- Tracker/log: one summary line in the AppShell description ("Today: 5 glasses"), one
+  WorkflowForm with one or two inputs and its submit Button, then the recent entries as a
+  divided List.
+- Splitter: balances as quiet Text rows (who owes whom), one expense WorkflowForm, entries
+  attributed like `<Item title="Dinner" detail="added by Sam" meta="$42.00" />`.
+- Planner/schedule: days or stages as Section groups in one scroll; reach for one Tabs row
+  only when the request names distinct areas ("Plan / Costs / Eat").
+- Poll/vote: the question as the title, options as tappable rows with counts, nothing else.
+- Countdown/status: one large value (Heading or a single Metric), one detail line, at most one
+  quiet action.
+
+COMPONENT RECIPES
 - Compose Stack, Cluster, Grid, Section, Card, List, and the form primitives. Do not nest default
   Cards. Use SegmentedControl for exclusive modes. IconButton always needs a label.
 - Check every @dot/ui import and prop against the authoritative types below. Useful recipes:
@@ -55,10 +94,12 @@ PRODUCT SHAPE
   `<Select value={value} onValueChange={setValue}
   options={[{ value: "high", label: "High" }]} />`,
   `<Checkbox checked={done} onCheckedChange={setDone} label="Done" />`,
-  `<Item leading={<Checkbox label="Done" checked={row.completed} onCheckedChange={onToggle} />} title={row.text} />`,
+  `<Item leading={<Checkbox label="Done" checked={row.completed}
+  onCheckedChange={onToggle} />} title={row.text} />`,
   `<SegmentedControl label="Filter" value={filter}
   onValueChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`,
-  `<Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="prep">Prep</TabsTrigger></TabsList><TabsContent value="prep">...</TabsContent></Tabs>`, and
+  `<Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="prep">Prep</TabsTrigger>
+  </TabsList><TabsContent value="prep">...</TabsContent></Tabs>`, and
   `<ListItem title="Task" detail="Today" />`. Use value callbacks, not a React setter as a native
   onChange handler. `visual_direction` chooses accent and density only; do not invent CSS from it.
 
@@ -261,6 +302,15 @@ def _repair_guidance(
             "diagnostics: include every required manifest field exactly once, omit undeclared "
             "fields, and derive contextual values in the submit handler instead of inventing "
             "visible inputs for them."
+        )
+    if "visual_quality" in codes:
+        guidance.append(
+            "The rendered first screen failed Dot's design review. Apply each visual_quality "
+            "note exactly while preserving behavior and every area the purpose names. Re-check "
+            "the per-screen furniture budget: the AppShell title once, at most one description "
+            "line, at most one compact summary line, one primary content block, and exactly one "
+            "primary action visible at rest. Remove redundant sections, decorative badges, and "
+            "filler panels; keep copy in quiet sentence case. Do not add new views."
         )
     if "external_url" in codes:
         guidance.append(

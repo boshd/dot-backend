@@ -75,6 +75,7 @@ class QuickJSAppSmokeRunner:
         bundle: BrowserBundle,
         *,
         acceptance_plan: tuple[Mapping[str, Any], ...] = (),
+        screenshot_path: str | Path | None = None,
     ) -> Mapping[str, Any]:
         if not self.available:
             raise RuntimeError("Dot app QuickJS smoke runtime is unavailable")
@@ -86,7 +87,8 @@ class QuickJSAppSmokeRunner:
         # Keep the protocol-compatible parameter while callers migrate, but never send an
         # interaction plan into the synthetic DOM. Synthetic interaction was rejecting valid
         # browser apps because it cannot faithfully model native controls or React focus.
-        del acceptance_plan
+        # The synthetic guest has no pixels either, so screenshots are Chromium-only.
+        del acceptance_plan, screenshot_path
         encoded_request = json.dumps(
             request,
             ensure_ascii=False,
@@ -230,6 +232,7 @@ class ChromiumAppAcceptanceRunner:
         *,
         acceptance_plan: tuple[Mapping[str, Any], ...] = (),
         records: Mapping[str, Any] | None = None,
+        screenshot_path: str | Path | None = None,
     ) -> Mapping[str, Any]:
         if not self.available:
             raise RuntimeError("Dot app real Chromium acceptance runtime is unavailable")
@@ -242,6 +245,10 @@ class ChromiumAppAcceptanceRunner:
         }
         if records is not None:
             request["records"] = dict(records)
+        if screenshot_path is not None:
+            # The screenshot never travels through the bounded JSON response; the harness
+            # writes the JPEG to this trusted path and reports only a capture marker.
+            request["screenshot_path"] = str(screenshot_path)
         encoded_request = json.dumps(
             request,
             ensure_ascii=False,
@@ -347,10 +354,15 @@ class VerifiedAppSmokeRunner:
         bundle: BrowserBundle,
         *,
         acceptance_plan: tuple[Mapping[str, Any], ...] = (),
+        screenshot_path: str | Path | None = None,
     ) -> Mapping[str, Any]:
         quickjs_result = dict(await self.quickjs.smoke(bundle))
         chromium_result = dict(
-            await self.chromium.smoke(bundle, acceptance_plan=acceptance_plan)
+            await self.chromium.smoke(
+                bundle,
+                acceptance_plan=acceptance_plan,
+                screenshot_path=screenshot_path,
+            )
         )
         return {
             **quickjs_result,

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -236,8 +237,11 @@ class FakeSmokeRunner:
         bundle: object,
         *,
         acceptance_plan: tuple[object, ...] = (),
+        screenshot_path: object | None = None,
     ) -> MappingProxyType[str, object]:
         del bundle, acceptance_plan
+        if screenshot_path is not None:
+            Path(screenshot_path).write_bytes(b"\xff\xd8fake-at-rest-jpeg")
         return MappingProxyType(
             {
                 "ready": True,
@@ -246,6 +250,17 @@ class FakeSmokeRunner:
                 "static_html": '<main data-testid="app">ready</main>',
             }
         )
+
+
+class NoScreenshotSmokeRunner(FakeSmokeRunner):
+    async def smoke(
+        self,
+        bundle: object,
+        *,
+        acceptance_plan: tuple[object, ...] = (),
+        screenshot_path: object | None = None,
+    ) -> MappingProxyType[str, object]:
+        return await super().smoke(bundle, acceptance_plan=acceptance_plan)
 
 
 class SequencedIssueSmokeRunner(FakeSmokeRunner):
@@ -258,12 +273,46 @@ class SequencedIssueSmokeRunner(FakeSmokeRunner):
         bundle: object,
         *,
         acceptance_plan: tuple[object, ...] = (),
+        screenshot_path: object | None = None,
     ) -> MappingProxyType[str, object]:
         self.calls += 1
         outcome = self.outcomes.pop(0)
         if outcome is not None:
             raise AppBrowserSmokeError((outcome,))
-        return await super().smoke(bundle, acceptance_plan=acceptance_plan)
+        return await super().smoke(
+            bundle, acceptance_plan=acceptance_plan, screenshot_path=screenshot_path
+        )
+
+
+class FakeVisualReviewer:
+    name = "fake-visual"
+
+    def __init__(self, outcomes: list[tuple[ValidationIssue, ...]]) -> None:
+        self.outcomes = list(outcomes)
+        self.screenshots: list[bytes] = []
+
+    async def review(
+        self,
+        screenshot_jpeg: bytes,
+        *,
+        blueprint: AppBlueprint,
+    ) -> tuple[ValidationIssue, ...]:
+        del blueprint
+        self.screenshots.append(screenshot_jpeg)
+        return self.outcomes.pop(0) if self.outcomes else ()
+
+
+class ExplodingVisualReviewer:
+    name = "exploding-visual"
+
+    async def review(
+        self,
+        screenshot_jpeg: bytes,
+        *,
+        blueprint: AppBlueprint,
+    ) -> tuple[ValidationIssue, ...]:
+        del screenshot_jpeg, blueprint
+        raise RuntimeError("sensitive reviewer quota response")
 
 
 class ConvergenceProvider(DeterministicLocalProvider):
@@ -306,8 +355,9 @@ class MissingStaticSmokeRunner(FakeSmokeRunner):
         bundle: object,
         *,
         acceptance_plan: tuple[object, ...] = (),
+        screenshot_path: object | None = None,
     ) -> MappingProxyType[str, object]:
-        del bundle, acceptance_plan
+        del bundle, acceptance_plan, screenshot_path
         return MappingProxyType({"ready": True, "runtime_errors": 0})
 
 
@@ -425,6 +475,159 @@ async def test_required_smoke_render_is_stored_once_and_must_not_be_empty() -> N
             require_browser_smoke=True,
         ).build(claim())
     assert rejected.value.issues[0].code == "missing_static_render"
+
+
+@pytest.mark.anyio
+async def test_visual_review_failure_repairs_then_ships() -> None:
+    provider = ConvergenceProvider()
+    reviewer = FakeVisualReviewer(
+        [
+            (ValidationIssue("visual_quality", "density: collapse the stacked metric cards"),),
+            (),
+        ]
+    )
+    pipeline = AppBuildPipeline(
+        provider,
+        smoke_runner=FakeSmokeRunner(),
+        require_browser_smoke=True,
+        visual_reviewer=reviewer,
+    )
+
+    completion = await pipeline.build(claim())
+
+    assert provider.repairs == 1
+    assert completion.metrics.repair_attempts == 1
+    assert len(reviewer.screenshots) == 2
+    assert reviewer.screenshots[0].startswith(b"\xff\xd8")
+    assert "visual_review" in completion.metrics.stage_duration_ms
+
+
+@pytest.mark.anyio
+async def test_visual_review_is_capped_at_two_scores_per_build() -> None:
+    provider = ConvergenceProvider()
+    always_failing = ValidationIssue("visual_quality", "redundancy: remove the duplicate totals")
+    reviewer = FakeVisualReviewer([(always_failing,), (always_failing,), (always_failing,)])
+    pipeline = AppBuildPipeline(
+        provider,
+        max_repair_attempts=4,
+        smoke_runner=FakeSmokeRunner(),
+        require_browser_smoke=True,
+        visual_reviewer=reviewer,
+    )
+
+    completion = await pipeline.build(claim())
+
+    assert len(reviewer.screenshots) == 2
+    assert completion.metrics.repair_attempts == 2
+
+
+@pytest.mark.anyio
+async def test_visual_review_failures_never_block_builds() -> None:
+    completion = await AppBuildPipeline(
+        DeterministicLocalProvider(),
+        smoke_runner=FakeSmokeRunner(),
+        require_browser_smoke=True,
+        visual_reviewer=ExplodingVisualReviewer(),
+    ).build(claim())
+
+    assert completion.metrics.repair_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_visual_review_skipped_without_captured_screenshot() -> None:
+    reviewer = FakeVisualReviewer(
+        [(ValidationIssue("visual_quality", "hierarchy: unreachable"),)]
+    )
+    completion = await AppBuildPipeline(
+        DeterministicLocalProvider(),
+        smoke_runner=NoScreenshotSmokeRunner(),
+        require_browser_smoke=True,
+        visual_reviewer=reviewer,
+    ).build(claim())
+
+    assert reviewer.screenshots == []
+    assert completion.metrics.repair_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_openai_visual_reviewer_maps_failed_axes_to_issues() -> None:
+    from benji_api.app_builder.visual_review import OpenAIVisualReviewer
+
+    class FakeVisionResponses:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        async def create(self, **request: object) -> SimpleNamespace:
+            self.requests.append(request)
+            return SimpleNamespace(
+                model="gpt-5.6-terra",
+                output_text=json.dumps(
+                    {
+                        "axes": [
+                            {"axis": "hierarchy", "passed": True, "note": ""},
+                            {
+                                "axis": "density",
+                                "passed": False,
+                                "note": "Collapse the three stacked cards into one list.",
+                            },
+                            {"axis": "alignment", "passed": True, "note": ""},
+                            {"axis": "redundancy", "passed": True, "note": ""},
+                            {
+                                "axis": "copy",
+                                "passed": False,
+                                "note": "Remove the exclamation mark from the header.",
+                            },
+                        ]
+                    }
+                ),
+                usage=SimpleNamespace(input_tokens=900, output_tokens=90, total_tokens=990),
+            )
+
+    responses = FakeVisionResponses()
+    client = SimpleNamespace(responses=responses)
+    reviewer = OpenAIVisualReviewer(client=client)
+
+    issues = await reviewer.review(
+        b"\xff\xd8fake", blueprint=AppBlueprint.from_mapping(blueprint())
+    )
+
+    assert [issue.code for issue in issues] == ["visual_quality", "visual_quality"]
+    assert issues[0].message.startswith("density: ")
+    assert issues[1].message.startswith("copy: ")
+    request = responses.requests[0]
+    assert request["store"] is False
+    content = request["input"][0]["content"]
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"].startswith("data:image/jpeg;base64,")
+    assert "Complexity must match the purpose" in request["instructions"]
+
+
+@pytest.mark.anyio
+async def test_openai_visual_reviewer_fails_open_on_provider_errors() -> None:
+    from benji_api.app_builder.visual_review import OpenAIVisualReviewer
+
+    class BrokenResponses:
+        async def create(self, **request: object) -> SimpleNamespace:
+            del request
+            raise RuntimeError("sensitive vision quota response")
+
+    reviewer = OpenAIVisualReviewer(client=SimpleNamespace(responses=BrokenResponses()))
+
+    issues = await reviewer.review(
+        b"\xff\xd8fake", blueprint=AppBlueprint.from_mapping(blueprint())
+    )
+
+    assert issues == ()
+
+
+def test_repair_guidance_covers_visual_quality() -> None:
+    from benji_api.app_builder.providers import _repair_guidance
+
+    guidance = _repair_guidance(
+        (ValidationIssue("visual_quality", "density: collapse the stacked cards"),)
+    )
+    assert "design review" in guidance.casefold()
+    assert "furniture budget" in guidance.casefold()
 
 
 @pytest.mark.anyio
@@ -703,6 +906,34 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     )
     assert "as an input changes" not in normalized_instructions
     assert "never mutate on mount" in normalized_instructions
+
+
+def test_generator_instructions_enforce_design_contract() -> None:
+    from benji_api.app_builder.providers import _GENERATOR_INSTRUCTIONS
+
+    instructions = " ".join(_GENERATOR_INSTRUCTIONS.split())
+
+    # Complexity scales with the request; restraint scales with the screen.
+    assert "Complexity scales with the request" in instructions
+    assert "restraint scales with the screen" in instructions
+    assert "one quiet screen with no Tabs" in instructions
+    assert "one Tabs row naming the user's own areas" in instructions
+    assert "The first screen is the job" in instructions
+    assert "unless the purpose is explicitly a dashboard" in instructions
+    # Per-screen furniture budget and single primary action.
+    assert "one primary content block" in instructions
+    assert "visible at rest per screen" in instructions
+    # Whitespace, accent, and Metric restraint.
+    assert "Whitespace is the styling" in instructions
+    assert "at most two places per screen" in instructions
+    assert "never as a home layout" in instructions
+    # Quiet copy and collaborative attribution.
+    assert "no exclamation marks" in instructions
+    assert "contribution-first" in instructions
+    # Exemplars anchor restraint without becoming a template menu.
+    assert "REFERENCE SHAPES" in instructions
+    assert "not a menu" in instructions
+    assert "never delete an area the user asked for" in instructions
 
 
 @pytest.mark.anyio

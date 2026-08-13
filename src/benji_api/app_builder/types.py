@@ -5,6 +5,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
@@ -400,6 +401,7 @@ class AppBrowserSmokeRunner(Protocol):
         bundle: BrowserBundle,
         *,
         acceptance_plan: tuple[Mapping[str, Any], ...] = (),
+        screenshot_path: str | Path | None = None,
     ) -> Mapping[str, Any]: ...
 
 

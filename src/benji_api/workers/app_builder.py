@@ -13,6 +13,7 @@ from benji_api.app_builder.browser_smoke import (
 from benji_api.app_builder.pipeline import AppBuildPipeline, process_next_build
 from benji_api.app_builder.providers import DeterministicLocalProvider, OpenAIAppSourceProvider
 from benji_api.app_builder.service_hooks import GeneratedAppBuildServiceHooks
+from benji_api.app_builder.visual_review import OpenAIVisualReviewer
 from benji_api.db.session import close_database
 
 logging.basicConfig(level=logging.INFO)
@@ -84,6 +85,23 @@ def _source_provider_from_environment(
     raise RuntimeError(f"Unsupported app builder provider: {configured_provider}")
 
 
+def _visual_reviewer_from_environment() -> OpenAIVisualReviewer | None:
+    """Blocking-but-fail-open design review over the at-rest Chromium screenshot."""
+
+    raw = (os.getenv("APP_BUILDER_VISUAL_REVIEW") or "true").strip().lower()
+    if raw in {"false", "0", "no", "off"}:
+        return None
+    if raw not in {"true", "1", "yes", "on"}:
+        raise ValueError("APP_BUILDER_VISUAL_REVIEW must be true or false")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAIVisualReviewer(
+        api_key=api_key,
+        model=os.getenv("APP_BUILDER_VISUAL_REVIEW_MODEL", "gpt-5.6-terra"),
+    )
+
+
 async def run() -> None:
     shutdown_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -140,14 +158,20 @@ async def run() -> None:
     )
     if not smoke_runner.available:
         raise RuntimeError("The app builder requires both QuickJS and real Chromium acceptance")
+    visual_reviewer = _visual_reviewer_from_environment()
     pipeline = AppBuildPipeline(
         provider,
         max_repair_attempts=repair_attempts,
         timeout_seconds=timeout_seconds,
         smoke_runner=smoke_runner,
         require_browser_smoke=True,
+        visual_reviewer=visual_reviewer,
     )
-    logger.info("App builder started with provider=%s", pipeline.provider.name)
+    logger.info(
+        "App builder started with provider=%s visual_review=%s",
+        pipeline.provider.name,
+        visual_reviewer.name if visual_reviewer is not None else "disabled",
+    )
     try:
         while not shutdown_requested.is_set():
             handled = await process_next_build(hooks, pipeline)

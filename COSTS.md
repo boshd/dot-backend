@@ -49,6 +49,13 @@ compilation) and 272,138,240 bytes maximum resident memory for the full test pro
 builder remains serial and Chromium exits after every candidate, so idle Railway usage is unchanged;
 re-measure on Railway before increasing build concurrency.
 
+Each build additionally runs a visual design review (`APP_BUILDER_VISUAL_REVIEW`, default on):
+at most two Terra vision calls per build over one 390x844 JPEG screenshot (roughly 1,000–1,500
+input tokens and under 300 output tokens per call at low reasoning, about $0.01/build worst
+case). The gate is fail-open, so reviewer outages add no retries or spend. Disable it or point
+`APP_BUILDER_VISUAL_REVIEW_MODEL` at a cheaper vision model if app-build volume makes this
+material.
+
 ### Firebase SMS exposure if Blaze is enabled later
 
 Prices apply after the first 10 sent SMS per project per day. Failed delivery can still count as

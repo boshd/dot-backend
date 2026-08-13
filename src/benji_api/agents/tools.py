@@ -894,24 +894,30 @@ class CreateGeneratedAppTool:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 500,
-                        "description": "The concrete outcome this app should create for its users.",
+                        "description": (
+                            "The concrete outcome this app should create for its users: one "
+                            "sentence naming the single job of the first screen, plus any "
+                            "additional areas the user explicitly asked for."
+                        ),
                     },
                     "product_brief": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 4_000,
                         "description": (
-                            "A cohesive brief covering the requested workflows, interaction model, "
-                            "important states, calculations, and useful defaults."
+                            "The workflows the user actually asked for: interaction model, "
+                            "important states, calculations, and useful defaults. Do not invent "
+                            "additional views, filters, or stats they did not request."
                         ),
                     },
                     "visual_direction": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 1_000,
+                        "maxLength": 200,
                         "description": (
-                            "Task-specific visual hierarchy, mood, density, and useful visual "
-                            "metaphors. Avoid a generic admin dashboard."
+                            "Accent color preference, density, and at most one mood word; "
+                            "never materials, textures, patterns, or references the renderer "
+                            "cannot honor."
                         ),
                     },
                     "access_mode": {
@@ -1568,7 +1574,7 @@ class ReviseCustomAppTool:
                     "change_request": {"type": "string", "minLength": 1, "maxLength": 4_000},
                     "title": {"type": ["string", "null"], "maxLength": 120},
                     "description": {"type": ["string", "null"], "maxLength": 500},
-                    "visual_direction": {"type": ["string", "null"], "maxLength": 1_000},
+                    "visual_direction": {"type": ["string", "null"], "maxLength": 200},
                     "manifest_json": {"type": ["string", "null"], "maxLength": 32_000},
                     "seed_data_json": {"type": ["string", "null"], "maxLength": 32_000},
                 },
@@ -1595,7 +1601,7 @@ class ReviseCustomAppTool:
             arguments.get("description"), "description", 500, allow_empty=True
         )
         visual_direction = _optional_string_argument(
-            arguments.get("visual_direction"), "visual_direction", 1_000
+            arguments.get("visual_direction"), "visual_direction", 200
         )
         manifest = _optional_json_object_argument(
             arguments.get("manifest_json"), "manifest_json", 32_000

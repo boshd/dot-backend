@@ -1283,3 +1283,31 @@ export default function App() {
     result = await runner.smoke(bundle)
 
     assert result["ux_audit"]["passed"] is True
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_captures_at_rest_screenshot(tmp_path) -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { AppShell, Item, List } from "@dot/ui";
+export default function App() {
+  return <AppShell title="Packing">
+    <List>
+      <Item title="Passport" meta="Packed" />
+      <Item title="Charger" meta="Open" />
+    </List>
+  </AppShell>;
+}'''
+        )
+    )
+    screenshot_path = tmp_path / "at-rest.jpeg"
+
+    result = await runner.smoke(bundle, screenshot_path=screenshot_path)
+
+    assert result["screenshot"] is True
+    contents = screenshot_path.read_bytes()
+    assert contents[:2] == b"\xff\xd8"
+    assert len(contents) > 1_000

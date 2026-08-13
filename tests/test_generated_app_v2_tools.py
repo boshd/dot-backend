@@ -1021,6 +1021,22 @@ async def test_removed_group_requester_cannot_create_app_for_owner() -> None:
     await engine.dispose()
 
 
+def test_create_personal_app_schema_constrains_design_inputs() -> None:
+    properties = CreateGeneratedAppTool(Settings()).definition.parameters["properties"]
+
+    visual = properties["visual_direction"]
+    assert visual["maxLength"] == 200
+    assert "accent" in visual["description"].casefold()
+    assert "never materials, textures, patterns" in visual["description"]
+    assert "do not invent additional views, filters, or stats" in (
+        properties["product_brief"]["description"].casefold()
+    )
+    assert "first screen" in properties["purpose"]["description"].casefold()
+
+    revision_properties = ReviseCustomAppTool().definition.parameters["properties"]
+    assert revision_properties["visual_direction"]["maxLength"] == 200
+
+
 def test_custom_app_tool_schemas_are_closed_and_use_json_strings() -> None:
     tools = [
         InspectCustomAppTool(Settings()),

@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
+from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 from typing import Any
@@ -102,6 +105,8 @@ class AppBuildPipeline:
         compiler: AppCompiler | None = None,
         smoke_runner: AppBrowserSmokeRunner | None = None,
         require_browser_smoke: bool = False,
+        visual_reviewer: Any | None = None,
+        max_visual_reviews: int = 2,
     ) -> None:
         if max_repair_attempts < 0 or max_repair_attempts > 4:
             raise ValueError("max_repair_attempts must be between 0 and 4")
@@ -109,6 +114,8 @@ class AppBuildPipeline:
             raise ValueError("timeout_seconds must be positive")
         if require_browser_smoke and smoke_runner is None:
             raise ValueError("require_browser_smoke needs a configured smoke runner")
+        if max_visual_reviews < 1 or max_visual_reviews > 4:
+            raise ValueError("max_visual_reviews must be between 1 and 4")
         self.provider = provider
         self.max_repair_attempts = max_repair_attempts
         self.timeout_seconds = timeout_seconds
@@ -116,6 +123,8 @@ class AppBuildPipeline:
         self.compiler = compiler or EsbuildAppCompiler(timeout_seconds=min(20.0, timeout_seconds))
         self.smoke_runner = smoke_runner
         self.require_browser_smoke = require_browser_smoke
+        self.visual_reviewer = visual_reviewer
+        self.max_visual_reviews = max_visual_reviews
 
     async def build(self, claim: BuildClaim) -> BuildCompletion:
         started_at = datetime.now(UTC)
@@ -126,6 +135,8 @@ class AppBuildPipeline:
         issue_history: list[tuple[ValidationIssue, ...]] = []
         seen_acceptance_fingerprints: set[tuple[tuple[str, str, str], ...]] = set()
         clean_regeneration_used = False
+        visual_reviews = 0
+        screenshot_dir: str | None = None
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 blueprint = await stages.measure(
@@ -160,20 +171,46 @@ class AppBuildPipeline:
                             issues = _dedupe_issues((*policy_issues, *exc.issues))
                     if not issues:
                         if self.smoke_runner is not None and browser_bundle is not None:
+                            screenshot_file: Path | None = None
+                            if (
+                                self.visual_reviewer is not None
+                                and visual_reviews < self.max_visual_reviews
+                            ):
+                                if screenshot_dir is None:
+                                    screenshot_dir = tempfile.mkdtemp(prefix="dot-app-visual-")
+                                screenshot_file = Path(screenshot_dir) / "at-rest.jpeg"
+                                screenshot_file.unlink(missing_ok=True)
+                            smoke_kwargs: dict[str, Any] = {
+                                "acceptance_plan": _acceptance_plan(blueprint),
+                            }
+                            if screenshot_file is not None:
+                                smoke_kwargs["screenshot_path"] = screenshot_file
                             try:
                                 result = await stages.measure(
                                     "smoke",
                                     partial(
                                         self.smoke_runner.smoke,
                                         browser_bundle,
-                                        acceptance_plan=_acceptance_plan(
-                                            blueprint,
-                                        ),
+                                        **smoke_kwargs,
                                     ),
                                 )
                                 smoke_result = MappingProxyType(dict(result))
                             except AppBrowserSmokeError as exc:
                                 issues = exc.issues
+                            if (
+                                not issues
+                                and screenshot_file is not None
+                                and screenshot_file.is_file()
+                            ):
+                                screenshot_jpeg = screenshot_file.read_bytes()
+                                if screenshot_jpeg:
+                                    visual_reviews += 1
+                                    issues = await self._review_visual_quality(
+                                        stages,
+                                        screenshot_jpeg,
+                                        blueprint,
+                                        claim,
+                                    )
                         else:
                             if self.require_browser_smoke:
                                 raise RuntimeError("required browser smoke runner is unavailable")
@@ -258,6 +295,9 @@ class AppBuildPipeline:
             raise TimeoutError(
                 f"app build exceeded the {self.timeout_seconds:g}s worker deadline"
             ) from exc
+        finally:
+            if screenshot_dir is not None:
+                shutil.rmtree(screenshot_dir, ignore_errors=True)
 
         completed_at = datetime.now(UTC)
         duration_ms = max(0, round((monotonic() - started) * 1000))
@@ -280,6 +320,33 @@ class AppBuildPipeline:
             artifact=artifact,
             metrics=metrics,
         )
+
+    async def _review_visual_quality(
+        self,
+        stages: _StageTimer,
+        screenshot_jpeg: bytes,
+        blueprint: AppBlueprint,
+        claim: BuildClaim,
+    ) -> tuple[ValidationIssue, ...]:
+        try:
+            issues = await stages.measure(
+                "visual_review",
+                partial(
+                    self.visual_reviewer.review,
+                    screenshot_jpeg,
+                    blueprint=blueprint,
+                ),
+            )
+            return tuple(issues)
+        except Exception:
+            # The review gate guards aesthetics only. A reviewer outage must never block a
+            # behaviorally verified app, so failures accept the candidate with a warning.
+            logger.warning(
+                "Visual review failed for job_id=%s; accepting the candidate without a score",
+                claim.job_id,
+                exc_info=True,
+            )
+            return ()
 
     def _package(
         self,

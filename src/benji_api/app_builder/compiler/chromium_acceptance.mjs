@@ -1476,6 +1476,19 @@ try {
     ).catch(() => fail("acceptance_records_refresh_missing", "seeded records were not listed"));
   }
   const initialExperience = await assertVisibleExperience(frame);
+  const screenshotPath = typeof request.screenshot_path === "string" && request.screenshot_path
+    ? request.screenshot_path
+    : null;
+  let screenshotCaptured = false;
+  if (screenshotPath) {
+    // The at-rest first screen is what the visual review gate judges; capture it before any
+    // acceptance interaction mutates the UI. Capture failures stay advisory: the acceptance
+    // verdict is behavioral and the reviewer simply receives no image.
+    try {
+      await page.screenshot({ path: screenshotPath, type: "jpeg", quality: 70 });
+      screenshotCaptured = true;
+    } catch {}
+  }
   if (seededRecordCount(initialRecords)) {
     await toggleSeededCheckbox(page, frame, timeoutMs);
   }
@@ -1500,6 +1513,7 @@ try {
       operations: state.operations,
       records: state.records,
       ux_audit: { passed: true, viewport: initialExperience.viewport },
+      ...(screenshotPath ? { screenshot: screenshotCaptured } : {}),
       ...acceptanceResult,
     },
   });
