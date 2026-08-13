@@ -47,6 +47,7 @@ from benji_api.services.integration_credentials import IntegrationCredentialVaul
 from benji_api.services.integrations import (
     complete_google_oauth,
     create_oauth_authorization,
+    oauth_callback_redirect_url,
 )
 
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
@@ -245,6 +246,65 @@ class FakeGoogleClient:
             body_text=f"The launch is Friday. token={access_token[:6]}…",
             body_truncated=False,
         )
+
+
+@pytest.mark.anyio
+async def test_messaging_google_connect_returns_to_an_unauthenticated_done_page() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///:memory:",
+        web_app_url="https://app.textdot.test",
+        integration_token_encryption_key=Fernet.generate_key().decode(),
+        google_oauth_client_id="google-client",
+        google_oauth_client_secret="google-secret",
+    )
+    fake_google = FakeGoogleClient()
+
+    async with session_factory() as session:
+        user = User(phone_number="+14155552671")
+        session.add(user)
+        await session.commit()
+        authorization = await create_oauth_authorization(
+            session,
+            user_id=user.id,
+            integration_key="google_calendar",
+            initiated_channel="messaging_link",
+            settings=settings,
+            google_client=fake_google,
+        )
+        state = parse_qs(urlparse(authorization.url).query)["state"][0]
+        completed = await complete_google_oauth(
+            session,
+            raw_state=state,
+            code="calendar-account-one",
+            settings=settings,
+            google_client=fake_google,
+        )
+
+    assert completed.redirect_after == "https://app.textdot.test/connect/done"
+    assert oauth_callback_redirect_url(
+        settings,
+        completed.redirect_after,
+        connected="google_calendar",
+        account=completed.account.email,
+    ).startswith("https://app.textdot.test/connect/done?")
+    assert "/?tab=integrations" not in oauth_callback_redirect_url(
+        settings,
+        completed.redirect_after,
+        connected="google_calendar",
+        account=completed.account.email,
+    )
+    assert oauth_callback_redirect_url(
+        settings,
+        "https://evil.example/phish",
+        connected="google_calendar",
+    ).startswith("https://app.textdot.test/")
+
+    await engine.dispose()
 
 
 @pytest.mark.anyio

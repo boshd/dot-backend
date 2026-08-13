@@ -27,7 +27,12 @@ from benji_api.agents.reactions import direct_imessage_reaction_target
 from benji_api.agents.relationship import RelationshipState, load_relationship_state
 from benji_api.agents.results import PersistedReaction, PersistedReply, PersistedTurn
 from benji_api.agents.runner import AgentRunner
-from benji_api.agents.text_style import prepare_app_completion_bubbles, prepare_text_bubbles
+from benji_api.agents.text_style import (
+    prepare_app_completion_bubbles,
+    prepare_text_bubbles,
+    prepare_trusted_link_bubbles,
+    trusted_urls_from_tool_outputs,
+)
 from benji_api.agents.tools import ToolRegistry
 from benji_api.agents.types import AgentMessage, ModelProvider, ToolContext
 from benji_api.config import Settings
@@ -525,11 +530,26 @@ async def _run_agent_wake(
             selected_reaction = (
                 result.reaction if reaction_target_external_id is not None else None
             )
-            clean_messages = (
-                prepare_app_completion_bubbles(result.messages, app_url=required_app_url)
-                if required_app_url is not None
-                else prepare_text_bubbles(result.messages)
+            trusted_urls = trusted_urls_from_tool_outputs(
+                {
+                    "name": call.name,
+                    "succeeded": call.succeeded,
+                    "output": call.output,
+                }
+                for call in result.tool_calls
             )
+            if required_app_url is not None:
+                clean_messages = prepare_app_completion_bubbles(
+                    result.messages,
+                    app_url=required_app_url,
+                )
+            elif trusted_urls:
+                clean_messages = prepare_trusted_link_bubbles(
+                    result.messages,
+                    urls=trusted_urls,
+                )
+            else:
+                clean_messages = prepare_text_bubbles(result.messages)
             if not clean_messages and selected_reaction is None:
                 if purpose == AgentRunPurpose.EVENT and wake_type == "schedule.triggered":
                     run.status = AgentRunStatus.COMPLETED.value

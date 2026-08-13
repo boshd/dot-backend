@@ -80,7 +80,7 @@ def _source_provider_from_environment(
             # One model call may legitimately consume most of the user-visible build window.
             # Keep the pipeline's global deadline authoritative instead of imposing a hidden
             # 50-second per-call cutoff that makes complex apps fail prematurely.
-            timeout_seconds=min(timeout_seconds, 180.0),
+            timeout_seconds=min(timeout_seconds, 300.0),
         )
     raise RuntimeError(f"Unsupported app builder provider: {configured_provider}")
 

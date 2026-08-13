@@ -14,6 +14,7 @@ from benji_api.agents.tools import (
     DeleteCustomAppRecordTool,
     InspectCustomAppTool,
     ListCustomAppRecordsTool,
+    ListGeneratedAppsTool,
     ReviseCustomAppTool,
     RollbackCustomAppTool,
     UpdateCustomAppRecordTool,
@@ -302,6 +303,45 @@ async def test_inspect_custom_app_exposes_truthful_build_phase() -> None:
     assert failed["latest_build"]["phase"] == "failed"
     assert failed["latest_build"]["attempts"] == 1
     assert failed["latest_build"]["updated_at"]
+
+    await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_inspect_and_list_omit_live_urls_until_the_first_build_lands() -> None:
+    engine, factory = await _database()
+    settings = Settings(generated_app_public_url="https://app.textdot.test")
+    async with factory() as session:
+        owner = User(phone_number="+14155550101")
+        session.add(owner)
+        await session.flush()
+        direct = Conversation(user_id=owner.id)
+        session.add(direct)
+        await session.commit()
+        code_app, _, _ = await create_code_app_build(
+            session,
+            user_id=owner.id,
+            conversation_id=direct.id,
+            title="Reset tracker",
+            description="Track resets",
+            request={"blueprint": {"title": "Reset tracker", "manifest": MANIFEST}},
+        )
+    context = ToolContext(user_id=owner.id, conversation_id=direct.id)
+
+    inspected = await InspectCustomAppTool(settings, session_factory=factory).execute(
+        context=context,
+        arguments={"app_id": str(code_app.id)},
+    )
+    listed = await ListGeneratedAppsTool(settings, session_factory=factory).execute(
+        context=context,
+        arguments={},
+    )
+
+    assert inspected["ready"] is False
+    assert inspected["app_url"] is None
+    assert "not ready" in inspected["message_hint"].lower()
+    assert listed["apps"][0]["ready"] is False
+    assert listed["apps"][0]["app_url"] is None
 
     await engine.dispose()
 

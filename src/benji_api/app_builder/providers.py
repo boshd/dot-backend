@@ -411,6 +411,7 @@ class OpenAIAppSourceProvider:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.max_output_tokens = max_output_tokens
+        self.timeout_seconds = timeout_seconds
         self._client = client or AsyncOpenAI(api_key=api_key, timeout=timeout_seconds)
 
     async def generate(self, blueprint: AppBlueprint) -> GeneratedSource:

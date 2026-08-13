@@ -37,7 +37,7 @@ from benji_api.models.finance import (
     FinancialConnectionStatus,
     FinancialTransaction,
 )
-from benji_api.models.generated_app import GeneratedAppAccessMode
+from benji_api.models.generated_app import GeneratedApp, GeneratedAppAccessMode
 from benji_api.models.generated_app_v2 import (
     GeneratedAppBuildStatus,
     GeneratedAppDataRecord,
@@ -634,9 +634,9 @@ class ConnectIntegrationTool:
         return ToolDefinition(
             name="create_integration_connect_link",
             description=(
-                "Create a short-lived, single-use link for the user to connect Google Calendar "
-                "Gmail, or a supported bank through Plaid. Use when a fully onboarded user asks "
-                "to connect one of these services."
+                "Create a short-lived, single-use link that opens Google Calendar, Gmail, or a "
+                "supported bank through Plaid immediately. Use this as soon as a fully onboarded "
+                "user asks to connect one of these services. Do not send them to web sign-in."
             ),
             parameters={
                 "type": "object",
@@ -667,7 +667,9 @@ class ConnectIntegrationTool:
             "connect_url": link.url,
             "expires_at": link.expires_at.isoformat(),
             "message_hint": (
-                "Tell the user this private link expires soon and should not be shared."
+                "Send the connect_url immediately as its own message with no surrounding words. "
+                "Do not ask if they want the link, and do not send them to sign in on the web app. "
+                "The link opens the provider connection directly."
             ),
         }
 
@@ -1155,12 +1157,17 @@ class ListGeneratedAppsTool:
                     "description": app.description,
                     "access_mode": app.access_mode,
                     "runtime_kind": app.runtime_kind,
+                    "ready": _listed_app_is_ready(app),
                     "app_url": (
-                        f"{self._settings.generated_app_public_url}/a/{app.public_id}"
-                        if app.runtime_kind == GeneratedAppRuntimeKind.CODE.value
-                        else generated_app_url(
-                            base_url=self._settings.generated_app_public_url,
-                            public_id=app.public_id,
+                        None
+                        if not _listed_app_is_ready(app)
+                        else (
+                            f"{self._settings.generated_app_public_url}/a/{app.public_id}"
+                            if app.runtime_kind == GeneratedAppRuntimeKind.CODE.value
+                            else generated_app_url(
+                                base_url=self._settings.generated_app_public_url,
+                                public_id=app.public_id,
+                            )
                         )
                     ),
                     "updated_at": app.updated_at.isoformat(),
@@ -1210,11 +1217,17 @@ class InspectCustomAppTool:
             )
         revision = owned.revision
         build = owned.build
-        return {
+        ready = owned.deployment is not None
+        payload = {
             "app_id": str(owned.app.id),
             "title": owned.app.title,
             "description": owned.app.description,
-            "app_url": f"{self._settings.generated_app_public_url}/a/{owned.app.public_id}",
+            "ready": ready,
+            "app_url": (
+                f"{self._settings.generated_app_public_url}/a/{owned.app.public_id}"
+                if ready
+                else None
+            ),
             "access_mode": owned.app.access_mode,
             "current_version": owned.app.current_version,
             "rollback_available": (
@@ -1249,6 +1262,12 @@ class InspectCustomAppTool:
                 else None
             ),
         }
+        if not ready:
+            payload["message_hint"] = (
+                "This app is not ready. Do not send a link or claim it is done. "
+                "The trusted completion event will deliver the working link."
+            )
+        return payload
 
 
 class CreateCustomAppLinkTool:
@@ -1309,9 +1328,11 @@ class CreateCustomAppLinkTool:
                 ttl_seconds=7 * 86_400,
             )
             await session.commit()
+        ready = owned.deployment is not None
         return {
             "app_id": str(owned.app.id),
             "title": owned.app.title,
+            "ready": ready,
             "app_url": (
                 f"{self._settings.generated_app_public_url}/a/"
                 f"{owned.app.public_id}#handoff={ticket}"
@@ -1321,6 +1342,12 @@ class CreateCustomAppLinkTool:
             ),
             "access_mode": owned.app.access_mode,
             "expires_in_days": 7,
+            "message_hint": (
+                "This opens a progress page, not a finished app. Do not say it is done. "
+                "Send the exact URL in its own message."
+                if not ready
+                else "Send the exact URL in its own message. It expires in 7 days."
+            ),
         }
 
 
@@ -3178,6 +3205,12 @@ def _agent_tool_request_hash(
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _listed_app_is_ready(app: GeneratedApp) -> bool:
+    if app.runtime_kind != GeneratedAppRuntimeKind.CODE.value:
+        return True
+    return app.current_version > 0
 
 
 def _required_string_argument(value: Any, field_name: str, max_length: int) -> str:

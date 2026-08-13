@@ -2,7 +2,7 @@ import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -80,6 +80,34 @@ def plaid_connect_surface_url(settings: Settings, *, raw_token: str) -> str:
     return f"{settings.web_app_url}/connect/plaid#{fragment}"
 
 
+def integration_connect_done_url(settings: Settings) -> str:
+    return f"{settings.web_app_url}/connect/done"
+
+
+def oauth_callback_redirect_url(
+    settings: Settings,
+    redirect_after: str | None,
+    **query_values: str,
+) -> str:
+    """Keep OAuth returns on the Dot web origin, including unauthenticated connect pages."""
+    allowed = urlparse(settings.web_app_url)
+    parsed = urlparse(redirect_after or f"{settings.web_app_url}/")
+    if parsed.scheme != allowed.scheme or parsed.netloc != allowed.netloc:
+        parsed = urlparse(f"{settings.web_app_url}/")
+    path = parsed.path or "/"
+    merged: dict[str, str] = {}
+    if path == "/" and "tab" not in query_values:
+        merged["tab"] = "integrations"
+    for key, values in parse_qs(parsed.query).items():
+        if values:
+            merged[key] = values[-1]
+    for key, value in query_values.items():
+        if value:
+            merged[key] = value
+    query = urlencode(merged)
+    return f"{allowed.scheme}://{allowed.netloc}{path}" + (f"?{query}" if query else "")
+
+
 def build_google_integration_client(settings: Settings) -> GoogleIntegrationClient:
     if settings.google_oauth_client_id is None or settings.google_oauth_client_secret is None:
         raise IntegrationNotConfiguredError("Google integrations are not configured")
@@ -117,7 +145,11 @@ async def create_oauth_authorization(
 
     raw_state = secrets.token_urlsafe(32)
     expires_at = datetime.now(UTC) + timedelta(minutes=settings.integration_oauth_state_ttl_minutes)
-    redirect_after = f"{settings.web_app_url}/?tab=integrations"
+    redirect_after = (
+        integration_connect_done_url(settings)
+        if initiated_channel == "messaging_link"
+        else f"{settings.web_app_url}/?tab=integrations"
+    )
     session.add(
         IntegrationOAuthState(
             user_id=user_id,

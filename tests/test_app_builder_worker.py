@@ -87,3 +87,15 @@ def test_openai_app_builder_defaults_to_balanced_model(monkeypatch) -> None:
     assert isinstance(provider, OpenAIAppSourceProvider)
     assert provider.model == "gpt-5.6-terra"
     assert provider.reasoning_effort == "medium"
+    assert provider.timeout_seconds == 55
+
+
+def test_openai_provider_call_timeout_allows_five_minutes(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("APP_BUILDER_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    provider = _source_provider_from_environment(timeout_seconds=420)
+
+    assert isinstance(provider, OpenAIAppSourceProvider)
+    assert provider.timeout_seconds == 300.0

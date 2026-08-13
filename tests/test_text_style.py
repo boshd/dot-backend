@@ -3,6 +3,8 @@ from benji_api.agents.text_style import (
     plain_text_bubble,
     prepare_app_completion_bubbles,
     prepare_text_bubbles,
+    prepare_trusted_link_bubbles,
+    trusted_urls_from_tool_outputs,
 )
 
 
@@ -46,3 +48,51 @@ def test_app_completion_bubbles_always_include_only_the_exact_trusted_url() -> N
     assert prepare_app_completion_bubbles(
         ["it's ready: https://wrong.example/a/nope"], app_url=trusted_url
     ) == (f"it's ready: {trusted_url}",)
+
+
+def test_trusted_link_bubbles_append_a_missing_connect_or_app_url() -> None:
+    connect_url = "https://api.example/api/v1/integrations/connect/token"
+    app_url = "https://app.example/a/demo#handoff=ticket"
+
+    assert prepare_trusted_link_bubbles(
+        ["use this one:"],
+        urls=(connect_url,),
+    ) == ("use this one:", connect_url)
+    assert prepare_trusted_link_bubbles(
+        ["this one, sorry lol"],
+        urls=(app_url,),
+    ) == ("this one, sorry lol", app_url)
+    assert prepare_trusted_link_bubbles(
+        ["open this", app_url],
+        urls=(app_url,),
+    ) == ("open this", app_url)
+
+
+def test_trusted_urls_come_from_connect_and_fresh_app_link_tools() -> None:
+    connect_url = "https://api.example/api/v1/integrations/connect/token"
+    app_url = "https://app.example/a/demo#handoff=ticket"
+
+    assert trusted_urls_from_tool_outputs(
+        (
+            {
+                "name": "create_integration_connect_link",
+                "succeeded": True,
+                "output": {"ok": True, "result": {"connect_url": connect_url}},
+            },
+            {
+                "name": "create_custom_app_link",
+                "succeeded": True,
+                "output": {"ok": True, "result": {"app_url": app_url}},
+            },
+            {
+                "name": "list_personal_apps",
+                "succeeded": True,
+                "output": {"ok": True, "result": {"apps": [{"app_url": "https://app.example/a/nope"}]}},
+            },
+            {
+                "name": "create_personal_app",
+                "succeeded": True,
+                "output": {"ok": True, "result": {"status": "queued"}},
+            },
+        )
+    ) == (connect_url, app_url)

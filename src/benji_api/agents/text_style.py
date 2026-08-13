@@ -53,3 +53,47 @@ def prepare_app_completion_bubbles(
     if any(app_url in bubble for bubble in bubbles):
         return bubbles
     return (*bubbles[: DELIVERY_BUBBLE_SAFETY_LIMIT - 1], app_url)
+
+
+_TRUSTED_LINK_FIELDS = {
+    "create_custom_app_link": "app_url",
+    "create_integration_connect_link": "connect_url",
+}
+
+
+def trusted_urls_from_tool_outputs(tool_calls: object) -> tuple[str, ...]:
+    """Collect exact URLs the model was supposed to send after specific link tools."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for call in tool_calls if isinstance(tool_calls, (list, tuple)) else ():
+        if not isinstance(call, dict) or call.get("succeeded") is not True:
+            continue
+        field = _TRUSTED_LINK_FIELDS.get(str(call.get("name") or ""))
+        if field is None:
+            continue
+        output = call.get("output")
+        payload = output.get("result") if isinstance(output, dict) else None
+        if not isinstance(payload, dict):
+            payload = output if isinstance(output, dict) else {}
+        url = payload.get(field)
+        if isinstance(url, str) and url.startswith("https://") and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return tuple(urls)
+
+
+def prepare_trusted_link_bubbles(
+    messages: tuple[str, ...] | list[str],
+    *,
+    urls: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Keep model prose and append any tool URL the model forgot to send."""
+    bubbles = list(prepare_text_bubbles(messages))
+    for url in urls:
+        if any(url in bubble for bubble in bubbles):
+            continue
+        if len(bubbles) >= DELIVERY_BUBBLE_SAFETY_LIMIT:
+            bubbles[-1] = url
+        else:
+            bubbles.append(url)
+    return tuple(bubbles)

@@ -5,7 +5,6 @@ import json
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
-from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import (
@@ -63,6 +62,7 @@ from benji_api.services.integrations import (
     consume_plaid_connect_link,
     create_oauth_authorization,
     inspect_connect_link,
+    oauth_callback_redirect_url,
     plaid_connect_surface_url,
 )
 from benji_api.services.user_events import dispatch_user_event, enqueue_user_event
@@ -338,7 +338,7 @@ async def open_integration_connect_link(
             settings=settings,
         )
     except (IntegrationAuthorizationError, IntegrationNotConfiguredError) as error:
-        return _web_redirect(settings, integration_error=str(error))
+        return _connect_done_redirect(settings, integration_error=str(error))
     return RedirectResponse(authorization.url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
@@ -486,9 +486,15 @@ async def google_oauth_callback(
     error: str | None = None,
 ) -> RedirectResponse:
     if error is not None:
-        return _web_redirect(settings, integration_error="Google access was not approved")
+        return _connect_done_redirect(
+            settings,
+            integration_error="Google access was not approved",
+        )
     if state_token is None or code is None:
-        return _web_redirect(settings, integration_error="Google authorization was incomplete")
+        return _connect_done_redirect(
+            settings,
+            integration_error="Google authorization was incomplete",
+        )
     try:
         completed = await complete_google_oauth(
             session,
@@ -502,17 +508,21 @@ async def google_oauth_callback(
         IntegrationNotConfiguredError,
         IntegrationNotFoundError,
     ) as callback_error:
-        return _web_redirect(settings, integration_error=str(callback_error))
+        return _connect_done_redirect(settings, integration_error=str(callback_error))
     background_tasks.add_task(
         dispatch_user_event,
         settings=settings,
         linq_client=linq_client,
         event_id=completed.user_event_id,
     )
-    return _web_redirect(
-        settings,
-        connected=completed.definition.key,
-        account=completed.account.email,
+    return RedirectResponse(
+        oauth_callback_redirect_url(
+            settings,
+            completed.redirect_after,
+            connected=completed.definition.key,
+            account=completed.account.email,
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -761,9 +771,19 @@ async def plaid_webhook(
 
 
 def _web_redirect(settings: Settings, **query_values: str) -> RedirectResponse:
-    query = urlencode({"tab": "integrations", **query_values})
     return RedirectResponse(
-        f"{settings.web_app_url}/?{query}",
+        oauth_callback_redirect_url(settings, f"{settings.web_app_url}/", **query_values),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def _connect_done_redirect(settings: Settings, **query_values: str) -> RedirectResponse:
+    return RedirectResponse(
+        oauth_callback_redirect_url(
+            settings,
+            f"{settings.web_app_url}/connect/done",
+            **query_values,
+        ),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 

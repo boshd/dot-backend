@@ -162,6 +162,8 @@ def test_core_prompt_reports_background_app_builds_truthfully() -> None:
     assert 'never call that phase queued or "stuck in the queue"' in normalized
     assert 'don\'t say you\'re "keeping an eye on it"' in normalized
     assert "trusted completion event will bring you back" in normalized
+    assert "do not send a link or claim it is ready" in normalized
+    assert "if inspect or list says it is not ready" in normalized
 
 
 def test_core_prompt_keeps_generated_app_links_in_their_own_bubble() -> None:
@@ -170,3 +172,6 @@ def test_core_prompt_keeps_generated_app_links_in_their_own_bubble() -> None:
     assert "generated app URL" in normalized
     assert "bare URL alone in its own `messages` item" in normalized
     assert "introduction or follow-up in separate message items" in normalized
+    assert "never say you are sending a link without that url item" in normalized.lower()
+    assert "create_integration_connect_link" in normalized
+    assert "do not send them to sign in" in normalized.lower()
