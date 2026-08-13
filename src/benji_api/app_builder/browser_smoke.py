@@ -229,6 +229,7 @@ class ChromiumAppAcceptanceRunner:
         bundle: BrowserBundle,
         *,
         acceptance_plan: tuple[Mapping[str, Any], ...] = (),
+        records: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         if not self.available:
             raise RuntimeError("Dot app real Chromium acceptance runtime is unavailable")
@@ -239,6 +240,8 @@ class ChromiumAppAcceptanceRunner:
             "context": {},
             "bundle": bundle.as_dict(),
         }
+        if records is not None:
+            request["records"] = dict(records)
         encoded_request = json.dumps(
             request,
             ensure_ascii=False,

@@ -300,6 +300,8 @@ def test_agent_facing_dot_runtime_declarations_match_runtime_sdk() -> None:
     assert generated == declaration
     assert "export declare function useRecords" in declaration
     assert "export declare function runAction" in declaration
+    assert "export type AppRecord" in declaration
+    assert "version: number" in declaration
     assert "__dotInitialize" not in declaration
     assert "__DOT_APP_POST__" not in declaration
 

@@ -670,6 +670,12 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert "onCheckedChange={setDone}" in request["instructions"]
     assert '<SegmentedControl label="Filter" value={filter}' in request["instructions"]
     assert '<ListItem title="Task" detail="Today" />' in request["instructions"]
+    assert "<Item" in request["instructions"] or "<ListItem" in request["instructions"]
+    assert "TabsTrigger" in request["instructions"]
+    assert (
+        "checkbox tap" in request["instructions"].casefold()
+        or "onCheckedChange" in request["instructions"]
+    )
     assert "AUTHORITATIVE @dot/app-runtime TYPES" in request["instructions"]
     assert "export declare function useAppData" in request["instructions"]
     assert "export declare function useRecords" in request["instructions"]
@@ -695,6 +701,8 @@ async def test_openai_provider_captures_model_tokens_and_latency() -> None:
     assert "do not return css files, classname props, inline style props" in (
         normalized_instructions
     )
+    assert "as an input changes" not in normalized_instructions
+    assert "never mutate on mount" in normalized_instructions
 
 
 @pytest.mark.anyio

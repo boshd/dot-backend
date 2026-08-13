@@ -55,19 +55,25 @@ PRODUCT SHAPE
   `<Select value={value} onValueChange={setValue}
   options={[{ value: "high", label: "High" }]} />`,
   `<Checkbox checked={done} onCheckedChange={setDone} label="Done" />`,
+  `<Item leading={<Checkbox label="Done" checked={row.completed} onCheckedChange={onToggle} />} title={row.text} />`,
   `<SegmentedControl label="Filter" value={filter}
-  onValueChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`, and
+  onValueChange={setFilter}><Segment value="open">Open</Segment></SegmentedControl>`,
+  `<Tabs value={tab} onValueChange={setTab}><TabsList><TabsTrigger value="prep">Prep</TabsTrigger></TabsList><TabsContent value="prep">...</TabsContent></Tabs>`, and
   `<ListItem title="Task" detail="Today" />`. Use value callbacks, not a React setter as a native
-  onChange handler.
+  onChange handler. `visual_direction` chooses accent and density only; do not invent CSS from it.
 
 PERSISTENCE AND USER ACTIONS
-- `useAppData()` returns app context. `useRecords(entity, {limit, offset})` returns records, meta,
-  loading, error, and refresh; limit is at most 100. Canonical user data mutations are:
+- `useAppData()` returns app context. `useRecords(entity, {limit, offset})` returns flattened
+  `AppRecord` rows (entity fields at the top level with `id` and `version`), plus meta, loading,
+  error, and refresh; limit is at most 100. Canonical user data mutations are:
   `await runAction("records.create", { entity, data })`,
   `await runAction("records.update", { record_id, expected_version, data })`, and
   `await runAction("records.delete", { record_id, expected_version })`.
-- Mutate only from an explicit click or submit. Never mutate on mount, in an effect/timer, or as an
-  input changes. Call runAction directly in that handler, catch failures, and show inline feedback.
+- Mutate only from an explicit click, checkbox/switch change, or submit. Never mutate on
+  mount, in an effect/timer, or on each keystroke. Checkbox and Tabs changes may call
+  runAction("records.update", { record_id, expected_version, data: { field: next } })
+  with a patch; the host merges it into the stored document. Call runAction directly in that
+  handler, catch failures, and show inline feedback.
 - Give persisted controls their manifest field name and a clear human label. Wrap every create
   workflow in WorkflowForm, setting `entity` to that exact manifest entity name and `operation` to
   `records.create`; for example, the expense entity uses `<WorkflowForm entity="expense"

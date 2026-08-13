@@ -36,12 +36,13 @@ export declare const chartTokens: Readonly<{
     surface: "var(--dot-surface)";
     ink: "var(--dot-ink)";
 }>;
-export declare function AppShell({ title, description, eyebrow, accent, width, children, }: ChildrenProps & {
+export declare function AppShell({ title, description, eyebrow, accent, width, density, children, }: ChildrenProps & {
     title?: ReactNode;
     description?: ReactNode;
     eyebrow?: ReactNode;
     accent?: DotAccent;
     width?: "compact" | "standard" | "wide";
+    density?: "compact" | "comfortable";
 }): import("react/jsx-runtime").JSX.Element;
 export declare function Section({ eyebrow, title, description, action, tone, children, }: ChildrenProps & {
     eyebrow?: ReactNode;
@@ -155,6 +156,19 @@ export declare function ListItem({ leading, title, detail, meta, action, childre
     action?: ReactNode;
     children?: ReactNode;
 }): import("react/jsx-runtime").JSX.Element;
+export declare const Item: typeof ListItem;
+export declare function Tabs({ value, onChange, onValueChange, children, }: ChildrenProps & {
+    value?: string;
+    onChange?: (value: string) => void;
+    onValueChange?: (value: string) => void;
+}): import("react/jsx-runtime").JSX.Element;
+export declare function TabsList({ children }: ChildrenProps): import("react/jsx-runtime").JSX.Element;
+export declare function TabsTrigger({ value, children, onClick, ...props }: Omit<SafeButtonProps, "value"> & {
+    value: string;
+}): import("react/jsx-runtime").JSX.Element;
+export declare function TabsContent({ value, children }: ChildrenProps & {
+    value: string;
+}): import("react/jsx-runtime").JSX.Element | null;
 export declare function EmptyState({ title, description, action, }: {
     title: ReactNode;
     description?: ReactNode;

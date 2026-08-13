@@ -225,12 +225,29 @@ async def test_code_app_build_session_runtime_and_optimistic_data() -> None:
             )
             assert listed.json()["meta"]["total"] == 1
             assert listed.json()["data"][0]["data"]["done"] is True
+            patched = await client.post(
+                f"/api/v1/apps/v2/{code_app.id}/actions",
+                headers=headers,
+                json={
+                    "operation": "records.update",
+                    "idempotency_key": "update-task-partial",
+                    "args": {
+                        "record_id": record["id"],
+                        "expected_version": 2,
+                        "data": {"done": False},
+                    },
+                },
+            )
+            assert patched.status_code == 200
+            assert patched.json()["data"]["data"] == {"title": "Cake", "done": False}
+            assert patched.json()["data"]["version"] == 3
     finally:
         api.dependency_overrides.clear()
         async with factory() as session:
             events = list((await session.scalars(select(GeneratedAppEvent))).all())
             assert [event.event_type for event in events] == [
                 "app.data.created",
+                "app.data.updated",
                 "app.data.updated",
             ]
         await engine.dispose()

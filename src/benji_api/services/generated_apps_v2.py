@@ -1542,17 +1542,21 @@ async def update_data_record(
             request_hash=request_hash,
         )
     manifest = await _active_manifest(session, app_id)
-    record_state = (
-        await session.execute(
-            select(GeneratedAppDataRecord.entity).where(
-                GeneratedAppDataRecord.id == record_id,
-                GeneratedAppDataRecord.app_id == app_id,
-            )
+    current = await session.scalar(
+        select(GeneratedAppDataRecord).where(
+            GeneratedAppDataRecord.id == record_id,
+            GeneratedAppDataRecord.app_id == app_id,
         )
-    ).one_or_none()
-    if record_state is None:
+    )
+    if current is None:
         raise CodeAppNotFoundError("App record was not found")
-    clean_data = _validate_entity_data(manifest, record_state.entity, data)
+    merged = dict(current.data or {})
+    for key, value in data.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    clean_data = _validate_entity_data(manifest, current.entity, merged)
     data_bytes = _json_bytes(clean_data)
     current_bytes = await session.scalar(
         select(GeneratedAppDataRecord.data_bytes).where(

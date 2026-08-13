@@ -1070,6 +1070,57 @@ export default function App() {
   return <main><h1>Trip planner</h1><p>Enter the guest_name below.</p></main>;
 }''',
         ),
+        (
+            "ux_nested_label",
+            '''export default function App() {
+  return <main><h1>Trip planner</h1>
+    <label>Outer label
+      <label>Inner label
+        <input style={{ width: 180, height: 44 }} />
+      </label>
+    </label>
+  </main>;
+}''',
+        ),
+        (
+            "ux_overlapping_text",
+            '''export default function App() {
+  return <main>
+    <h1>Trip planner</h1>
+    <span style={{ position: "absolute", left: 16, top: 80, width: 140, height: 24 }}>
+      Alpha copy
+    </span>
+    <span style={{ position: "absolute", left: 40, top: 80, width: 140, height: 24 }}>
+      Beta copy
+    </span>
+  </main>;
+}''',
+        ),
+        (
+            "ux_leading_overflow",
+            '''import { AppShell, Item, List } from "@dot/ui";
+export default function App() {
+  return <AppShell title="Prep">
+    <List>
+      <Item
+        leading={<span>Mark complete now please extra</span>}
+        title="Passport"
+        meta="Open"
+      />
+    </List>
+  </AppShell>;
+}''',
+        ),
+        (
+            "ux_giant_heading",
+            '''export default function App() {
+  return <main className="dot-app-shell" data-density="compact">
+    <header className="dot-app-header">
+      <h1 style={{ fontSize: 32 }}>Portugal Trip Hub</h1>
+    </header>
+  </main>;
+}''',
+        ),
     ],
 )
 async def test_chromium_acceptance_rejects_mobile_ux_regressions(
@@ -1136,6 +1187,94 @@ export default function App() {
       <Segment value="done">Done</Segment>
     </SegmentedControl>
     <Checkbox label="Packed" checked={done} onCheckedChange={setDone} />
+  </AppShell>;
+}'''
+        )
+    )
+
+    result = await runner.smoke(bundle)
+
+    assert result["ux_audit"]["passed"] is True
+
+
+@pytest.mark.anyio
+async def test_chromium_acceptance_persists_checkbox_toggle() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { runAction, useRecords } from "@dot/app-runtime";
+import { AppShell, Checkbox, Item, List } from "@dot/ui";
+type Row = { id: string; version: number; text: string; completed: boolean };
+export default function App() {
+  const { records, refresh } = useRecords<Row>("checklist_item");
+  return <AppShell title="Prep">
+    <List>{records.map((item) =>
+      <Item key={item.id} title={item.text} meta="Open"
+        leading={<Checkbox label="Done" checked={item.completed}
+          onCheckedChange={(completed) => { void runAction("records.update", {
+            record_id: item.id, expected_version: item.version, data: { completed },
+          }).then(() => refresh()); }} />}
+      />
+    )}</List>
+  </AppShell>;
+}'''
+        )
+    )
+    result = await runner.smoke(
+        bundle,
+        records={
+            "checklist_item": [
+                {
+                    "id": "00000000-0000-4000-8000-000000000001",
+                    "entity": "checklist_item",
+                    "version": 1,
+                    "text": "Check passport",
+                    "completed": False,
+                }
+            ]
+        },
+    )
+
+    updates = [
+        operation
+        for operation in result["operations"]
+        if operation["operation"] == "records.update"
+    ]
+    assert len(updates) == 1
+    assert updates[0]["args"]["data"] == {"completed": True}
+    stored = result["records"]["checklist_item"][0]
+    assert stored["completed"] is True
+    assert stored["text"] == "Check passport"
+    assert stored["version"] == 2
+    assert result["ux_audit"]["passed"] is True
+
+
+@pytest.mark.anyio
+async def test_chromium_ux_audit_accepts_compact_appshell_and_item_checkbox() -> None:
+    runner = ChromiumAppAcceptanceRunner(timeout_seconds=12, sandbox_required=False)
+    if not runner.available:
+        pytest.skip("real Chromium acceptance runtime is unavailable")
+    bundle = await EsbuildAppCompiler().compile(
+        _source(
+            '''import { useState } from "react";
+import { AppShell, Checkbox, Field, Item, List } from "@dot/ui";
+export default function App() {
+  const [done, setDone] = useState(false);
+  const [split, setSplit] = useState(false);
+  return <AppShell title="Portugal Trip Hub">
+    <List>
+      <Item
+        leading={<Checkbox label="Mark complete" checked={done} onCheckedChange={setDone} />}
+        title="Check passport validity"
+        detail="Kareem"
+        meta="Open"
+      />
+    </List>
+    <Field label="Split between">
+      <Checkbox label="Alex" checked={split} onCheckedChange={setSplit} />
+    </Field>
   </AppShell>;
 }'''
         )

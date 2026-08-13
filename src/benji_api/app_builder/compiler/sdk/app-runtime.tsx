@@ -17,6 +17,14 @@ type JsonObject = Record<string, unknown>;
 type RuntimeError = { code: string; message: string };
 type RequestOptions = { idempotencyKey?: string; timeoutMs?: number };
 
+export type AppRecord<T = JsonObject> = T & {
+  id: string;
+  entity: string;
+  version: number;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
 /** @internal */
 declare global {
   interface Window {
@@ -183,7 +191,7 @@ export function useRecords<T = JsonObject>(
   entity: string,
   query: { limit?: number; offset?: number } = {},
 ) {
-  const [records, setRecords] = useState<T[]>([]);
+  const [records, setRecords] = useState<AppRecord<T>[]>([]);
   const [meta, setMeta] = useState<JsonObject>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -206,9 +214,9 @@ export function useRecords<T = JsonObject>(
         : Array.isArray(result)
           ? result
           : [];
-      setRecords(nextRecords as T[]);
+      setRecords(nextRecords as AppRecord<T>[]);
       setMeta(envelope?.meta ?? {});
-      return nextRecords as T[];
+      return nextRecords as AppRecord<T>[];
     } catch (caught) {
       const nextError = caught instanceof Error ? caught : new Error(String(caught));
       setError(nextError);

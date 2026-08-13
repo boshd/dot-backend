@@ -191,7 +191,7 @@ function iframeDocument(bundle, context, channelToken) {
 <body><div id="dot-app-root"></div><script>${bootstrap.replaceAll("</script", "<\\/script")}</script></body></html>`;
 }
 
-function hostDocument(frameDocument, context, channelToken) {
+function hostDocument(frameDocument, context, channelToken, initialRecords) {
   const source = `
     (() => {
       const token = ${scriptLiteral(channelToken)};
@@ -202,7 +202,7 @@ function hostDocument(frameDocument, context, channelToken) {
         operations: [],
         runtimeErrors: [],
         violations: [],
-        records: {},
+        records: ${scriptLiteral(initialRecords && typeof initialRecords === "object" ? initialRecords : {})},
         nextId: 1,
       };
       Object.defineProperty(window, "__DOT_ACCEPTANCE__", {
@@ -300,6 +300,28 @@ function hostDocument(frameDocument, context, channelToken) {
             state.records[entity] ||= [];
             state.records[entity].push(record);
             result = clone(record);
+          } else if (operation === "records.update") {
+            const recordId = String(args.record_id || "");
+            const patch = args.data && typeof args.data === "object" ? clone(args.data) : {};
+            let updated = null;
+            for (const entity of Object.keys(state.records)) {
+              const list = state.records[entity] || [];
+              const index = list.findIndex((item) => item.id === recordId);
+              if (index < 0) continue;
+              const current = list[index];
+              if (args.expected_version != null && current.version !== args.expected_version) break;
+              const merged = { ...current };
+              for (const [key, value] of Object.entries(patch)) {
+                if (value === null) delete merged[key];
+                else merged[key] = value;
+              }
+              merged.version = current.version + 1;
+              merged.updated_at = "2026-01-01T09:00:00Z";
+              list[index] = merged;
+              updated = clone(merged);
+              break;
+            }
+            result = updated || {};
           } else if (operation === "dot.reminder.create") {
             result = { id: "acceptance-reminder", status: "scheduled" };
           }
@@ -787,11 +809,60 @@ async function auditVisibleExperience(frame) {
       const fontSize = Number.parseFloat(getComputedStyle(heading).fontSize);
       const lineHeight = Number.parseFloat(getComputedStyle(heading).lineHeight) || fontSize;
       const lineCount = Math.max(1, Math.round(rect.height / lineHeight));
-      if (fontSize > 56 || rect.height > viewportHeight * 0.35 || lineCount > 3) {
+      const shell = document.querySelector(".dot-app-shell");
+      const comfortable = shell?.getAttribute("data-density") === "comfortable";
+      const maxHeading = shell && !comfortable ? 24 : 56;
+      if (fontSize > maxHeading || rect.height > viewportHeight * 0.35 || lineCount > 3) {
         push(
           "ux_giant_heading",
           `h1 is too dominant on mobile (${Math.round(fontSize)}px, ${lineCount} lines, ${Math.round(rect.height)}px tall)`,
         );
+      }
+    }
+
+    if (document.querySelector("label label")) {
+      push("ux_nested_label", "nested labels are invalid HTML and break checkbox/field clicks");
+    }
+
+    for (const leading of document.querySelectorAll(".dot-list-leading")) {
+      if (!visible(leading)) continue;
+      if (leading.scrollWidth > leading.clientWidth + 1 || leading.scrollHeight > leading.clientHeight + 1) {
+        push(
+          "ux_leading_overflow",
+          `list leading overflows its 44px slot (${leading.scrollWidth}x${leading.scrollHeight} in ${leading.clientWidth}x${leading.clientHeight})`,
+        );
+      }
+    }
+    for (const meta of document.querySelectorAll(".dot-list-meta")) {
+      if (getComputedStyle(meta).display === "none") {
+        push("ux_hidden_list_meta", "list item meta is hidden on the mobile viewport");
+      }
+    }
+
+    const overlapSkip = (element) =>
+      element.classList.contains("dot-sr-only") || element.closest(".dot-list-leading");
+    const textNodes = [...document.querySelectorAll("h1,h2,h3,p,span,strong,small,label")]
+      .filter(visible)
+      .filter((element) => !overlapSkip(element) && textOf(element));
+    const containsRect = (outer, inner) =>
+      outer.left <= inner.left + 1 && outer.right >= inner.right - 1 &&
+      outer.top <= inner.top + 1 && outer.bottom >= inner.bottom - 1;
+    for (let index = 0; index < textNodes.length; index += 1) {
+      const left = textNodes[index];
+      const leftRect = left.getBoundingClientRect();
+      for (let other = index + 1; other < textNodes.length; other += 1) {
+        const right = textNodes[other];
+        if (left.contains(right) || right.contains(left)) continue;
+        const rightRect = right.getBoundingClientRect();
+        if (containsRect(leftRect, rightRect) || containsRect(rightRect, leftRect)) continue;
+        const overlapX = Math.min(leftRect.right, rightRect.right) - Math.max(leftRect.left, rightRect.left);
+        const overlapY = Math.min(leftRect.bottom, rightRect.bottom) - Math.max(leftRect.top, rightRect.top);
+        if (overlapX > 1 && overlapY > 1) {
+          push(
+            "ux_overlapping_text",
+            `${describe(left)} overlaps ${describe(right)}`,
+          );
+        }
       }
     }
 
@@ -1034,6 +1105,46 @@ async function enterField(frame, selector, value) {
 
 async function hostState(page) {
   return page.evaluate(() => JSON.parse(JSON.stringify(window.__DOT_ACCEPTANCE__)));
+}
+
+function seededRecordCount(records) {
+  if (!records || typeof records !== "object") return 0;
+  return Object.values(records).reduce(
+    (total, list) => total + (Array.isArray(list) ? list.length : 0),
+    0,
+  );
+}
+
+async function toggleSeededCheckbox(page, frame, timeoutMs) {
+  const checkbox = frame.locator('input[type="checkbox"]').first();
+  if (!(await checkbox.count())) {
+    fail("acceptance_flow_missing", "seeded records did not render a checkbox to toggle");
+  }
+  const before = await hostState(page);
+  const beforeUpdates = before.operations.filter((item) => item.operation === "records.update").length;
+  const beforeLists = before.operations.filter((item) => item.operation === "records.list").length;
+  await checkbox.click();
+  await page.waitForFunction(
+    (minimum) => window.__DOT_ACCEPTANCE__.operations.filter(
+      (item) => item.operation === "records.update",
+    ).length > minimum,
+    beforeUpdates,
+    { timeout: Math.min(timeoutMs, 4_000) },
+  ).catch(() => fail("acceptance_flow_missing", "checkbox toggle did not call records.update"));
+  await page.waitForFunction(
+    (minimum) => window.__DOT_ACCEPTANCE__.operations.filter(
+      (item) => item.operation === "records.list",
+    ).length > minimum,
+    beforeLists,
+    { timeout: Math.min(timeoutMs, 4_000) },
+  ).catch(() => fail(
+    "acceptance_records_refresh_missing",
+    "checkbox toggle did not refresh records",
+  ));
+  const afterCheckbox = frame.locator('input[type="checkbox"]').first();
+  if (!(await afterCheckbox.isChecked())) {
+    fail("acceptance_field_value_mismatch", "checkbox did not stay checked after records.update");
+  }
 }
 
 function mutationIdentityMatches(operation, step) {
@@ -1339,8 +1450,9 @@ try {
   page.setDefaultTimeout(Math.min(timeoutMs, 4_000));
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(String(error?.message || error).slice(0, 800)));
+  const initialRecords = request.records && typeof request.records === "object" ? request.records : {};
   const inner = iframeDocument(request.bundle, context, channelToken);
-  await page.setContent(hostDocument(inner, context, channelToken), { waitUntil: "domcontentloaded" });
+  await page.setContent(hostDocument(inner, context, channelToken, initialRecords), { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => window.__DOT_ACCEPTANCE__?.ready === true, undefined, {
     timeout: timeoutMs,
   }).catch(async () => {
@@ -1356,7 +1468,17 @@ try {
   const acceptancePlan = Array.isArray(request.acceptance_plan)
     ? request.acceptance_plan.slice(0, MAX_STEPS)
     : [];
+  if (seededRecordCount(initialRecords)) {
+    await page.waitForFunction(
+      () => window.__DOT_ACCEPTANCE__.operations.some((item) => item.operation === "records.list"),
+      undefined,
+      { timeout: Math.min(timeoutMs, 4_000) },
+    ).catch(() => fail("acceptance_records_refresh_missing", "seeded records were not listed"));
+  }
   const initialExperience = await assertVisibleExperience(frame);
+  if (seededRecordCount(initialRecords)) {
+    await toggleSeededCheckbox(page, frame, timeoutMs);
+  }
   const acceptanceResult = await runAcceptance(page, frame, acceptancePlan, timeoutMs);
   await assertVisibleExperience(frame);
   const state = await hostState(page);
@@ -1376,6 +1498,7 @@ try {
       runtime_errors: 0,
       network_attempts: networkAttempts,
       operations: state.operations,
+      records: state.records,
       ux_audit: { passed: true, viewport: initialExperience.viewport },
       ...acceptanceResult,
     },

@@ -39,6 +39,10 @@ type SegmentedControlContextValue = {
   value?: string;
   onValueChange?: (value: string) => void;
 };
+type TabsContextValue = {
+  value?: string;
+  onValueChange?: (value: string) => void;
+};
 
 type ValueChangeProps = { onValueChange?: (value: string) => void };
 
@@ -61,6 +65,8 @@ function normalizeSize(value: DotSize): "sm" | "md" | "lg" {
 }
 
 const SegmentedControlContext = React.createContext<SegmentedControlContextValue | null>(null);
+const TabsContext = React.createContext<TabsContextValue | null>(null);
+const ItemLeadingContext = React.createContext(false);
 
 export const chartTokens = Object.freeze({
   primary: "var(--dot-chart-1)",
@@ -78,6 +84,7 @@ export function AppShell({
   eyebrow,
   accent = "coral",
   width = "standard",
+  density = "compact",
   children,
 }: ChildrenProps & {
   title?: ReactNode;
@@ -85,9 +92,10 @@ export function AppShell({
   eyebrow?: ReactNode;
   accent?: DotAccent;
   width?: "compact" | "standard" | "wide";
+  density?: "compact" | "comfortable";
 }) {
   return (
-    <main className="dot-app-shell" data-accent={accent} data-width={width}>
+    <main className="dot-app-shell" data-accent={accent} data-width={width} data-density={density}>
       {(eyebrow || title || description) && (
         <header className="dot-app-header">
           {eyebrow && <span className="dot-overline">{eyebrow}</span>}
@@ -441,11 +449,11 @@ export function Field({
   children,
 }: ChildrenProps & { label?: ReactNode; hint?: ReactNode; error?: ReactNode }) {
   return (
-    <label className="dot-field">
+    <div className="dot-field">
       {label && <span className="dot-field-label">{label}</span>}
       {children}
       {error ? <span className="dot-field-error">{error}</span> : hint && <span className="dot-field-hint">{hint}</span>}
-    </label>
+    </div>
   );
 }
 
@@ -463,7 +471,15 @@ export function Input({
     onChange?.(event);
     if (!event.defaultPrevented) onValueChange?.(event.currentTarget.value);
   }} />;
-  return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
+  if (!(label || hint || error)) return control;
+  return (
+    <Field hint={hint} error={error}>
+      <label className="dot-control-label">
+        {label && <span className="dot-field-label">{label}</span>}
+        {control}
+      </label>
+    </Field>
+  );
 }
 
 export function Textarea({
@@ -478,7 +494,15 @@ export function Textarea({
     onChange?.(event);
     if (!event.defaultPrevented) onValueChange?.(event.currentTarget.value);
   }} />;
-  return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
+  if (!(label || hint || error)) return control;
+  return (
+    <Field hint={hint} error={error}>
+      <label className="dot-control-label">
+        {label && <span className="dot-field-label">{label}</span>}
+        {control}
+      </label>
+    </Field>
+  );
 }
 
 export function Select({
@@ -507,7 +531,15 @@ export function Select({
       ))}
     </select>
   );
-  return label || hint || error ? <Field label={label} hint={hint} error={error}>{control}</Field> : control;
+  if (!(label || hint || error)) return control;
+  return (
+    <Field hint={hint} error={error}>
+      <label className="dot-control-label">
+        {label && <span className="dot-field-label">{label}</span>}
+        {control}
+      </label>
+    </Field>
+  );
 }
 
 export function Checkbox({
@@ -521,13 +553,25 @@ export function Checkbox({
   onCheckedChange?: (checked: boolean) => void;
   onValueChange?: (checked: boolean) => void;
 }) {
-  return <label className="dot-checkbox"><input {...props} type="checkbox" onChange={(event) => {
-    onChange?.(event);
-    if (!event.defaultPrevented) {
-      onCheckedChange?.(event.currentTarget.checked);
-      onValueChange?.(event.currentTarget.checked);
-    }
-  }} />{label && <span>{label}</span>}</label>;
+  const inLeading = React.useContext(ItemLeadingContext);
+  const accessible = inLeading && typeof label === "string" ? label : undefined;
+  return (
+    <label className="dot-checkbox" data-compact={inLeading ? "true" : undefined}>
+      <input
+        {...props}
+        type="checkbox"
+        aria-label={accessible}
+        onChange={(event) => {
+          onChange?.(event);
+          if (!event.defaultPrevented) {
+            onCheckedChange?.(event.currentTarget.checked);
+            onValueChange?.(event.currentTarget.checked);
+          }
+        }}
+      />
+      {label && <span className={inLeading ? "dot-sr-only" : undefined}>{label}</span>}
+    </label>
+  );
 }
 
 export function List({ children, divided = true }: ChildrenProps & { divided?: boolean }) {
@@ -554,12 +598,70 @@ export function ListItem({
     : children ?? (detail && <span>{detail}</span>);
   return (
     <li className="dot-list-item">
-      {leading && <div className="dot-list-leading">{leading}</div>}
+      {leading && (
+        <ItemLeadingContext.Provider value={true}>
+          <div className="dot-list-leading">{leading}</div>
+        </ItemLeadingContext.Provider>
+      )}
       <div className="dot-list-copy">{copy}</div>
       {meta && <span className="dot-list-meta">{meta}</span>}
       {action && <div className="dot-list-action">{action}</div>}
     </li>
   );
+}
+
+export const Item = ListItem;
+
+export function Tabs({
+  value,
+  onChange,
+  onValueChange,
+  children,
+}: ChildrenProps & {
+  value?: string;
+  onChange?: (value: string) => void;
+  onValueChange?: (value: string) => void;
+}) {
+  return (
+    <TabsContext.Provider value={{ value, onValueChange: onValueChange ?? onChange }}>
+      <div className="dot-tabs">{children}</div>
+    </TabsContext.Provider>
+  );
+}
+
+export function TabsList({ children }: ChildrenProps) {
+  return <div className="dot-tabs-list" role="tablist">{children}</div>;
+}
+
+export function TabsTrigger({
+  value,
+  children,
+  onClick,
+  ...props
+}: Omit<SafeButtonProps, "value"> & { value: string }) {
+  const tabs = React.useContext(TabsContext);
+  const selected = tabs?.value === value;
+  return (
+    <button
+      {...props}
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      className="dot-tabs-trigger"
+      onClick={(event) => {
+        onClick?.(event);
+        if (!event.defaultPrevented) tabs?.onValueChange?.(value);
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function TabsContent({ value, children }: ChildrenProps & { value: string }) {
+  const tabs = React.useContext(TabsContext);
+  if (tabs?.value !== undefined && tabs.value !== value) return null;
+  return <div className="dot-tabs-content" role="tabpanel">{children}</div>;
 }
 
 export function EmptyState({

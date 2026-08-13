@@ -291,14 +291,34 @@ function recordResult(operation, args) {
   if (operation === "records.update") {
     const recordId = ownData(args, "record_id");
     const data = ownData(args, "data");
-    return {
-      ...(data && typeof data === "object" ? data : {}),
-      id: typeof recordId === "string" ? recordId : "00000000-0000-4000-8000-000000000001",
-      entity,
-      version: 2,
-      created_at: "2026-01-01T09:00:00Z",
-      updated_at: "2026-01-01T09:00:00Z",
-    };
+    const patch = data && typeof data === "object" ? data : objectCreate(null);
+    const expectedVersion = ownData(args, "expected_version");
+    const entries = arrayFrom(mapEntries(state.records));
+    for (let entryIndex = 0; entryIndex < entries.length; entryIndex += 1) {
+      const entityName = entries[entryIndex][0];
+      const list = arraySlice(entries[entryIndex][1]);
+      for (let itemIndex = 0; itemIndex < list.length; itemIndex += 1) {
+        const current = list[itemIndex];
+        if (ownData(current, "id") !== recordId) continue;
+        if (expectedVersion !== undefined && ownData(current, "version") !== expectedVersion) {
+          return current;
+        }
+        const merged = { ...current };
+        const patchKeys = objectKeys(patch);
+        for (let keyIndex = 0; keyIndex < patchKeys.length; keyIndex += 1) {
+          const key = patchKeys[keyIndex];
+          const value = ownData(patch, key);
+          if (value === null) delete merged[key];
+          else merged[key] = value;
+        }
+        merged.version = (ownData(current, "version") || 1) + 1;
+        merged.updated_at = "2026-01-01T09:00:00Z";
+        list[itemIndex] = merged;
+        mapSet(state.records, entityName, list);
+        return merged;
+      }
+    }
+    return {};
   }
   if (operation === "records.delete") return { deleted: true };
   if (operation === "app.data.get") return {};

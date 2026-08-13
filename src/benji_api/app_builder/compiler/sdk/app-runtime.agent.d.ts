@@ -3,6 +3,13 @@ type RequestOptions = {
     idempotencyKey?: string;
     timeoutMs?: number;
 };
+export type AppRecord<T = JsonObject> = T & {
+    id: string;
+    entity: string;
+    version: number;
+    created_at?: string | null;
+    updated_at?: string | null;
+};
 export declare function useAppData<T = unknown>(): {
     readonly data: T | undefined;
     readonly loading: boolean;
@@ -13,11 +20,11 @@ export declare function useRecords<T = JsonObject>(entity: string, query?: {
     limit?: number;
     offset?: number;
 }): {
-    readonly records: T[];
+    readonly records: AppRecord<T>[];
     readonly meta: JsonObject;
     readonly loading: boolean;
     readonly error: Error | null;
-    readonly refresh: () => Promise<T[]>;
+    readonly refresh: () => Promise<AppRecord<T>[]>;
 };
 export declare function runAction<T = unknown>(operation: string, args?: JsonObject, options?: RequestOptions): Promise<T>;
 export {};
